@@ -1,0 +1,23 @@
+# LLM config template: no API keys committed. Set api_key or api_key_env after opc init.
+llm:
+  default_model: "openai/gpt-5.4"
+  api_base: "https://openrouter.ai/api/v1"
+  api_key: ""
+  # api_key_env: "OPENROUTER_API_KEY"
+
+  temperature: 1
+  max_tokens: 32768
+  routing: {}
+  fallback: {}
+
+  # Optional: total input context window, used as the denominator for the
+  # context-usage ring and to trigger auto-summarization. You normally do NOT
+  # need this — for models litellm can map (most OpenAI / Anthropic models) the
+  # window is resolved automatically. Only set it when your model is served
+  # through a proxy / self-hosted endpoint that litellm cannot map, so the ring
+  # has no denominator. Scalar applies to the default model:
+  # context_window: 200000
+  # Or per-model (wins over the scalar); keys are matched by model name:
+  # context_window_overrides:
+  #   gpt-5.4: 400000
+  #   claude-sonnet-4.5: 200000

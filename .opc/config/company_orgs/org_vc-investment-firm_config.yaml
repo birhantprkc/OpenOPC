@@ -1,0 +1,1065 @@
+schema_version: 2
+kind: opc_org_architecture
+organization_id: vc-investment-firm
+organization_name: VC Investment Firm
+company:
+  name: VC Investment Firm
+  topology: Corporate Structure
+  company_profile: custom
+  execution_model: actor_runtime
+  final_decider_role_id: managing_partner
+  company_profiles:
+  - corporate
+  - custom
+roles:
+- id: managing_partner
+  name: Managing Partner
+  responsibility: Defines the investment mandate, target stage, sector focus, decision
+    criteria, and final portfolio recommendation.
+  reports_to: owner
+  icon: leader
+  can_spawn:
+  - investment_director
+  - due_diligence_lead
+  - investment_committee
+  - report_delivery_lead
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: null
+  prompt_refs:
+  - 'You are the Managing Partner. Defines the investment mandate, target stage, sector
+    focus, decision criteria, and final portfolio recommendation. Coordinate work
+    with: Investment Director, Due Diligence Lead, Investment Committee Chair, Report
+    & Delivery Lead. Delegate tasks appropriately and aggregate results. Review outputs
+    for quality and correctness. Approve quality work or request changes.'
+  - Keep the team focused on investment decisions rather than raw research accumulation.
+  - Final output must identify Top 3 companies, investment rationale, key risks, entry
+    path, suggested stage, and follow-up plan.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - investment_director
+    - due_diligence_lead
+    - investment_committee
+    - report_delivery_lead
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: investment_director
+  name: Investment Director
+  responsibility: Translates the user request into an investment research framework,
+    screening criteria, task split, and candidate company shortlist.
+  reports_to: managing_partner
+  icon: strategy
+  can_spawn:
+  - sector_analyst
+  - market_researcher
+  - startup_scout
+  - competitive_analyst
+  - news_signal_analyst
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: null
+  prompt_refs:
+  - 'You are the Investment Director. Translates the user request into an investment
+    research framework, screening criteria, task split, and candidate company shortlist.
+    Coordinate work with: Sector Analyst, Market Researcher, Startup Scout, Competitive
+    Analyst, News & Signal Analyst. Delegate tasks appropriately and aggregate results.
+    Review outputs for quality and correctness. Approve quality work or request changes.'
+  - 'Produce a clear VC research framework: market thesis, screening standard, candidate
+    pool logic, and scoring rubric.'
+  - Ask scouts and analysts for evidence tables, not generic summaries.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - sector_analyst
+    - market_researcher
+    - startup_scout
+    - competitive_analyst
+    - news_signal_analyst
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: sector_analyst
+  name: Sector Analyst
+  responsibility: Evaluates whether the target sector can compound over the next 3-5
+    years, including demand drivers, inflection points, and adoption constraints.
+  reports_to: investment_director
+  icon: analytics
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Sector Analyst. Evaluates whether the target sector can compound over
+    the next 3-5 years, including demand drivers, inflection points, and adoption
+    constraints. Focus on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: market_researcher
+  name: Market Researcher
+  responsibility: Quantifies TAM/SAM/SOM, buyer budgets, growth rates, adoption curves,
+    and comparable public or private market signals.
+  reports_to: investment_director
+  icon: analytics
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Market Researcher. Quantifies TAM/SAM/SOM, buyer budgets, growth rates,
+    adoption curves, and comparable public or private market signals. Focus on delivering
+    quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: startup_scout
+  name: Startup Scout
+  responsibility: Builds a broad candidate pool with founding date, headquarters,
+    funding stage, amount raised, investors, product, customers, news, website, LinkedIn,
+    Crunchbase, PitchBook, GitHub, and source URLs.
+  reports_to: investment_director
+  icon: target
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Startup Scout. Builds a broad candidate pool with founding date, headquarters,
+    funding stage, amount raised, investors, product, customers, news, website, LinkedIn,
+    Crunchbase, PitchBook, GitHub, and source URLs. Focus on delivering quality work
+    within your area of expertise.
+  - 'Prioritize breadth first: gather a defensible longlist before ranking.'
+  - Separate verified facts from inferred signals and keep source URLs next to every
+    company row.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: competitive_analyst
+  name: Competitive Analyst
+  responsibility: Maps incumbents, startup competitors, substitute technologies, market
+    positioning, moat strength, differentiation, and big-tech pressure.
+  reports_to: investment_director
+  icon: team
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Competitive Analyst. Maps incumbents, startup competitors, substitute
+    technologies, market positioning, moat strength, differentiation, and big-tech
+    pressure. Focus on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: news_signal_analyst
+  name: News & Signal Analyst
+  responsibility: Tracks recent market signals, customer wins, launches, layoffs,
+    regulatory movement, hiring velocity, GitHub activity, and investor interest.
+  reports_to: investment_director
+  icon: marketing
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the News & Signal Analyst. Tracks recent market signals, customer wins,
+    launches, layoffs, regulatory movement, hiring velocity, GitHub activity, and
+    investor interest. Focus on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: due_diligence_lead
+  name: Due Diligence Lead
+  responsibility: Turns the shortlist into a diligence plan, coordinates specialist
+    checks, resolves contradictions, and synthesizes company-level conviction.
+  reports_to: managing_partner
+  icon: clipboard
+  can_spawn:
+  - technical_dd_analyst
+  - business_dd_analyst
+  - financial_analyst
+  - risk_legal_analyst
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: null
+  prompt_refs:
+  - 'You are the Due Diligence Lead. Turns the shortlist into a diligence plan, coordinates
+    specialist checks, resolves contradictions, and synthesizes company-level conviction.
+    Coordinate work with: Technical DD Analyst, Business DD Analyst, Financial Analyst,
+    Risk & Legal Analyst. Delegate tasks appropriately and aggregate results.'
+  - Force each diligence stream to give a verdict, confidence level, and disconfirming
+    evidence.
+  - Maintain a comparable scorecard across all shortlisted companies.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - technical_dd_analyst
+    - business_dd_analyst
+    - financial_analyst
+    - risk_legal_analyst
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: technical_dd_analyst
+  name: Technical DD Analyst
+  responsibility: Assesses technical moat, architecture credibility, benchmarks, patents,
+    papers, open-source projects, GitHub traction, team technical depth, and scalability.
+  reports_to: due_diligence_lead
+  icon: code
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Technical DD Analyst. Assesses technical moat, architecture credibility,
+    benchmarks, patents, papers, open-source projects, GitHub traction, team technical
+    depth, and scalability. Focus on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: business_dd_analyst
+  name: Business DD Analyst
+  responsibility: Evaluates target customers, sales motion, pricing model, evidence
+    of ARR or revenue, deployment friction, customer concentration, and go-to-market
+    defensibility.
+  reports_to: due_diligence_lead
+  icon: strategy
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - You are the Business DD Analyst. Evaluates target customers, sales motion, pricing
+    model, evidence of ARR or revenue, deployment friction, customer concentration,
+    and go-to-market defensibility. Focus on delivering quality work within your area
+    of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: financial_analyst
+  name: Financial Analyst
+  responsibility: Analyzes financing history, investors, valuation signals, burn-rate
+    implications, round dynamics, comparable valuations, exit routes, and upside risk/reward.
+  reports_to: due_diligence_lead
+  icon: analytics
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Financial Analyst. Analyzes financing history, investors, valuation
+    signals, burn-rate implications, round dynamics, comparable valuations, exit routes,
+    and upside risk/reward. Focus on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: risk_legal_analyst
+  name: Risk & Legal Analyst
+  responsibility: Finds privacy, open-source license, supply-chain, geopolitical,
+    customer concentration, regulatory, IP, and founder-stability risks.
+  reports_to: due_diligence_lead
+  icon: security
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Risk & Legal Analyst. Finds privacy, open-source license, supply-chain,
+    geopolitical, customer concentration, regulatory, IP, and founder-stability risks.
+    Focus on delivering quality work within your area of expertise.
+  - Actively search for reasons not to invest; do not let opportunity framing hide
+    material risks.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: investment_committee
+  name: Investment Committee Chair
+  responsibility: Runs structured bull-case and bear-case review, compares evidence
+    quality, and prepares the decision package for the Managing Partner.
+  reports_to: managing_partner
+  icon: team
+  can_spawn:
+  - bull_case_reviewer
+  - bear_case_reviewer
+  - final_decision_reviewer
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: null
+  prompt_refs:
+  - 'You are the Investment Committee Chair. Runs structured bull-case and bear-case
+    review, compares evidence quality, and prepares the decision package for the Managing
+    Partner. Coordinate work with: Bull Case Reviewer, Bear Case Reviewer, Final Decision
+    Reviewer. Delegate tasks appropriately and aggregate results. Review outputs for
+    quality and correctness. Approve quality work or request changes.'
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - bull_case_reviewer
+    - bear_case_reviewer
+    - final_decision_reviewer
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: bull_case_reviewer
+  name: Bull Case Reviewer
+  responsibility: Builds the strongest evidence-backed case for why each shortlisted
+    company should be funded now.
+  reports_to: investment_committee
+  icon: idea
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Bull Case Reviewer. Builds the strongest evidence-backed case for
+    why each shortlisted company should be funded now. Focus on delivering quality
+    work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: bear_case_reviewer
+  name: Bear Case Reviewer
+  responsibility: Builds the strongest evidence-backed case against investing, including
+    timing, valuation, technical, market, and execution objections.
+  reports_to: investment_committee
+  icon: bug
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Bear Case Reviewer. Builds the strongest evidence-backed case against
+    investing, including timing, valuation, technical, market, and execution objections.
+    Focus on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: final_decision_reviewer
+  name: Final Decision Reviewer
+  responsibility: Reconciles bull and bear cases, ranks companies, explains confidence,
+    and flags follow-up diligence before partner approval.
+  reports_to: investment_committee
+  icon: clipboard
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Final Decision Reviewer. Reconciles bull and bear cases, ranks companies,
+    explains confidence, and flags follow-up diligence before partner approval. Focus
+    on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: report_delivery_lead
+  name: Report & Delivery Lead
+  responsibility: 'Owns final deliverables: investment memo, scorecard, market map,
+    competitive matrix, financing timeline, PPT, data table, and charts.'
+  reports_to: managing_partner
+  icon: layout
+  can_spawn:
+  - data_analyst
+  - investment_memo_writer
+  - ppt_designer
+  - visualization_specialist
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: null
+  prompt_refs:
+  - 'You are the Report & Delivery Lead. Owns final deliverables: investment memo,
+    scorecard, market map, competitive matrix, financing timeline, PPT, data table,
+    and charts. Coordinate work with: Data Analyst, Investment Memo Writer, PPT Designer,
+    Visualization Specialist. Delegate tasks appropriately and aggregate results.'
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - data_analyst
+    - investment_memo_writer
+    - ppt_designer
+    - visualization_specialist
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: data_analyst
+  name: Data Analyst
+  responsibility: Normalizes company data, computes scorecards, creates comparable
+    tables, and prepares chart-ready datasets.
+  reports_to: report_delivery_lead
+  icon: database
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Data Analyst. Normalizes company data, computes scorecards, creates
+    comparable tables, and prepares chart-ready datasets. Focus on delivering quality
+    work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: investment_memo_writer
+  name: Investment Memo Writer
+  responsibility: Writes a partner-quality investment memo with thesis, market, company
+    analysis, diligence evidence, risks, valuation view, and recommendation.
+  reports_to: report_delivery_lead
+  icon: writing
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_snapshot
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Investment Memo Writer. Writes a partner-quality investment memo with
+    thesis, market, company analysis, diligence evidence, risks, valuation view, and
+    recommendation. Focus on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: ppt_designer
+  name: PPT Designer
+  responsibility: Turns the investment memo into a concise VC-style presentation with
+    clear hierarchy, scorecards, market maps, and decision slides.
+  reports_to: report_delivery_lead
+  icon: design
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_snapshot
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the PPT Designer. Turns the investment memo into a concise VC-style presentation
+    with clear hierarchy, scorecards, market maps, and decision slides. Focus on delivering
+    quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: visualization_specialist
+  name: Visualization Specialist
+  responsibility: Creates market maps, competitor matrices, financing timelines, scoring
+    charts, and visual summaries for the final report and PPT.
+  reports_to: report_delivery_lead
+  icon: analytics
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - You are the Visualization Specialist. Creates market maps, competitor matrices,
+    financing timelines, scoring charts, and visual summaries for the final report
+    and PPT. Focus on delivering quality work within your area of expertise.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+employees: []
+escalation_rules: []
+runtime_policies:
+  custom:
+    communication:
+      default_mode: dm
+      blocking_default: true
+      meeting_required_for: []
+      allow_broadcast: true
+    memory:
+      include_role_memory: false
+      include_project_memory: false
+      include_decision_log: true
+      include_artifact_index: true
+      recent_history_lines: 12
+    handoff:
+      require_structured_handoff: true
+      require_ack: true
+      include_risks: true
+      include_open_questions: true
+    artifact:
+      enforce_contract: false
+      require_artifact_index: true
+      required_kinds: []
+    review:
+      enable_work_item_gates: false
+      strict_gate_inference: true
+      require_reviewer_role: true
+      allow_human_override: true
+    gate_harness:
+      enabled: true
+      decision_mode: agent_first
+      default_degrade_policy: allow
+      auto_infer_turn_kind: true
+      auto_infer_gate_profile: true
+      max_rework_rounds_per_issue: 2
+      stagnation_threshold: 2
+      allow_pass_with_constraints: true
+      enable_delivery_constraints_propagation: true
+      agent_model: ''
+      agent_confidence_threshold: 0.55
+      fallback_to_rules_on_parse_error: true
+      builtin_blocker_map:
+        workspace_mismatch: rework_same_work_item
+        missing_required_artifact: rework_same_work_item
+        verification_missing: rework_same_work_item
+        dependency_not_ready: rework_same_work_item
+        cross_work_item_conflict: replan
+        external_secret_missing: await_user_decision
+        permission_missing: escalate
+        environment_capability_gap: pass_with_constraints
+        quality_gap: rework_same_work_item
+        goal_env_mismatch: replan
+        unresolved_user_visible_risk: pass_with_constraints
+      turn_kind_overrides: {}
+      gate_profile_overrides: {}
+    parallel:
+      auto_dispatch: true
+      review_gate_enabled: true
+      max_workers: 10
+    coordination:
+      inference_mode: llm_primary
+      fallback_mode: conservative
+      strict_gate_turn_kinds:
+      - verify
+      - deliver
+      mixed_gate_turn_kinds:
+      - synthesize
+      - review
+      - integration
+      allow_manager_release_for_mixed_only: true
+      allow_custom_signals: true
+talent_templates: []
+teams: []
+team_runtime:
+  default_team_id: ''
+  shared_role_session_scope: team
+  allow_shared_role_sessions: true
+  seat_refresh_interval_seconds: 30
+  metadata: {}
+installed_packages: []
+role_serial_queue_enabled: true
+metadata:
+  source: org_mode
+  organization_config_file: company_orgs/org_vc-investment-firm_config.yaml

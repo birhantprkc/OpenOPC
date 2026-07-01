@@ -1,0 +1,318 @@
+schema_version: 2
+kind: opc_org_architecture
+organization_id: game-development-studio
+organization_name: Game Development Studio
+company:
+  name: Game Development Studio
+  topology: Lean Game Studio
+  company_profile: custom
+  execution_model: actor_runtime
+  final_decider_role_id: studio_director
+  company_profiles:
+  - corporate
+  - custom
+roles:
+- id: studio_director
+  name: Studio Director
+  responsibility: Acts as the CEO-like owner-facing role for game projects. Clarifies
+    the user's game goal, defines the playable scope, coordinates the small studio,
+    resolves tradeoffs, and owns final delivery quality.
+  reports_to: owner
+  icon: leader
+  can_spawn:
+  - game_designer
+  - gameplay_engineer
+  - art_ui_designer
+  - qa_release_tester
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: codex
+  prompt_refs:
+  - You are the Studio Director. You are the owner-facing final decision role for
+    a lean game studio. Clarify the requested game, target platform, core promise,
+    scope, constraints, and definition of done.
+  - Coordinate game design, gameplay engineering, art/UI, and QA release validation.
+    Keep the team focused on a playable and testable game, not disconnected ideas
+    or assets.
+  - Final delivery must include what was built, how to run it, controls, implemented
+    systems, validation evidence, known risks, and next steps.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles:
+    - game_designer
+    - gameplay_engineer
+    - art_ui_designer
+    - qa_release_tester
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: coordinator
+  coordinator_policy: null
+- id: game_designer
+  name: Game Designer
+  responsibility: Owns gameplay concept, core loop, mechanics, controls, level flow,
+    progression, onboarding, narrative framing, and audio direction at prototype scope.
+  reports_to: studio_director
+  icon: idea
+  can_spawn: []
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - You are the Game Designer. Turn the user's request into a buildable gameplay brief
+    with genre, pillars, core loop, controls, progression, level beats, player feedback,
+    and acceptance criteria.
+  - Keep the design practical for a small implementation team. Produce concrete rules,
+    tuning values, and testable requirements.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: external
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: gameplay_engineer
+  name: Gameplay Engineer
+  responsibility: Implements playable systems, controls, camera, physics, game state,
+    UI wiring, build scripts, integration fixes, and engine-specific code.
+  reports_to: studio_director
+  icon: code
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_snapshot
+  - browser_take_screenshot
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - You are the Gameplay Engineer. Implement the playable game, integrate design and
+    assets, keep changes scoped, and verify with builds, logs, screenshots, or runnable
+    tests when possible.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: external
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: art_ui_designer
+  name: Art/UI Designer
+  responsibility: Owns visual direction, HUD, menus, player feedback, readability,
+    asset style, technical art needs, VFX direction, and art-to-engine consistency.
+  reports_to: studio_director
+  icon: design
+  can_spawn: []
+  tools:
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - browser_snapshot
+  - browser_take_screenshot
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - You are the Art/UI Designer. Define and implement practical visual direction,
+    UI hierarchy, player feedback, asset constraints, and engine-ready art guidance.
+  - Keep the visual plan shippable inside the prototype scope and make UI states explicit
+    enough for engineering and QA.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: external
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: qa_release_tester
+  name: QA Release Tester
+  responsibility: Validates playability, controls, build health, UI readability, performance
+    risks, release notes, and known-issue reporting with concrete evidence.
+  reports_to: studio_director
+  icon: clipboard
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_snapshot
+  - browser_take_screenshot
+  preferred_external_agent: codex
+  prompt_refs:
+  - 'You are the QA Release Tester. Validate the game like a release gate: run or
+    inspect builds, collect evidence, identify blockers, check controls and UI, and
+    produce a concise ship/no-ship assessment.'
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+employees: []
+escalation_rules: []
+runtime_policies:
+  custom:
+    communication:
+      default_mode: dm
+      blocking_default: true
+      meeting_required_for: []
+      allow_broadcast: true
+    memory:
+      include_role_memory: false
+      include_project_memory: false
+      include_decision_log: true
+      include_artifact_index: true
+      recent_history_lines: 12
+    handoff:
+      require_structured_handoff: true
+      require_ack: true
+      include_risks: true
+      include_open_questions: true
+    artifact:
+      enforce_contract: false
+      require_artifact_index: true
+      required_kinds: []
+    review:
+      enable_work_item_gates: false
+      strict_gate_inference: true
+      require_reviewer_role: true
+      allow_human_override: true
+    gate_harness:
+      enabled: true
+      decision_mode: agent_first
+      default_degrade_policy: allow
+      auto_infer_turn_kind: true
+      auto_infer_gate_profile: true
+      max_rework_rounds_per_issue: 2
+      stagnation_threshold: 2
+      allow_pass_with_constraints: true
+      enable_delivery_constraints_propagation: true
+      agent_model: ''
+      agent_confidence_threshold: 0.55
+      fallback_to_rules_on_parse_error: true
+      builtin_blocker_map:
+        workspace_mismatch: rework_same_work_item
+        missing_required_artifact: rework_same_work_item
+        verification_missing: rework_same_work_item
+        dependency_not_ready: rework_same_work_item
+        cross_work_item_conflict: replan
+        external_secret_missing: await_user_decision
+        permission_missing: escalate
+        environment_capability_gap: pass_with_constraints
+        quality_gap: rework_same_work_item
+        goal_env_mismatch: replan
+        unresolved_user_visible_risk: pass_with_constraints
+      turn_kind_overrides: {}
+      gate_profile_overrides: {}
+    parallel:
+      auto_dispatch: true
+      review_gate_enabled: true
+      max_workers: 4
+    coordination:
+      inference_mode: llm_primary
+      fallback_mode: conservative
+      strict_gate_turn_kinds:
+      - verify
+      - deliver
+      mixed_gate_turn_kinds:
+      - synthesize
+      - review
+      - integration
+      allow_manager_release_for_mixed_only: true
+      allow_custom_signals: true
+talent_templates: []
+teams: []
+team_runtime:
+  default_team_id: ''
+  shared_role_session_scope: team
+  allow_shared_role_sessions: true
+  seat_refresh_interval_seconds: 30
+  metadata: {}
+installed_packages: []
+role_serial_queue_enabled: true
+metadata:
+  source: org_mode
+  organization_config_file: company_orgs/org_game-development-studio_config.yaml

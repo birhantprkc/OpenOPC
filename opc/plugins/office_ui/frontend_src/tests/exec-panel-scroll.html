@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Exec panel scroll fixture</title>
+    <style>
+      /* Match the global resets used in production */
+      * { box-sizing: border-box; min-width: 0; }
+      html, body, #root {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0c111b;
+        color: #e2e8f0;
+        font-family: sans-serif;
+        font-size: 14px;
+      }
+
+      :root {
+        --surface: #141b2b;
+        --bg: #0c111b;
+        --border: rgba(148, 163, 184, 0.12);
+        --text-primary: #e2e8f0;
+        --text-secondary: #8494a7;
+        --accent: #6366f1;
+      }
+
+      /* ── Production panel CSS, copied verbatim from kanban.css ─────────── */
+      .exec-panel-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.3);
+        z-index: 199;
+      }
+
+      .exec-panel {
+        position: fixed;
+        top: 0;
+        right: 0;
+        width: 560px;
+        max-width: 90vw;
+        height: 100vh;
+        height: 100dvh;
+        background: var(--surface);
+        border-left: 1px solid var(--border);
+        z-index: 200;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .exec-panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+      }
+
+      .exec-panel-identity {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+      }
+
+      .exec-panel-body {
+        flex: 1 1 0;
+        min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding: 12px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      .exec-task-card {
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 8px;
+        margin-bottom: 10px;
+        background: rgba(20, 27, 43, 0.8);
+        overflow: hidden;
+        /* Mirrors production fix: prevent flex-shrink from squeezing cards. */
+        flex-shrink: 0;
+        flex-basis: auto;
+      }
+
+      .exec-task-card-header {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        text-align: left;
+        color: var(--text-primary);
+      }
+
+      .exec-task-card-body {
+        padding: 4px 14px 14px;
+        border-top: 1px solid rgba(148, 163, 184, 0.12);
+      }
+
+      .exec-section {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .exec-section-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-secondary);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .exec-section-content {
+        font-size: 13px;
+        color: var(--text-primary);
+        line-height: 1.5;
+      }
+
+      .exec-handoff-scroll {
+        max-height: 28vh;
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
+
+      .exec-activity-scroll {
+        max-height: 55vh;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding-right: 4px;
+        border-radius: 6px;
+        background: rgba(12, 17, 27, 0.3);
+      }
+
+      /* ── Production progress block CSS, copied verbatim from chat.css ─── */
+      .ptl-block {
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+      }
+
+      .ptl-timeline {
+        display: flex;
+        flex-direction: column;
+        padding-left: 2px;
+      }
+
+      .ptl-entry {
+        display: flex;
+        gap: 0;
+        min-height: 30px;
+      }
+
+      .ptl-connector {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        width: 26px;
+        flex-shrink: 0;
+      }
+
+      .ptl-dot {
+        width: 22px;
+        height: 22px;
+        border-radius: 6px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+      }
+
+      .ptl-line {
+        width: 1px;
+        flex: 1;
+        background: var(--border);
+        min-height: 8px;
+      }
+
+      .ptl-entry-last .ptl-line { display: none; }
+
+      .ptl-content {
+        flex: 1;
+        min-width: 0;
+        padding: 2px 0 8px 8px;
+      }
+
+      .ptl-tool-card {
+        background: rgba(20, 27, 43, 0.78);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+
+      .msg-content-agent-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--accent);
+        padding: 10px 14px;
+      }
+
+      /* ── Test markers (non-production) ───────────────────────────────── */
+      [data-testid] { outline: 0; }
+    </style>
+  </head>
+  <body>
+    <div class="exec-panel" data-testid="exec-panel">
+      <div class="exec-panel-header" data-testid="exec-panel-header">
+        <h3>Test role</h3>
+      </div>
+      <div class="exec-panel-identity" data-testid="exec-panel-identity">
+        <div>Test agent — qa_lead</div>
+      </div>
+      <div class="exec-panel-body" data-testid="exec-panel-body">
+        <!-- One expanded card with: projection, long Received From, Activity (300 entries), Artifacts, Passed To -->
+        <div class="exec-task-card">
+          <button class="exec-task-card-header"><span>#1 Big role turn</span></button>
+          <div class="exec-task-card-body">
+            <div style="font-size:11px;color:var(--text-secondary);margin:8px 0 12px;">Projection: projection-abc</div>
+
+            <div class="exec-section">
+              <div class="exec-section-header">Received From</div>
+              <div class="msg-content-agent-card exec-handoff-scroll" data-testid="received-from-scroll">
+                <p id="received-from-content">PLACEHOLDER</p>
+              </div>
+            </div>
+
+            <div class="exec-section">
+              <div class="exec-section-header">Activity <span>300</span></div>
+              <div class="exec-section-content exec-activity-scroll" data-testid="activity-scroll">
+                <div class="ptl-block" data-testid="activity-block">
+                  <div class="ptl-timeline" data-testid="activity-timeline">
+                    <!-- entries injected by JS below -->
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="exec-section">
+              <div class="exec-section-header">Artifacts</div>
+              <ul style="margin:0;padding:0 0 0 18px;font-size:13px;line-height:1.6;">
+                <li>artifact-1</li>
+                <li>artifact-2</li>
+                <li>artifact-3</li>
+              </ul>
+            </div>
+
+            <div class="exec-section">
+              <div class="exec-section-header">Passed To</div>
+              <div class="msg-content-agent-card exec-handoff-scroll" data-testid="passed-to-scroll">
+                <p id="passed-to-content">PLACEHOLDER</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Sibling cards to verify outer panel scroll also works.  Multiple
+             cards each with their own large Activity stress the parent scroll. -->
+        <div class="exec-task-card" data-testid="sibling-card">
+          <button class="exec-task-card-header"><span>#2 Sibling role turn</span></button>
+          <div class="exec-task-card-body">
+            <div class="exec-section">
+              <div class="exec-section-header">Activity <span>1</span></div>
+              <div class="exec-section-content exec-activity-scroll">
+                <div class="ptl-block">
+                  <div class="ptl-timeline">
+                    <div class="ptl-entry ptl-entry-last">
+                      <div class="ptl-connector"><div class="ptl-dot"></div></div>
+                      <div class="ptl-content">Single sibling entry</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="exec-task-card" data-testid="trailing-card">
+          <button class="exec-task-card-header"><span>#3 Trailing role turn</span></button>
+          <div class="exec-task-card-body">
+            <div class="exec-section">
+              <div class="exec-section-header">Activity <span>large</span></div>
+              <div class="exec-section-content exec-activity-scroll" data-testid="trailing-activity-scroll">
+                <div class="ptl-block">
+                  <div class="ptl-timeline" data-testid="trailing-activity-timeline"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // Inject N activity entries.  Override via ?entries=NN.
+      const params = new URLSearchParams(location.search)
+      const N = Math.max(1, parseInt(params.get('entries') || '300', 10))
+      const handoffLines = Math.max(1, parseInt(params.get('handoff') || '40', 10))
+      // When ?live=NN is set, additional entries are appended after load so we
+      // can prove the scroll bottom remains reachable while the timeline grows
+      // (mirrors a running role's snapshot ticks).
+      const liveAppend = parseInt(params.get('live') || '0', 10)
+
+      const lorem = 'Received From summary line that may wrap to multiple lines depending on viewport width. '
+      document.getElementById('received-from-content').textContent =
+        Array.from({ length: handoffLines }, (_, i) => `(${i + 1}) ${lorem}`).join('\n')
+      document.getElementById('passed-to-content').textContent =
+        Array.from({ length: 6 }, (_, i) => `Handoff line ${i + 1}: passed to next work item with summary.`).join('\n')
+
+      function buildEntry(globalIdx, isLast) {
+        const entry = document.createElement('div')
+        entry.className = `ptl-entry${isLast ? ' ptl-entry-last' : ''}`
+        entry.dataset.entryIndex = String(globalIdx)
+        if (isLast) entry.dataset.testid = 'last-activity-entry'
+        entry.innerHTML = `
+          <div class="ptl-connector"><div class="ptl-dot"></div>${isLast ? '' : '<div class="ptl-line"></div>'}</div>
+          <div class="ptl-content">
+            <div>Entry #${globalIdx + 1}: ${globalIdx % 3 === 0 ? 'Tool call: list_files' : globalIdx % 3 === 1 ? 'Thinking about the task' : 'Status update'}</div>
+            ${globalIdx % 5 === 0 ? '<div class="ptl-tool-card" style="margin-top:6px;padding:8px;">extra detail line A<br/>extra detail line B</div>' : ''}
+          </div>
+        `
+        return entry
+      }
+
+      const timeline = document.querySelector('[data-testid="activity-timeline"]')
+      function rebuildTimeline(total) {
+        timeline.innerHTML = ''
+        for (let i = 0; i < total; i++) {
+          timeline.appendChild(buildEntry(i, i === total - 1))
+        }
+      }
+      rebuildTimeline(N)
+
+      // Populate the trailing card's activity too — it lives at the bottom of
+      // the panel-body, so reaching its last entry exercises both the outer
+      // panel scroll AND the inner activity scroll in series.
+      const trailingTimeline = document.querySelector('[data-testid="trailing-activity-timeline"]')
+      const trailingCount = Math.max(1, parseInt(params.get('trailing') || '120', 10))
+      for (let i = 0; i < trailingCount; i++) {
+        const isLast = i === trailingCount - 1
+        const entry = buildEntry(i, isLast)
+        if (isLast) entry.dataset.testid = 'trailing-last-entry'
+        trailingTimeline.appendChild(entry)
+      }
+
+      // Expose a global hook so the playwright test can drive the live append.
+      window.__appendEntries = function (count) {
+        const current = timeline.children.length
+        // Strip the previous 'last' marker.
+        const prevLast = timeline.querySelector('[data-testid="last-activity-entry"]')
+        if (prevLast) {
+          prevLast.classList.remove('ptl-entry-last')
+          prevLast.removeAttribute('data-testid')
+          // Restore the ptl-line that was hidden on the last entry.
+          if (!prevLast.querySelector('.ptl-line')) {
+            const dot = prevLast.querySelector('.ptl-dot')
+            const line = document.createElement('div')
+            line.className = 'ptl-line'
+            dot && dot.parentNode && dot.parentNode.appendChild(line)
+          }
+        }
+        for (let i = 0; i < count; i++) {
+          const isLast = i === count - 1
+          timeline.appendChild(buildEntry(current + i, isLast))
+        }
+      }
+
+      if (liveAppend > 0) {
+        // Append a few entries on a microtask so the test can wait for them.
+        queueMicrotask(() => window.__appendEntries(liveAppend))
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,605 @@
+schema_version: 2
+kind: opc_org_architecture
+organization_id: corporate
+organization_name: Team Runtime Co
+company:
+  name: Team Runtime Co
+  topology: Corporate Structure
+  company_profile: corporate
+  execution_model: actor_runtime
+  final_decider_role_id: ceo
+  company_profiles:
+  - corporate
+  - custom
+roles:
+- id: ceo
+  name: CEO
+  responsibility: Strategic intake, high-level routing, final aggregation and delivery
+    to the owner.
+  reports_to: owner
+  icon: leader
+  can_spawn:
+  - cto
+  - cmo
+  - coo
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - shell_exec
+  - file_write
+  - file_edit
+  preferred_external_agent: null
+  prompt_refs:
+  - Route tasks to the appropriate C-suite executive. Aggregate final results.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: cto
+  name: CTO
+  responsibility: Technical planning, architecture decisions, code review, and engineering
+    oversight.
+  reports_to: ceo
+  icon: code
+  can_spawn:
+  - senior_engineer
+  - devops_engineer
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - shell_exec
+  preferred_external_agent: null
+  prompt_refs:
+  - Focus on technical feasibility, architecture quality, and engineering best practices.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: cmo
+  name: CMO
+  responsibility: Marketing strategy, content planning, UX review, and brand oversight.
+  reports_to: ceo
+  icon: marketing
+  can_spawn:
+  - content_specialist
+  - designer
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - Optimize for audience fit, brand consistency, and content quality.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: coo
+  name: COO
+  responsibility: Operations coordination, process management, cross-team alignment,
+    and quality assurance.
+  reports_to: ceo
+  icon: strategy
+  can_spawn:
+  - acquisition_specialist
+  - qa_analyst
+  tools:
+  - file_read
+  - file_search
+  - list_dir
+  - todo_write
+  - todo_read
+  - web_search
+  - web_fetch
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - Ensure operational efficiency, process compliance, and delivery quality.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: acquisition_specialist
+  name: Acquisition Specialist
+  responsibility: Discover, verify, prepare, and report task-critical external inputs
+    inside the shared workspace.
+  reports_to: coo
+  icon: target
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_navigate_back
+  - browser_click
+  - browser_snapshot
+  - browser_type
+  - browser_wait_for
+  - browser_scroll
+  - browser_select_option
+  - browser_take_screenshot
+  - browser_close
+  preferred_external_agent: claude_code
+  prompt_refs:
+  - 'Run data acquisition in four phases: Discover, Verify, Prepare, Report.'
+  - For media tasks, HTML snapshots and URL lists never count as acquired binary assets.
+  - Use standard CLI download tools through shell_exec instead of ad hoc inline network
+    scripts.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: senior_engineer
+  name: Senior Engineer
+  responsibility: Code implementation, system development, and technical execution.
+  reports_to: cto
+  icon: terminal
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_navigate_back
+  - browser_click
+  - browser_snapshot
+  - browser_type
+  - browser_wait_for
+  - browser_scroll
+  - browser_select_option
+  - browser_take_screenshot
+  - browser_close
+  preferred_external_agent: codex
+  prompt_refs:
+  - Write clean, tested code. Leave clear documentation for reviewers.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: devops_engineer
+  name: DevOps Engineer
+  responsibility: Infrastructure, deployment, CI/CD, monitoring, and operational hardening.
+  reports_to: cto
+  icon: settings
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_navigate_back
+  - browser_click
+  - browser_snapshot
+  - browser_type
+  - browser_wait_for
+  - browser_scroll
+  - browser_select_option
+  - browser_take_screenshot
+  - browser_close
+  preferred_external_agent: cursor
+  prompt_refs:
+  - Prioritize operational safety, observability, and deployment readiness.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: content_specialist
+  name: Content Specialist
+  responsibility: Documentation, copywriting, presentations, and user-facing writing.
+  reports_to: cmo
+  icon: writing
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_navigate_back
+  - browser_click
+  - browser_snapshot
+  - browser_type
+  - browser_wait_for
+  - browser_scroll
+  - browser_select_option
+  - browser_take_screenshot
+  - browser_close
+  preferred_external_agent: null
+  prompt_refs:
+  - Write clearly for the target audience. Polish deliverables.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: designer
+  name: Designer
+  responsibility: Visual design, UX artifacts, wireframes, and design system work.
+  reports_to: cmo
+  icon: design
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  - browser_navigate
+  - browser_navigate_back
+  - browser_click
+  - browser_snapshot
+  - browser_type
+  - browser_wait_for
+  - browser_scroll
+  - browser_select_option
+  - browser_take_screenshot
+  - browser_close
+  preferred_external_agent: null
+  prompt_refs:
+  - Focus on usability, visual consistency, and design quality.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: qa_analyst
+  name: QA Analyst
+  responsibility: Testing, security review, compliance checks, and acceptance validation.
+  reports_to: coo
+  icon: bug
+  can_spawn: []
+  tools:
+  - file_read
+  - file_write
+  - file_search
+  - list_dir
+  - shell_exec
+  - browser_navigate
+  - browser_navigate_back
+  - browser_snapshot
+  - browser_wait_for
+  - browser_scroll
+  - browser_select_option
+  - browser_take_screenshot
+  preferred_external_agent: null
+  prompt_refs:
+  - Test rigorously. Reject unclear or unsafe outputs.
+  skill_refs: []
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: auto
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: work
+    shell_timeout_override: null
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+- id: env_engineer
+  name: Environment Engineer
+  responsibility: 'Probe the host environment, install required tools and dependencies,
+    prepare the assigned target_output_dir and base workspace directories, configure
+    runtime environments (conda/venv/docker/system packages), and produce a verified
+    environment manifest for downstream execution work items. Supports any toolchain:
+    video editing (FFmpeg, DaVinci), 3D engines (Unity, Unreal, Blender, Godot), audio
+    processing (FMOD, Wwise, SoX), ML/AI frameworks (PyTorch, TensorFlow), game development
+    SDKs, design tools, and any other software the task requires.'
+  reports_to: cto
+  icon: database
+  can_spawn: []
+  tools:
+  - shell_exec
+  - file_read
+  - file_write
+  - file_edit
+  - file_search
+  - list_dir
+  - web_search
+  - web_fetch
+  - todo_write
+  - todo_read
+  preferred_external_agent: null
+  prompt_refs:
+  - Always probe what is already installed before attempting installation.
+  - Prepare the assigned target_output_dir before downstream work items run, including
+    any missing parent directories and baseline workspace folders.
+  - Produce a structured environment_manifest JSON as your final artifact.
+  - Include verification commands that downstream work items can use to validate the
+    environment.
+  - Prefer system package managers (apt, brew, dnf) for system tools, pip/conda/uv
+    for Python packages.
+  - When GPU is needed, check CUDA/ROCm availability and driver versions.
+  - For complex environments, create isolated envs (conda/venv) rather than polluting
+    the host.
+  skill_refs:
+  - env_provisioning
+  handoff_template_ref: null
+  memory_policy_ref: null
+  artifact_contract_ref: null
+  runtime_policy:
+    execution_strategy: native
+    allowed_downstream_roles: []
+    review_role: null
+    default_turn_type: setup
+    shell_timeout_override: 1800
+    setup_env_type: null
+    coordination_hints: {}
+    signal_capabilities: []
+    parallelism_constraints: []
+    gate_preferences: {}
+  capabilities: []
+  role_type: worker
+  coordinator_policy: null
+employees: []
+escalation_rules: []
+runtime_policies:
+  corporate:
+    communication:
+      default_mode: dm
+      blocking_default: false
+      meeting_required_for:
+      - architecture
+      - cross_team_conflict
+      allow_broadcast: true
+    memory:
+      include_role_memory: true
+      include_project_memory: false
+      include_decision_log: true
+      include_artifact_index: true
+      recent_history_lines: 12
+    handoff:
+      require_structured_handoff: true
+      require_ack: false
+      include_risks: true
+      include_open_questions: true
+    artifact:
+      enforce_contract: false
+      require_artifact_index: true
+      required_kinds: []
+    review:
+      enable_work_item_gates: false
+      strict_gate_inference: false
+      require_reviewer_role: true
+      allow_human_override: true
+    gate_harness:
+      enabled: true
+      decision_mode: agent_first
+      default_degrade_policy: allow
+      auto_infer_turn_kind: true
+      auto_infer_gate_profile: true
+      max_rework_rounds_per_issue: 2
+      stagnation_threshold: 2
+      allow_pass_with_constraints: true
+      enable_delivery_constraints_propagation: true
+      agent_model: ''
+      agent_confidence_threshold: 0.55
+      fallback_to_rules_on_parse_error: true
+      builtin_blocker_map:
+        workspace_mismatch: rework_same_work_item
+        missing_required_artifact: rework_same_work_item
+        verification_missing: rework_same_work_item
+        dependency_not_ready: rework_same_work_item
+        cross_work_item_conflict: replan
+        external_secret_missing: await_user_decision
+        permission_missing: escalate
+        environment_capability_gap: pass_with_constraints
+        quality_gap: rework_same_work_item
+        goal_env_mismatch: replan
+        unresolved_user_visible_risk: pass_with_constraints
+      turn_kind_overrides: {}
+      gate_profile_overrides: {}
+    parallel:
+      auto_dispatch: true
+      review_gate_enabled: true
+      max_workers: 10
+    coordination:
+      inference_mode: llm_primary
+      fallback_mode: conservative
+      strict_gate_turn_kinds:
+      - verify
+      - deliver
+      mixed_gate_turn_kinds:
+      - synthesize
+      - review
+      - integration
+      allow_manager_release_for_mixed_only: true
+      allow_custom_signals: true
+talent_templates: []
+teams: []
+team_runtime:
+  default_team_id: ''
+  shared_role_session_scope: team
+  allow_shared_role_sessions: true
+  seat_refresh_interval_seconds: 30
+  metadata: {}
+installed_packages: []
+role_serial_queue_enabled: true
+metadata:
+  source: opc_config
+  organization_config_file: company_orgs/org_corporate_config.yaml

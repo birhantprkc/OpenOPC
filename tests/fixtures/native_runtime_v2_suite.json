@@ -1,0 +1,108 @@
+{
+  "suite_version": "1.0",
+  "name": "native_runtime_v2_openopc_style",
+  "description": "OpenOPC style benchmark suite for evaluating OpenOPC Native Runtime V2 across long-running coding, resume, permission, subagent, and company-mode workflows.",
+  "metrics": [
+    "success_rate",
+    "average_turns",
+    "tool_success_rate",
+    "permission_interruption_rate",
+    "token_cost_usd",
+    "resume_success_rate",
+    "cache_stable_prefix_reuse_rate",
+    "verifier_catch_rate"
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "long_session_coding",
+      "name": "Long Session Coding",
+      "mode": "task_mode",
+      "goal": "Sustain a 100-turn coding session with automatic compaction while preserving correctness.",
+      "acceptance_signals": [
+        "completes_without_legacy_loop",
+        "compaction_applied",
+        "checkpoint_saved",
+        "turn_completed"
+      ]
+    },
+    {
+      "scenario_id": "repo_search_implement",
+      "name": "Repo Search And Implement",
+      "mode": "task_mode",
+      "goal": "Search a repository, implement a change, and validate it with tools in one continuous runtime session.",
+      "acceptance_signals": [
+        "tool_started",
+        "tool_progress",
+        "tool_completed",
+        "turn_completed"
+      ]
+    },
+    {
+      "scenario_id": "browser_verification",
+      "name": "Browser Verification",
+      "mode": "task_mode",
+      "goal": "Use browser tools to verify the implementation and report validation status without leaving runtime_v2.",
+      "acceptance_signals": [
+        "tool_started",
+        "tool_completed",
+        "assistant_delta"
+      ]
+    },
+    {
+      "scenario_id": "permission_intercept",
+      "name": "Permission Intercept",
+      "mode": "task_mode",
+      "goal": "Fail closed on dangerous shell or file operations and resume correctly after user approval.",
+      "acceptance_signals": [
+        "permission_requested",
+        "permission_resolved",
+        "checkpoint_saved"
+      ]
+    },
+    {
+      "scenario_id": "subagent_parallel",
+      "name": "Subagent Parallel",
+      "mode": "task_mode",
+      "goal": "Spawn multiple specialist subagents, coordinate them, and merge results back into the parent runtime.",
+      "acceptance_signals": [
+        "subagent_started",
+        "subagent_updated",
+        "subagent_completed"
+      ]
+    },
+    {
+      "scenario_id": "compaction_continue",
+      "name": "Compaction Continue",
+      "mode": "task_mode",
+      "goal": "Continue execution after durable compaction with session memory reinjected into the prompt.",
+      "acceptance_signals": [
+        "compaction_applied",
+        "assistant_delta",
+        "turn_completed"
+      ]
+    },
+    {
+      "scenario_id": "checkpoint_resume",
+      "name": "Checkpoint Resume",
+      "mode": "task_mode",
+      "goal": "Persist a structured checkpoint, restore transcript state, and resume tool execution without legacy recovery text.",
+      "acceptance_signals": [
+        "checkpoint_saved",
+        "turn_started",
+        "turn_completed"
+      ]
+    },
+    {
+      "scenario_id": "company_work_item_execution",
+      "name": "Company Work Item Execution",
+      "mode": "company_mode",
+      "goal": "Execute a company-mode workflow stage with native runtime_v2 semantics and keep progress visible to channels and Office UI.",
+      "acceptance_signals": [
+        "turn_started",
+        "tool_started",
+        "checkpoint_saved",
+        "turn_completed"
+      ]
+    }
+  ]
+}

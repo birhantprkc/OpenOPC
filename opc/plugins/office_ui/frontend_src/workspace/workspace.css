@@ -1,0 +1,1878 @@
+/* ═══════════════════════════════════════════════════════
+   Workspace — Unified three-column layout
+   ═══════════════════════════════════════════════════════ */
+
+/* Three-column container */
+.workspace-page {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Middle column: Board area */
+.workspace-board {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.project-cockpit {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-elevated) 92%, var(--surface) 8%);
+  flex-shrink: 0;
+}
+
+.project-cockpit.embedded {
+  flex: 1;
+  padding: 12px;
+  border-bottom: none;
+  background: transparent;
+  overflow: auto;
+}
+
+.project-cockpit.embedded .project-cockpit-grid--team {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.project-cockpit.embedded .project-cockpit-team-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.project-cockpit.embedded .project-cockpit-team-head {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.project-cockpit.embedded .project-cockpit-team-status {
+  align-self: flex-start;
+}
+
+.project-cockpit.embedded .project-cockpit-seat-row {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: flex-start;
+}
+
+.project-cockpit.embedded .project-cockpit-metrics span,
+.project-cockpit.embedded .project-cockpit-summary span,
+.project-cockpit.embedded .project-cockpit-team-meta span,
+.project-cockpit.embedded .project-cockpit-seat-role,
+.project-cockpit.embedded .project-cockpit-seat-id {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+.project-cockpit-overview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.project-cockpit-title {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.project-cockpit-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+}
+
+.project-cockpit-title strong {
+  font-size: 14px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.project-cockpit-stop-btn {
+  margin-left: auto;
+  padding: 3px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  border: 1px solid var(--red);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  color: var(--red);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.project-cockpit-stop-btn:hover {
+  background: color-mix(in srgb, var(--red) 20%, transparent);
+}
+
+.project-cockpit-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.project-cockpit-metrics span,
+.project-cockpit-summary span {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--surface);
+}
+
+.project-cockpit-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.project-cockpit-grid--team {
+  grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.6fr);
+}
+
+.project-cockpit-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 180px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.project-cockpit-panel--wide {
+  min-width: 0;
+}
+
+.project-cockpit-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-cockpit-panel h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.project-cockpit-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+  overflow: auto;
+}
+
+.project-cockpit-inline-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.project-cockpit-team-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+  padding: 10px 12px;
+  overflow: auto;
+}
+
+.project-cockpit-team-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  padding: 10px;
+}
+
+.project-cockpit-team-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.project-cockpit-team-title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.project-cockpit-team-title strong {
+  font-size: 13px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.project-cockpit-team-title span {
+  font-size: 11px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.project-cockpit-team-status,
+.project-cockpit-seat-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.project-cockpit-team-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.project-cockpit-team-meta span {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--surface);
+}
+
+.project-cockpit-seat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.project-cockpit-seat-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--surface);
+}
+
+.project-cockpit-seat-role,
+.project-cockpit-seat-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.project-cockpit-seat-id {
+  color: var(--text-secondary);
+}
+
+.project-cockpit-team-status.status-running,
+.project-cockpit-seat-status.status-running,
+.project-cockpit-team-status.status-active,
+.project-cockpit-seat-status.status-active,
+.project-cockpit-team-status.status-ready,
+.project-cockpit-seat-status.status-ready {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 55%, var(--border) 45%);
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+}
+
+.project-cockpit-team-status.status-blocked,
+.project-cockpit-seat-status.status-blocked,
+.project-cockpit-team-status.status-awaiting-review,
+.project-cockpit-seat-status.status-awaiting-review,
+.project-cockpit-team-status.status-awaiting-peer,
+.project-cockpit-seat-status.status-awaiting-peer,
+.project-cockpit-team-status.status-awaiting_review,
+.project-cockpit-seat-status.status-awaiting_review,
+.project-cockpit-team-status.status-awaiting-manager-review,
+.project-cockpit-seat-status.status-awaiting-manager-review,
+.project-cockpit-team-status.status-awaiting-human-review,
+.project-cockpit-seat-status.status-awaiting-human-review {
+  color: var(--yellow);
+  border-color: color-mix(in srgb, var(--yellow) 55%, var(--border) 45%);
+  background: color-mix(in srgb, var(--yellow) 10%, transparent);
+}
+
+.project-cockpit-team-status.status-failed,
+.project-cockpit-seat-status.status-failed,
+.project-cockpit-team-status.status-error,
+.project-cockpit-seat-status.status-error {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 55%, var(--border) 45%);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+}
+
+.project-cockpit-team-status.status-idle,
+.project-cockpit-seat-status.status-idle,
+.project-cockpit-team-status.status-cold,
+.project-cockpit-seat-status.status-cold,
+.project-cockpit-team-status.status-paused,
+.project-cockpit-seat-status.status-paused,
+.project-cockpit-team-status.status-done,
+.project-cockpit-seat-status.status-done {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border) 45%);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+@media (max-width: 1280px) {
+  .project-cockpit-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .project-cockpit-grid--team {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 780px) {
+  .project-cockpit-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .project-cockpit-seat-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* When panel is maximized, hide the board */
+.workspace-page.panel-maximized .workspace-board {
+  display: none;
+}
+
+/* ── Context Panel ──────────────────────────────────── */
+
+.ctx-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-elevated);
+  overflow: hidden;
+  transition: width 0.15s ease;
+  position: relative;
+  /* Enable container queries so children respond to the panel's own width
+     instead of the viewport. The user can drag this panel to any width
+     independently of the browser size, so viewport-based media queries
+     produce the wrong breakpoints. */
+  container-type: inline-size;
+  container-name: ctxpanel;
+}
+
+.ctx-panel.collapsed {
+  width: 0 !important;
+  border-left: none;
+  overflow: hidden;
+}
+
+.ctx-panel.maximized {
+  flex: 1;
+}
+
+/* Resize handle */
+.ctx-resize-handle {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.ctx-resize-handle:hover,
+.ctx-resize-handle.active {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+/* Collapsed strip */
+.ctx-collapse-strip {
+  width: 24px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-left: 1px solid var(--border);
+  opacity: 0.5;
+  transition: opacity 0.15s;
+}
+
+.ctx-collapse-strip:hover {
+  opacity: 1;
+}
+
+/* Panel header (tab bar) */
+.ctx-header {
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  height: 36px;
+  gap: 2px;
+  flex-shrink: 0;
+  /* Allow horizontal scrolling of tab labels when the panel is narrow.
+     The trailing actions cluster (maximize / close) is pinned outside the
+     scroll region via `.ctx-header-actions` below. */
+  min-width: 0;
+}
+
+.ctx-header-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  scroll-behavior: smooth;
+  /* Fade out the right edge so scrollable content visually hints there's
+     more — without a chunky scrollbar eating real estate. */
+  mask-image: linear-gradient(to right, transparent 0, black 6px, black calc(100% - 14px), transparent 100%);
+}
+
+.ctx-header-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.ctx-tab {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 6px 10px;
+  cursor: pointer;
+  border-radius: var(--radius-xs);
+  transition: color 0.15s, background 0.15s;
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-family: inherit;
+}
+
+.ctx-tab:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.ctx-tab.active {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
+.ctx-header-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+  padding-left: 6px;
+  flex-shrink: 0;
+}
+
+.ctx-header-actions button {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: var(--radius-xs);
+  display: flex;
+  align-items: center;
+}
+
+.ctx-header-actions button:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.ctx-header-title {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 0 4px;
+}
+
+.ctx-session-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-elevated) 90%, var(--surface) 10%);
+  flex-shrink: 0;
+}
+
+.ctx-session-strip-scroll {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.ctx-session-chip {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+}
+
+.ctx-session-chip.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border) 45%);
+  background: color-mix(in srgb, var(--accent-soft) 75%, var(--surface) 25%);
+}
+
+.ctx-session-chip-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.ctx-session-chip-status,
+.ctx-multi-card-status {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: var(--text-secondary);
+}
+
+.ctx-session-chip-status.status-running,
+.ctx-multi-card-status.status-running {
+  background: var(--green);
+}
+
+.ctx-session-chip-status.status-idle,
+.ctx-multi-card-status.status-idle,
+.ctx-session-chip-status.status-done,
+.ctx-multi-card-status.status-done {
+  background: var(--accent);
+}
+
+.ctx-session-chip-status.status-failed,
+.ctx-multi-card-status.status-failed {
+  background: var(--red);
+}
+
+.ctx-session-chip-status.status-cancelled,
+.ctx-multi-card-status.status-cancelled {
+  background: var(--text-secondary);
+}
+
+.ctx-session-chip-title {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  min-width: 0;
+}
+
+@container ctxpanel (max-width: 480px) {
+  .ctx-session-chip-title {
+    max-width: 120px;
+  }
+}
+
+.ctx-session-chip-unread {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.ctx-session-chip-close {
+  border: none;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+}
+
+.ctx-session-chip-close:hover,
+.ctx-session-view-btn:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.ctx-session-view-btn {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.ctx-session-view-btn.active {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border) 45%);
+  background: color-mix(in srgb, var(--accent-soft) 75%, var(--surface) 25%);
+}
+
+/* Panel body */
+.ctx-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.ctx-body > .msg-list {
+  min-height: 0;
+}
+
+.ctx-work-item-progress {
+  flex-shrink: 0;
+  padding: 12px 12px 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  max-height: 50vh;
+  position: relative;
+  z-index: 1;
+  background: var(--bg-elevated);
+}
+
+.ctx-multi-grid {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  /* Allow cards to shrink below 320px when there is only one column;
+     `min(100%, 320px)` lets a single column take the full width gracefully
+     rather than forcing horizontal scroll on a narrow panel. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 12px;
+  padding: 12px;
+  align-content: start;
+}
+
+.ctx-multi-card {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--bg-elevated) 86%, var(--surface) 14%);
+  overflow: hidden;
+  /* Each card has its own container context so per-card composer / pills
+     can also wrap when one column gets narrow. */
+  container-type: inline-size;
+  container-name: ctxpanel;
+}
+
+.ctx-multi-card.focused {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border) 40%);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent 76%);
+}
+
+.ctx-multi-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.ctx-multi-card-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  padding: 0;
+}
+
+.ctx-multi-card-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.ctx-multi-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.ctx-multi-card-actions button {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ctx-multi-card-actions button:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.ctx-multi-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.ctx-multi-card-body {
+  flex: 1;
+  min-height: 220px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.ctx-multi-card-body .msg-list {
+  flex: 1;
+  min-height: 0;
+}
+
+.ctx-multi-card .msg-composer {
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+}
+
+@media (max-width: 900px) {
+  .ctx-multi-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 8px;
+  }
+
+  .ctx-multi-card-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 640px) {
+  .ctx-session-strip {
+    flex-wrap: wrap;
+  }
+
+  .ctx-session-strip-scroll {
+    flex-basis: 100%;
+    order: 2;
+  }
+}
+
+/* Child detail top bar */
+.ctx-child-topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.ctx-back-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.ctx-back-btn:hover {
+  text-decoration: underline;
+}
+
+.ctx-child-stop-btn {
+  margin-left: auto;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  border: 1px solid var(--red);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  color: var(--red);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.ctx-child-stop-btn:hover {
+  background: color-mix(in srgb, var(--red) 20%, transparent);
+}
+
+.ctx-child-resume-btn {
+  margin-left: auto;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  border: 1px solid var(--green);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  color: var(--green);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.ctx-child-resume-btn:hover {
+  background: color-mix(in srgb, var(--green) 22%, transparent);
+}
+
+/* Child detail header */
+.ctx-child-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ctx-child-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.ctx-child-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.ctx-child-name {
+  font-weight: 600;
+  font-size: 13px;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctx-child-work-item {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.ctx-task-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ctx-task-detail-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.ctx-task-kv-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+.ctx-task-kv-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.ctx-task-kv-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.ctx-task-kv-value {
+  font-size: 12px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Card selection highlight */
+.kanban-card.is-selected {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* Empty state for context panel */
+.ctx-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: var(--text-secondary);
+  font-size: 13px;
+  gap: 8px;
+  padding: 20px;
+  text-align: center;
+}
+
+.ctx-empty-icon {
+  font-size: 24px;
+  opacity: 0.4;
+}
+
+/* Sections in child detail */
+.ctx-child-detail {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.ctx-child-detail .exec-section {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ctx-child-detail .exec-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
+.ctx-child-detail .exec-section-content {
+  font-size: 12px;
+}
+
+.ctx-child-transcript {
+  display: flex;
+  flex-direction: column;
+  min-height: 280px;
+  max-height: 55vh;
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.ctx-child-transcript-header,
+.ctx-child-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
+.ctx-child-transcript-header {
+  padding: 8px 12px 0;
+}
+
+.ctx-child-transcript .msg-list {
+  min-height: 0;
+}
+
+.ctx-child-markdown-section,
+.ctx-child-artifacts,
+.ctx-child-passed-to {
+  padding: 8px 12px;
+}
+
+.ctx-child-artifacts,
+.ctx-child-passed-to {
+  border-top: 1px solid var(--border);
+}
+
+.ctx-child-markdown-card {
+  padding: 10px 12px;
+}
+
+.ctx-child-markdown-card .msg-content-agent {
+  font-size: 12px;
+}
+
+.ctx-child-artifact-list {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+}
+
+/* ── Info tab — sectioned card layout (Status / People / Timing / Dev) ──
+   The old key:value list looked like a spreadsheet, exposed internal
+   identifiers, and wasted vertical space. This rebuild groups fields by
+   concern, hides debug fields behind an opt-in toggle, and uses card
+   surfaces for visual hierarchy. */
+
+.ctx-info-v2 {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 14px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ctx-info-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ctx-info-section-title {
+  margin: 0 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.ctx-info-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent 20%);
+  background: color-mix(in srgb, var(--surface) 60%, var(--bg-elevated) 40%);
+}
+
+.ctx-info-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.ctx-info-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--surface) 70%, var(--bg-elevated) 30%);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent 30%);
+  color: var(--text);
+  text-transform: capitalize;
+}
+
+.ctx-info-status-pill.status-running    { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, transparent 65%); }
+.ctx-info-status-pill.status-idle,
+.ctx-info-status-pill.status-suspended  { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent 65%); }
+.ctx-info-status-pill.status-done       { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, transparent 65%); }
+.ctx-info-status-pill.status-failed,
+.ctx-info-status-pill.status-cancelled  { color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, transparent 65%); }
+.ctx-info-status-pill.status-blocked,
+.ctx-info-status-pill.status-awaiting_human { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 35%, transparent 65%); }
+
+.ctx-info-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.ctx-info-priority-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  background: transparent;
+}
+
+.ctx-info-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.ctx-info-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-elevated) 80%, transparent 20%);
+  border: 1px solid color-mix(in srgb, var(--border) 65%, transparent 35%);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.ctx-info-fact {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 0;
+  min-width: 0;
+}
+
+.ctx-info-fact-label {
+  /* Width must adapt: long labels like "Execution agent" need ~96px on a
+     wide panel but compress on narrow ones. `flex: 0 0 auto` + clamp
+     gives both: never grows, never falls below 72px, scales smoothly. */
+  flex: 0 0 auto;
+  width: clamp(72px, 22%, 104px);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  padding-top: 2px;
+  /* If a label is somehow longer than the column, wrap it gracefully. */
+  word-break: break-word;
+}
+
+.ctx-info-fact-value {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  word-break: break-word;
+}
+
+.ctx-info-mono {
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.ctx-info-mono-break {
+  word-break: break-all;
+  display: inline-block;
+  line-height: 1.5;
+}
+
+.ctx-info-dev-section {
+  margin-top: 4px;
+}
+
+.ctx-info-dev-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  margin-left: -4px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  border-radius: 6px;
+  align-self: flex-start;
+  transition: color 140ms ease, background 140ms ease;
+}
+
+.ctx-info-dev-toggle:hover,
+.ctx-info-dev-toggle.expanded {
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface) 50%, transparent 50%);
+}
+
+.ctx-info-dev-card {
+  background: color-mix(in srgb, var(--bg-elevated) 86%, var(--surface) 14%);
+  border-style: dashed;
+}
+
+@container ctxpanel (max-width: 360px) {
+  /* Truly cramped: stack label+value vertically so neither truncates. */
+  .ctx-info-v2 { padding: 12px 10px 20px; gap: 12px; }
+  .ctx-info-card { padding: 10px 12px; }
+  .ctx-info-fact {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+  .ctx-info-fact-label { width: auto; font-size: 9.5px; }
+  .ctx-info-fact-value { font-size: 12px; }
+}
+
+/* ── Agents panel inside ContextPanel ─────────────────────────────────── */
+.ctx-body .awp {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: minmax(300px, 38%) minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-areas:
+    "header header"
+    "search search"
+    "list detail";
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  border-left: none;
+  background: color-mix(in srgb, var(--bg) 88%, var(--surface) 12%);
+}
+
+.ctx-body .awp-header {
+  grid-area: header;
+  padding: 10px 16px;
+  background: color-mix(in srgb, var(--bg-elevated) 82%, var(--surface) 18%);
+}
+
+.ctx-body .awp-title {
+  font-size: 13px;
+  gap: 8px;
+}
+
+.ctx-body .awp-count {
+  font-size: 11px;
+  padding: 2px 7px;
+}
+
+.ctx-body .awp-controls {
+  gap: 8px;
+}
+
+.ctx-body .awp-filter {
+  min-width: 112px;
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+.ctx-body .awp-search-toggle {
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+  border: 1px solid transparent;
+}
+
+.ctx-body .awp-search-toggle:hover,
+.ctx-body .awp-search-toggle.active {
+  border-color: var(--border);
+  background: var(--surface);
+}
+
+.ctx-body .awp-search-bar {
+  grid-area: search;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--bg) 82%, var(--surface) 18%);
+}
+
+.ctx-body .awp-search-input {
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+.ctx-body .awp-list {
+  grid-area: list;
+  flex: unset;
+  min-height: 0;
+  max-height: none;
+  border-right: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 94%, var(--surface) 6%);
+}
+
+.ctx-body .awp:not(:has(.awp-detail)) .awp-list {
+  grid-column: 1 / -1;
+  border-right: none;
+}
+
+.ctx-body .awp-row {
+  display: grid;
+  grid-template-columns: 10px minmax(160px, 1fr) minmax(148px, 220px) minmax(44px, max-content);
+  gap: 10px;
+  min-height: 58px;
+  padding: 10px 16px;
+  font-size: 12px;
+}
+
+.ctx-body .awp-row-selected {
+  padding-left: 14px;
+}
+
+.ctx-body .awp-dot {
+  align-self: center;
+}
+
+.ctx-body .awp-row-info {
+  gap: 3px;
+}
+
+.ctx-body .awp-row-name {
+  font-size: 12.5px;
+  line-height: 1.25;
+}
+
+.ctx-body .awp-row-projection {
+  font-size: 10.5px;
+  line-height: 1.25;
+}
+
+.ctx-body .awp-row-activity {
+  max-width: none;
+  justify-self: end;
+  font-size: 11.5px;
+  line-height: 1.25;
+}
+
+.ctx-body .awp-row-time {
+  min-width: 36px;
+  font-size: 10.5px;
+}
+
+.ctx-body .awp-detail {
+  grid-area: detail;
+  flex: unset;
+  min-width: 0;
+  min-height: 260px;
+  border-top: none;
+  border-left: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-elevated) 78%, var(--bg) 22%);
+}
+
+.ctx-body .awp-detail-header {
+  padding: 12px 16px;
+}
+
+.ctx-body .awp-detail-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  font-size: 15px;
+}
+
+.ctx-body .awp-detail-name {
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.ctx-body .awp-detail-role,
+.ctx-body .awp-detail-employee,
+.ctx-body .awp-detail-projection {
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.ctx-body .awp-detail-body {
+  padding: 12px 16px 16px;
+}
+
+.ctx-body .awp-detail-section-label {
+  letter-spacing: 0;
+}
+
+.ctx-body .awp .wf-role-turns {
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ctx-body .awp .wf-role-turn {
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 72%, var(--bg) 28%);
+}
+
+.ctx-body .awp .wf-role-turn-button {
+  grid-template-columns: auto minmax(0, 1fr) max-content 22px;
+  min-height: 48px;
+  padding: 10px 12px;
+  gap: 10px;
+}
+
+.ctx-body .awp .wf-role-turn-title {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.ctx-body .awp .wf-role-turn-time {
+  align-self: center;
+  white-space: nowrap;
+}
+
+.ctx-body .awp .wf-role-turn-chevron {
+  align-self: center;
+  justify-self: end;
+  width: 22px;
+  height: 22px;
+  justify-content: center;
+  color: var(--text-secondary);
+  opacity: 0.9;
+}
+
+.ctx-body .awp .wf-role-turn-chevron svg {
+  width: 14px;
+  height: 14px;
+}
+
+.ctx-body .awp .wf-role-turn-activity {
+  padding: 12px;
+}
+
+@container ctxpanel (max-width: 720px) {
+  .ctx-body .awp {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(180px, 42%) minmax(260px, 1fr);
+    grid-template-areas:
+      "header"
+      "search"
+      "list"
+      "detail";
+  }
+
+  .ctx-body .awp-list {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ctx-body .awp-detail {
+    min-height: 260px;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+
+  .ctx-body .awp:not(:has(.awp-detail)) .awp-list {
+    grid-row: 3 / -1;
+  }
+
+  .ctx-body .awp-row {
+    grid-template-columns: 10px minmax(0, 1fr) minmax(34px, max-content);
+    grid-template-rows: auto auto;
+    gap: 4px 10px;
+    min-height: 56px;
+    padding: 9px 12px;
+  }
+
+  .ctx-body .awp-row-activity {
+    grid-column: 2 / 4;
+    justify-self: start;
+  }
+
+  .ctx-body .awp-row-time {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .ctx-body .awp .wf-role-turn-button {
+    grid-template-columns: auto minmax(0, 1fr) 22px;
+    grid-template-rows: auto auto;
+    min-height: 58px;
+  }
+
+  .ctx-body .awp .wf-role-turn-time {
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: start;
+  }
+
+  .ctx-body .awp .wf-role-turn-chevron {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+  }
+}
+
+@container ctxpanel (max-width: 420px) {
+  .ctx-body .awp-header {
+    align-items: flex-start;
+    gap: 8px;
+    flex-direction: column;
+  }
+
+  .ctx-body .awp-controls {
+    width: 100%;
+  }
+
+  .ctx-body .awp-filter {
+    flex: 1;
+  }
+}
+
+/* ── Work Item Recovery Panel ────────────────────────────────────────── */
+
+.wfr-panel {
+  padding: 0 8px;
+}
+
+.wfr-card {
+  background: color-mix(in srgb, var(--yellow, #f39c12) 8%, var(--bg-secondary));
+  border: 1px solid color-mix(in srgb, var(--yellow, #f39c12) 25%, transparent);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+}
+
+.wfr-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.wfr-icon {
+  font-size: 16px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.wfr-header-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wfr-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.wfr-subtitle {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.wfr-work-items {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.wfr-work-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.wfr-work-item-icon {
+  font-size: 12px;
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+  font-weight: 700;
+}
+
+.wfr-work-item-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wfr-work-item-badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--red, #e74c3c) 15%, transparent);
+  color: var(--red, #e74c3c);
+  flex-shrink: 0;
+}
+
+.wfr-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.wfr-btn {
+  padding: 5px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.wfr-btn--resume {
+  background: var(--green, #27ae60);
+  color: #fff;
+}
+.wfr-btn--resume:hover { opacity: 0.85; }
+
+.wfr-btn--cancel {
+  background: var(--red, #e74c3c);
+  color: #fff;
+}
+.wfr-btn--cancel:hover { opacity: 0.85; }
+
+.wfr-btn--dismiss {
+  background: transparent;
+  color: var(--text-secondary);
+}
+.wfr-btn--dismiss:hover { color: var(--text); }
+
+.wfr-recovering {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--accent);
+}
+
+/* ═══════════════════════════════════════════════════════
+   Kanban empty-state
+   ═══════════════════════════════════════════════════════ */
+.kanban-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: var(--text-secondary);
+  font-size: 14px;
+  padding: 32px 16px;
+  text-align: center;
+}
+.kanban-empty-state-inline {
+  flex: 0;
+  padding: 16px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   TaskDetailView — detail sections
+   ═══════════════════════════════════════════════════════ */
+.task-detail-runtime {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  font-size: 11px;
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--surface);
+}
+
+.task-detail-runtime.status-reflecting {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 8%, var(--surface));
+}
+
+.task-detail-runtime.status-tool_active {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, var(--surface));
+}
+
+.task-detail-runtime-agent {
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+
+.task-detail-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.task-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.task-detail-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0;
+}
+
+.task-detail-dep-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.task-detail-dep-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: var(--surface);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.task-detail-dep-id {
+  font-size: 10px;
+  color: var(--text-secondary);
+  font-family: 'SF Mono', 'Fira Code', Consolas, 'Courier New', monospace;
+  flex-shrink: 0;
+}
+
+.task-detail-handoff {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+}
+
+.task-detail-progress {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 200px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.progress-entry {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.progress-entry:hover {
+  background: var(--surface);
+}
+
+.progress-time {
+  font-size: 10px;
+  color: var(--text-secondary);
+  font-family: 'SF Mono', 'Fira Code', Consolas, 'Courier New', monospace;
+  flex-shrink: 0;
+  min-width: 64px;
+}
+
+.progress-summary {
+  color: var(--text);
+  word-break: break-word;
+}
+
+.progress-entry.type-thinking .progress-summary { color: var(--yellow); }
+.progress-entry.type-tool_call .progress-summary { color: var(--green); }
+.progress-entry.type-handoff .progress-summary { color: var(--accent); }
+.progress-entry.type-gate_result .progress-summary { color: #d97706; }
+
+/* ═══════════════════════════════════════════════════════
+   TaskDetailView — linked session messages
+   ═══════════════════════════════════════════════════════ */
+.task-detail-linked-messages {
+  max-height: 400px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 0;
+  background: var(--bg);
+}
+.task-detail-empty-hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-style: italic;
+  margin: 4px 0;
+}

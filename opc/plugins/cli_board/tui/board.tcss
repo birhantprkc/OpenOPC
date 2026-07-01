@@ -1,0 +1,79 @@
+Screen {
+    layout: vertical;
+    background: #020617;
+    color: #e2e8f0;
+}
+
+Header {
+    background: #0f172a;
+    color: #e2e8f0;
+}
+
+Footer {
+    background: #0f172a;
+    color: #94a3b8;
+}
+
+#metrics-bar {
+    height: auto;
+    padding: 0 1 1 1;
+}
+
+#body {
+    height: 1fr;
+    padding: 0 1 0 1;
+}
+
+#session-shell,
+#main-shell,
+#context-shell {
+    height: 1fr;
+    min-height: 12;
+    border: round #1e293b;
+    background: #020617;
+    padding: 1;
+}
+
+#session-shell {
+    width: 30;
+    min-width: 26;
+    max-width: 34;
+}
+
+#main-shell {
+    width: 2fr;
+    min-width: 48;
+    margin: 0 1;
+}
+
+#context-shell {
+    width: 42;
+    min-width: 34;
+    max-width: 56;
+}
+
+#session-scroll,
+#main-scroll,
+#context-scroll {
+    height: 1fr;
+}
+
+#context-tabs {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#status-bar {
+    height: auto;
+    padding: 0 1;
+    background: #0f172a;
+    color: #e2e8f0;
+}
+
+.hidden {
+    display: none;
+}
+
+.pane-focused {
+    border: round #38bdf8;
+}

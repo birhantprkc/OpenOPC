@@ -1,0 +1,226 @@
+/* Config import/export panel styles. */
+
+/* ── Config Import/Export Panel ──────────────────────────────────── */
+
+.cfg-io-panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.3),
+    0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+.cfg-io-header {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.cfg-io-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+.cfg-io-subtitle {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 4px 0 0;
+  line-height: 1.5;
+}
+
+.cfg-io-section {
+  padding: 14px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cfg-io-section + .cfg-io-section {
+  border-top: 1px solid var(--border);
+}
+
+.cfg-io-section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cfg-io-section-icon {
+  width: 16px;
+  height: 16px;
+  opacity: 0.6;
+}
+.cfg-io-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+
+/* Upload row: hidden file input + styled label */
+.cfg-io-upload-row {
+  display: flex;
+  align-items: center;
+}
+.cfg-io-file-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+}
+.cfg-io-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  border: 0;
+}
+.cfg-io-file-btn {
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text);
+  transition: border-color 0.15s, color 0.15s;
+}
+.cfg-io-file-label:hover .cfg-io-file-btn {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.cfg-io-file-input:focus-visible + .cfg-io-file-btn {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cfg-io-file-name {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* Textarea — monospace for YAML */
+.cfg-io-textarea {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  line-height: 1.5;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 140px;
+}
+.cfg-io-textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.cfg-io-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+  flex-wrap: wrap;
+}
+
+/* Preview box (success / ready to apply) */
+.cfg-io-preview {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--green) 28%, transparent);
+  border-radius: var(--radius-xs);
+  margin-top: 4px;
+}
+.cfg-io-preview-icon {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.cfg-io-preview-body {
+  flex: 1;
+  min-width: 0;
+}
+.cfg-io-preview-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--green);
+  margin-bottom: 8px;
+}
+.cfg-io-preview-stats {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.cfg-io-preview-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cfg-io-stat-label {
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  font-weight: 500;
+}
+.cfg-io-stat-value {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Error box */
+.cfg-io-error {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 28%, transparent);
+  border-radius: var(--radius-xs);
+  margin-top: 4px;
+}
+.cfg-io-error-icon {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.cfg-io-error-body {
+  flex: 1;
+  min-width: 0;
+}
+.cfg-io-error-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--red);
+  margin-bottom: 6px;
+}
+.cfg-io-error-text {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text);
+  background: var(--bg-secondary);
+  padding: 8px 10px;
+  border-radius: 4px;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.4;
+}

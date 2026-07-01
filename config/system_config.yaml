@@ -1,0 +1,313 @@
+system:
+  auto_approve_below_cost: 10.0
+  context_compression_threshold: 0.85
+  default_channel: cli
+  escalation_timeout_seconds: 300
+  log_level: INFO
+  max_agent_iterations: 50
+  opc_home: ''
+  browser:
+    mode: embedded
+    headless: true
+    chrome_channel: chrome
+    chrome_executable_path: ''
+    user_data_dir: ''
+    args: []
+  native_runtime:
+    enabled: true
+    stream_llm: true
+    emit_runtime_events: true
+    event_protocol_version: v2
+    enable_tool_hooks: true
+    converge_on_parallel_failure: true
+    max_parallel_read_tools: 6
+    tool_result_budget_chars: 20000
+    microcompact_chars: 8000
+    history_snip_trigger_messages: 40
+    subagent_max_depth: 3
+    auto_extract_durable_memory: false
+    durable_memory_extract_min_messages: 4
+    durable_memory_max_input_chars: 12000
+    prompt_prefix_stability:
+      enabled: true
+      separate_dynamic_context: true
+      emit_cache_fingerprint_events: true
+    prompt_harness:
+      enabled: true
+      split_static_dynamic: true
+      emit_delta_messages: true
+      cache_static_prefix_only: true
+      artifact_messages_enabled: true
+      section_dedup_enabled: true
+      reinject_after_compaction: true
+    reactive_compaction:
+      enabled: true
+      max_overflow_retries: 2
+      circuit_breaker_failures: 2
+    context_usage_reporting:
+      enabled: true
+      emit_runtime_events: true
+    verification_policy:
+      # Native self-verification gate (spawns a `verify` subagent to re-check a
+      # finished turn). Disabled by default: it adds latency/cost and is low
+      # value for non-code work; company mode already has the manager-review
+      # gate as the quality check. Set to true to re-enable for both task and
+      # company mode. See opc/layer3_agent/runtime_v2/runtime.py.
+      enabled: false
+      min_todos_for_verification: 3
+      require_on_code_edits: true
+      require_on_risky_tools: true
+      verifier_profile: verify
+      skip_metadata_key: skip_verification
+    background_session_memory:
+      enabled: true
+      update_interval_messages: 4
+      max_input_chars: 6000
+    prefetch:
+      enabled: true
+      session_memory: true
+      focused_memory: true
+      skills_summary: true
+      project_memory_candidates: true
+      max_chars: 4000
+    tool_aware_microcompact:
+      enabled: true
+      preserve_recent_messages: 8
+      tool_result_char_budget: 4000
+      assistant_char_budget: 3000
+      preserve_failure_outputs: true
+    artifact_compaction:
+      enabled: true
+      session_memory_fast_path: true
+      reinject_tool_surface_delta: true
+      reinject_skills_delta: true
+      reinject_active_subagents: true
+      reinject_verification_state: true
+      reinject_permission_state: true
+      prompt_too_long_retry: true
+      max_prompt_too_long_retries: 3
+      artifact_char_budget: 12000
+    task_ledger:
+      enabled: true
+      max_items: 24
+      persist_to_runtime_session: true
+      persist_to_task_metadata: true
+      emit_runtime_events: true
+    streaming_tool_start:
+      enabled: true
+      safe_read_only_only: true
+      require_allow_prediction: true
+    verification_contract:
+      enabled: true
+      append_status_to_final: true
+      require_explicit_status: true
+    execution_environment:
+      worktree_venv:
+        enabled: true
+        provider: auto
+        venv_dir: .opc-venv
+        editable_project: true
+        requirements_files: []
+        auto_detect_requirements: true
+        system_site_packages: false
+        fail_if_prepare_fails: false
+      sandbox:
+        enabled: true
+        default_mode: workspace-write
+        fail_if_unavailable: false
+        allow_direct_fallback: true
+        allow_network: true
+        windows:
+          mode: elevated
+          wrapper: none
+        linux:
+          mode: workspace-write
+          wrapper: auto
+        macos:
+          mode: workspace-write
+          wrapper: auto
+  task_mode:
+    sub_agent_timeout_sec: 86400
+  require_confirmation:
+  - deploy to production
+  - send external emails
+  - modify database schema
+
+autonomy:
+  enabled: true
+  mode: bounded
+  approval_model: ''
+  approval_confidence_threshold: 0.7
+  learned_policy_threshold: 0.8
+  max_auto_approve_risk: medium
+  allow_native_tool_auto_approval: true
+  allow_external_agent_auto_approval: true
+  learn_from_feedback: true
+  save_external_sessions: true
+  tool_first_use_approval: true
+  tool_approval_exemptions:
+  - read_inbox
+  - send_dm
+  - ask_peer_and_wait
+  - reply_message
+  - broadcast_issue
+  - annotate_task
+  - start_meeting
+  - respond_meeting
+  - ack_handoff
+  - review_handoff
+  - propose_task_adjustment
+  - propose_runtime_replan
+  - request_user_input
+  - todo_read
+  - todo_write
+  command_review_window: 20
+  sensitive_keywords:
+  - token
+  - password
+  - secret
+  - api key
+  - credential
+  - private key
+  - payment
+  - database schema
+  - drop table
+  - rm -rf
+  - terraform destroy
+  - deploy to production
+  - send email
+  safe_command_prefixes:
+  - ls
+  - pwd
+  - echo
+  - rg
+  - git status
+  - git diff
+  - curl
+  - wget
+  - yt-dlp
+  - aria2c
+  - ffmpeg
+  permissions_v2:
+    enabled: true
+    fail_closed: true
+    classifier_enabled: true
+    shell_ast_validation: true
+    llm_classifier_model: ''
+    classifier_thresholds:
+      allow: 0.2
+      ask: 0.5
+      deny: 0.8
+    denial_memory:
+      enabled: true
+      repeat_threshold: 2
+    sandbox_policy:
+      treat_network_as_risky: true
+      treat_external_paths_as_high_risk: true
+      explicit_prefix_allowlist: []
+    candidate_extractors:
+    - path
+    - file_path
+    - directory
+    - working_directory
+    - target_output_dir
+    - workspace_path
+    - command
+    - cmd
+    - url
+    default_scope: once
+    allow_scopes:
+    - once
+    - session
+    - project
+    - global
+    allow_tools: []
+    deny_tools: []
+    allowed_paths: []
+    denied_paths: []
+    safe_shell_prefixes:
+    - ls
+    - pwd
+    - echo
+    - rg
+    - git status
+    - git diff
+    - curl
+    - wget
+    - yt-dlp
+    - aria2c
+    - ffmpeg
+    - python -V
+    - python3 -V
+    - node -v
+    - npm -v
+    ask_shell_prefixes:
+    - git commit
+    - git push
+    - npm install
+    - pip install
+    - pnpm install
+    - cargo test
+    - pytest
+    dangerous_shell_patterns:
+    - \brm\s+-rf\b
+    - \bdrop\s+table\b
+    - \btruncate\b
+    - \bterraform\s+destroy\b
+    - \bgit\s+push\s+--force\b
+
+mcp_servers:
+# ── Local MCP servers (stdio) ──────────────────────────────────────
+# Native Python Playwright browser tools are enabled by default.
+# Leave this browser MCP entry disabled unless you explicitly want the external MCP server.
+- name: browser
+  type: local
+  command: ["npx", "@playwright/mcp@latest", "--headless"]
+  enabled: false
+  env: {}
+  tools_filter: []
+  startup_timeout: 30.0
+
+# Example: GitHub MCP server (uncomment and set GITHUB_TOKEN)
+# - name: github
+#   type: local
+#   command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+#   enabled: true
+#   env:
+#     GITHUB_TOKEN: "your-github-token"
+#   tools_filter: []
+#   startup_timeout: 30.0
+
+# Example: filesystem MCP server
+# - name: filesystem
+#   type: local
+#   command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+#   enabled: true
+
+# ── Remote MCP servers (StreamableHTTP / SSE) ──────────────────────
+# Example: remote MCP server with custom headers
+# - name: remote-api
+#   type: remote
+#   url: "https://mcp.example.com/sse"
+#   enabled: true
+#   headers:
+#     Authorization: "Bearer your-token"
+#   startup_timeout: 30.0
+
+capabilities:
+  enable_recovery: true
+  local_first: true
+  attach_remote_skill_summaries: true
+  promote_remote_skills: true
+  remote_skill_source: skillhub
+  max_remote_skill_results: 5
+  tool_failure_threshold: 2
+  skillhub:
+    enabled: false
+    api_base: https://www.skillhub.club/api/v1
+    api_key: ''
+    api_key_env: SKILLHUB_API_KEY
+    search_limit: 5
+    method: hybrid
+    cache_remote_skills: true
+    promote_after_successes: 2

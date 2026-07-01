@@ -1,0 +1,248 @@
+company:
+  company_profile: ''
+  company_profiles:
+  - corporate
+  - custom
+  final_decider_role_id: null
+  name: Team Runtime Co
+  topology: Corporate Structure
+employees:
+- category: engineering
+  description: Expert DevOps engineer specializing in infrastructure automation, CI/CD
+    pipeline development, and cloud operations
+  domains: []
+  employee_id: devops_engineer-engineering-engineering-devops-automator
+  metadata:
+    source_path: engineering/engineering-devops-automator.md
+    source_repo: /data2/bjdwhzzh/project-hku/agency-agents
+    source_revision: local
+    talent_template_category: engineering
+    talent_template_name: DevOps Automator
+  name: DevOps Automator
+  preferred_external_agent: codex
+  prompt_refs:
+  - prompts/talent/engineering-engineering-devops-automator.md
+  role_id: devops_engineer
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags:
+  - engineering
+  - devops
+  - automator
+  - engineering-devops-automator
+  template_id: engineering-engineering-devops-automator
+- category: engineering
+  description: Expert technical writer specializing in developer documentation, API
+    references, README files, and tutorials. Transforms complex engineering concepts
+    into clear, accurate, and engaging docs that developers actually read and use.
+  domains: []
+  employee_id: content_specialist-engineering-engineering-technical-writer
+  metadata:
+    source_path: engineering/engineering-technical-writer.md
+    source_repo: /data2/bjdwhzzh/project-hku/agency-agents
+    source_revision: local
+    talent_template_category: engineering
+    talent_template_name: Technical Writer
+  name: Technical Writer
+  preferred_external_agent: codex
+  prompt_refs:
+  - prompts/talent/engineering-engineering-technical-writer.md
+  role_id: content_specialist
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags:
+  - engineering
+  - technical
+  - writer
+  - engineering-technical-writer
+  template_id: engineering-engineering-technical-writer
+- category: design
+  description: Expert UI designer specializing in visual design systems, component
+    libraries, and pixel-perfect interface creation. Creates beautiful, consistent,
+    accessible user interfaces that enhance UX and reflect brand identity
+  domains: []
+  employee_id: designer-design-design-ui-designer
+  metadata:
+    source_path: design/design-ui-designer.md
+    source_repo: /data2/bjdwhzzh/project-hku/agency-agents
+    source_revision: local
+    talent_template_category: design
+    talent_template_name: UI Designer
+  name: UI Designer
+  preferred_external_agent: codex
+  prompt_refs:
+  - prompts/talent/design-design-ui-designer.md
+  role_id: designer
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags:
+  - design
+  - designer
+  - design-ui-designer
+  template_id: design-design-ui-designer
+- category: engineering
+  description: Expert application security engineer specializing in threat modeling,
+    vulnerability assessment, secure code review, security architecture design, and
+    incident response for modern web, API, and cloud-native applications.
+  domains: []
+  employee_id: qa_analyst-engineering-engineering-security-engineer
+  metadata:
+    source_path: engineering/engineering-security-engineer.md
+    source_repo: /data2/bjdwhzzh/project-hku/agency-agents
+    source_revision: local
+    talent_template_category: engineering
+    talent_template_name: Security Engineer
+  name: Security Engineer
+  preferred_external_agent: codex
+  prompt_refs:
+  - prompts/talent/engineering-engineering-security-engineer.md
+  role_id: qa_analyst
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags:
+  - engineering
+  - security
+  - engineer
+  - engineering-security-engineer
+  template_id: engineering-engineering-security-engineer
+- category: fallback
+  description: Empty placeholder employee for the CEO role when recruitment found
+    no credible fit. Add prompt_refs in YAML to customize fallback execution.
+  domains: []
+  employee_id: ceo-fallback-empty-employee
+  metadata:
+    auto_created_for_role: ceo
+    employee_origin: recruitment_fallback
+    is_fallback_employee: true
+  name: CEO Fallback Empty Employee
+  preferred_external_agent: null
+  prompt_refs: []
+  role_id: ceo
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags: []
+  template_id: fallback-empty-employee
+- category: fallback
+  description: Empty placeholder employee for the CTO role when recruitment found
+    no credible fit. Add prompt_refs in YAML to customize fallback execution.
+  domains: []
+  employee_id: cto-fallback-empty-employee
+  metadata:
+    auto_created_for_role: cto
+    employee_origin: recruitment_fallback
+    is_fallback_employee: true
+  name: CTO Fallback Empty Employee
+  preferred_external_agent: null
+  prompt_refs: []
+  role_id: cto
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags: []
+  template_id: fallback-empty-employee
+- category: fallback
+  description: Empty placeholder employee for the COO role when recruitment found
+    no credible fit. Add prompt_refs in YAML to customize fallback execution.
+  domains: []
+  employee_id: coo-fallback-empty-employee
+  metadata:
+    auto_created_for_role: coo
+    employee_origin: recruitment_fallback
+    is_fallback_employee: true
+  name: COO Fallback Empty Employee
+  preferred_external_agent: null
+  prompt_refs: []
+  role_id: coo
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags: []
+  template_id: fallback-empty-employee
+- category: fallback
+  description: Empty placeholder employee for the Acquisition Specialist role when
+    recruitment found no credible fit. Add prompt_refs in YAML to customize fallback
+    execution.
+  domains: []
+  employee_id: acquisition_specialist-fallback-empty-employee
+  metadata:
+    auto_created_for_role: acquisition_specialist
+    employee_origin: recruitment_fallback
+    is_fallback_employee: true
+  name: Acquisition Specialist Fallback Empty Employee
+  preferred_external_agent: claude_code
+  prompt_refs: []
+  role_id: acquisition_specialist
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags: []
+  template_id: fallback-empty-employee
+- category: fallback
+  description: Empty placeholder employee for the Senior Engineer role when recruitment
+    found no credible fit. Add prompt_refs in YAML to customize fallback execution.
+  domains: []
+  employee_id: senior_engineer-fallback-empty-employee
+  metadata:
+    auto_created_for_role: senior_engineer
+    employee_origin: recruitment_fallback
+    is_fallback_employee: true
+  name: Senior Engineer Fallback Empty Employee
+  preferred_external_agent: codex
+  prompt_refs: []
+  role_id: senior_engineer
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags: []
+  template_id: fallback-empty-employee
+- category: fallback
+  description: Empty placeholder employee for the Environment Engineer role when recruitment
+    found no credible fit. Add prompt_refs in YAML to customize fallback execution.
+  domains: []
+  employee_id: env_engineer-fallback-empty-employee
+  metadata:
+    auto_created_for_role: env_engineer
+    employee_origin: recruitment_fallback
+    is_fallback_employee: true
+  name: Environment Engineer Fallback Empty Employee
+  preferred_external_agent: null
+  prompt_refs: []
+  role_id: env_engineer
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags: []
+  template_id: fallback-empty-employee
+- category: design
+  description: Expert UI designer specializing in visual design systems, component
+    libraries, and pixel-perfect interface creation. Creates beautiful, consistent,
+    accessible user interfaces that enhance UX and reflect brand identity
+  domains: []
+  employee_id: cmo-design-design-ui-designer
+  metadata:
+    source_path: design/design-ui-designer.md
+    source_repo: /data2/bjdwhzzh/project-hku/agency-agents
+    source_revision: local
+    talent_template_category: design
+    talent_template_name: UI Designer
+  name: UI Designer
+  preferred_external_agent: codex
+  prompt_refs:
+  - prompts/talent/design-design-ui-designer.md
+  role_id: cmo
+  seniority: junior
+  skill_refs: []
+  status: active
+  tags:
+  - design
+  - designer
+  - design-ui-designer
+  template_id: design-design-ui-designer
+escalation_rules: []
+roles: []
+schema_version: 1

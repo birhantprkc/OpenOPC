@@ -1,0 +1,37 @@
+{
+  "name": "openopc-office-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc -b",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@hello-pangea/dnd": "^18.0.1",
+    "@tanstack/react-virtual": "^3.13.23",
+    "easystarjs": "^0.4.4",
+    "mdast-util-to-markdown": "^2.1.2",
+    "phaser": "^3.90.0",
+    "react": "^19.2.4",
+    "@xyflow/react": "^12.3.5",
+    "@dagrejs/dagre": "^1.1.4",
+    "@tanstack/react-table": "^8.21.0",
+    "react-dom": "^19.2.4",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "playwright": "^1.58.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4",
+    "ws": "^8.20.0"
+  }
+}

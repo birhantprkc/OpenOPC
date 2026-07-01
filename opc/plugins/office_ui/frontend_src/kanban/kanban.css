@@ -1,0 +1,1077 @@
+
+
+/* ── Agent Status Bar ────────────────────────────────────────────────────── */
+.agent-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.agent-status-summary {
+  font-size: 10px;
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.agent-status-chips {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 1;
+  min-width: 0;
+}
+
+.agent-status-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: border-color 200ms, background 200ms;
+}
+
+.agent-status-chip.status-idle {
+  opacity: 0.6;
+}
+
+.agent-status-chip.status-reflecting {
+  border-color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 8%, var(--surface));
+}
+
+.agent-status-chip.status-tool_active {
+  border-color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, var(--surface));
+}
+
+.agent-status-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  border: 1.5px solid var(--accent);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.agent-status-chip.status-reflecting .agent-status-avatar {
+  border-color: var(--yellow);
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 15%, var(--surface));
+}
+
+.agent-status-chip.status-tool_active .agent-status-avatar {
+  border-color: var(--green);
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 15%, var(--surface));
+}
+
+.agent-status-name {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.agent-status-detail {
+  color: var(--text-secondary);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-status-chip.status-reflecting .agent-status-detail { color: var(--yellow); }
+.agent-status-chip.status-tool_active .agent-status-detail { color: var(--green); }
+
+.agent-status-task {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text-secondary);
+  font-family: 'SF Mono', 'Fira Code', Consolas, 'Courier New', monospace;
+}
+
+/* ── Board View ──────────────────────────────────────────────────────────── */
+.kanban-board {
+  display: flex;
+  gap: 10px;
+  padding: 16px;
+  height: 100%;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+/* ── Column ──────────────────────────────────────────────────────────────── */
+.kanban-column {
+  display: flex;
+  flex-direction: column;
+  min-width: 290px;
+  max-width: 290px;
+  background: var(--surface);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.kanban-column-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--bg-elevated);
+}
+
+.kanban-col-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.kanban-col-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  flex: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.kanban-col-count {
+  font-size: 10px;
+  color: var(--text-secondary);
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  min-width: 20px;
+  text-align: center;
+}
+
+.kanban-col-add {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  width: 22px;
+  height: 22px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+}
+.kanban-col-add:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.kanban-quick-add {
+  padding: 4px 8px 8px;
+}
+.kanban-quick-input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.82rem;
+  outline: none;
+}
+
+.kanban-col-body {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  min-height: 60px;
+}
+
+/* ── Card (vibe-kanban style) ────────────────────────────────────────────── */
+.kanban-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: border-color 150ms, box-shadow 150ms;
+  user-select: none;
+}
+
+.kanban-card:hover {
+  border-color: var(--border-hover);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.kanban-card.is-dragging {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  border-color: var(--accent);
+  opacity: 0.97;
+}
+
+/* Row 1: display ID */
+.kanban-card-id {
+  font-size: 10px;
+  color: var(--text-secondary);
+  font-family: 'SF Mono', 'Fira Code', Consolas, 'Courier New', monospace;
+  letter-spacing: 0.02em;
+  margin-bottom: 5px;
+  display: block;
+}
+
+/* Row 2: title */
+.kanban-card-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  line-height: 1.45;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  margin: 0 0 6px 0;
+}
+
+/* Row 3: description preview */
+
+/* Row 4: footer — priority left, assignee right */
+.kanban-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 4px;
+  gap: 4px;
+}
+
+.kanban-card-footer-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kanban-priority {
+  font-size: 13px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.kanban-assignee-badge {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  border: 1.5px solid var(--accent);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  text-transform: uppercase;
+}
+
+/* ── Empty State ─────────────────────────────────────────────────────────── */
+.kanban-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+.kanban-empty-icon {
+  font-size: 28px;
+  opacity: 0.4;
+}
+
+/* ── Board Selector ─────────────────────────────────────────────────────── */
+.board-selector {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+  flex-shrink: 0;
+}
+
+.board-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 16px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.board-tab {
+  padding: 6px 14px;
+  border: 1px solid transparent;
+  border-radius: 6px 6px 0 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 120ms;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.board-tab:hover { background: var(--surface); color: var(--text); }
+.board-tab.active {
+  background: var(--surface);
+  color: var(--text);
+  border-color: var(--border);
+  border-bottom-color: var(--surface);
+  font-weight: 600;
+}
+
+.board-tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* Editable board/session title on top of the kanban */
+.board-tab-editable {
+  cursor: default;
+}
+.board-tab-title {
+  cursor: text;
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: background 120ms;
+}
+.board-tab-title:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.board-tab-title-input {
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 2px 4px;
+  outline: none;
+  min-width: 120px;
+}
+
+
+/* ── Card: Start (run) button ────────────────────────────────────────── */
+.kanban-start-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 120ms;
+  flex-shrink: 0;
+}
+
+.kanban-start-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ── Card: Active runtime border glow ────────────────────────────────── */
+.kanban-card.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 2px 8px rgba(79, 70, 229, 0.15);
+}
+
+/* ── Card: Runtime status row ────────────────────────────────────────── */
+.kanban-card-runtime {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  background: var(--surface);
+}
+
+.kanban-card-runtime.status-reflecting {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 10%, var(--surface));
+}
+
+.kanban-card-runtime.status-tool_active {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, var(--surface));
+}
+
+.kanban-runtime-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+  animation: kanban-pulse 1.2s ease-in-out infinite;
+}
+
+.kanban-runtime-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes kanban-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── Card: Dependency badge ──────────────────────────────────────────── */
+.kanban-dep-badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+
+/* ── Card Enhancements (tags, cross-office, multi-assignee) ──────────── */
+.kanban-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.kanban-cross-badge {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.kanban-card-tags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.kanban-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.kanban-assignee-group {
+  display: flex;
+  gap: 0;
+}
+
+.kanban-assignee-group .kanban-assignee-badge {
+  margin-left: -4px;
+}
+
+.kanban-assignee-group .kanban-assignee-badge:first-child {
+  margin-left: 0;
+}
+
+.kanban-assignee-more {
+  background: var(--surface);
+  color: var(--text-secondary);
+  border-color: var(--border);
+  font-size: 8px;
+}
+
+/* ── Card Meta Row (employee, gate, projection, origin badges) ─────────── */
+
+.kanban-card-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.kanban-meta-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kanban-meta-icon {
+  font-size: 10px;
+  line-height: 1;
+}
+
+.kanban-employee-badge {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.kanban-role-badge {
+  border-color: var(--green);
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+}
+
+.kanban-projection-badge {
+  border-color: var(--yellow);
+  color: var(--yellow);
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+}
+
+.kanban-gate-badge {
+  gap: 2px;
+}
+
+.kanban-gate-review {
+  border-color: var(--yellow);
+  color: var(--yellow);
+}
+
+.kanban-gate-approval {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.kanban-gate-human_confirmation {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.kanban-origin-badge {
+  border-color: var(--text-secondary);
+  color: var(--text-secondary);
+  font-size: 9px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Execution Panel (Layer 2 — Agent observation panel)
+   ══════════════════════════════════════════════════════════════════════════ */
+
+@keyframes exec-slide-in {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+
+.exec-panel-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  z-index: 199;
+  animation: exec-backdrop-in 200ms ease;
+}
+
+@keyframes exec-backdrop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.exec-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 560px;
+  max-width: 90vw;
+  height: 100vh;
+  /* Some browsers compute 100vh including the URL bar; use dvh when
+     available so the panel matches the *visible* viewport. */
+  height: 100dvh;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  animation: exec-slide-in 250ms cubic-bezier(0.32, 0.72, 0, 1);
+  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.2);
+}
+
+/* ── Header ───────────────────────────────────────────────────── */
+
+.exec-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.exec-panel-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.exec-panel-title-row svg {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.exec-panel-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.exec-badge {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.exec-badge-running  { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); }
+.exec-badge-idle     { background: color-mix(in srgb, var(--yellow) 15%, transparent); color: var(--yellow); }
+.exec-badge-done     { background: color-mix(in srgb, var(--green) 15%, transparent);  color: var(--green); }
+.exec-badge-pending  { background: color-mix(in srgb, var(--text-secondary) 15%, transparent); color: var(--text-secondary); }
+.exec-badge-failed   { background: color-mix(in srgb, var(--red) 15%, transparent);    color: var(--red); }
+.exec-badge-cancelled { background: color-mix(in srgb, var(--text-secondary) 10%, transparent); color: var(--text-secondary); }
+
+.exec-panel-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.exec-panel-close:hover {
+  background: var(--surface-hover, rgba(255, 255, 255, 0.06));
+  color: var(--text-primary);
+}
+
+/* ── Agent identity ───────────────────────────────────────────── */
+
+.exec-panel-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.exec-panel-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.exec-panel-agent-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.exec-panel-agent-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.exec-panel-agent-role {
+  font-size: 11px;
+  color: var(--green);
+}
+
+.exec-panel-employee {
+  font-size: 11px;
+  color: var(--text-tertiary, var(--text-secondary));
+  opacity: 0.8;
+}
+
+.exec-panel-projection {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-transform: capitalize;
+}
+
+/* ── Scrollable body ──────────────────────────────────────────── */
+
+.exec-panel-body {
+  flex: 1 1 0;
+  /* `min-height: 0` is required: the default `min-height: auto` on a flex
+     child refuses to shrink below the intrinsic content height, so the
+     body would grow past the 100vh panel and `overflow-y: auto` would
+     never kick in — scrolling breaks silently. */
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── Section blocks ───────────────────────────────────────────── */
+
+.exec-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.exec-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.exec-section-header svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.exec-section-content {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+/* Per-section scroll caps inside an expanded task card.
+ *
+ * The handoff sections (Received From / Passed To) hold arbitrary markdown
+ * — sometimes a single sentence, sometimes a multi-page brief — and the
+ * Activity timeline can grow into hundreds of tool/thinking entries.  If
+ * either is left unbounded it pushes the other off-screen, so we give
+ * each its own scroll container with a viewport-relative cap that roughly
+ * splits the card body into thirds:
+ *   • Received From / Passed To → up to ~1/3 of the viewport
+ *   • Activity                  → up to ~2/3 of the viewport
+ *
+ * Do NOT set `overscroll-behavior: contain` on either: once the inner
+ * scroll hits its boundary, the wheel must chain out to the outer panel
+ * body so sibling sections and other task cards stay reachable. */
+.exec-handoff-scroll {
+  max-height: 28vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.exec-handoff-scroll::-webkit-scrollbar { width: 8px; }
+.exec-handoff-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.exec-handoff-scroll::-webkit-scrollbar-track { background: transparent; }
+
+.exec-activity-scroll {
+  max-height: 55vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;            /* leave room for the scrollbar */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  border-radius: 6px;
+  /* subtle inset so the user perceives this is a scrollable region */
+  background: color-mix(in srgb, var(--bg, var(--surface)) 30%, transparent);
+}
+
+.exec-activity-scroll::-webkit-scrollbar { width: 8px; }
+.exec-activity-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.exec-activity-scroll::-webkit-scrollbar-track { background: transparent; }
+
+.exec-activity-scroll::-webkit-scrollbar { width: 8px; }
+.exec-activity-scroll::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.exec-activity-scroll::-webkit-scrollbar-track { background: transparent; }
+
+pre.exec-section-content {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg, var(--surface));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-family: var(--mono, monospace);
+  margin: 0;
+}
+
+.exec-section-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+.exec-artifact-list {
+  margin: 0;
+  padding: 0 0 0 18px;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+.exec-artifact-item {
+  word-break: break-word;
+}
+
+/* ── Multi-task view: each task gets a collapsible card ─────────────── */
+
+.exec-panel-task-count {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text-secondary) 15%, transparent);
+  color: var(--text-secondary);
+  margin-left: 6px;
+  letter-spacing: 0.2px;
+}
+
+.exec-task-card {
+  border: 1px solid color-mix(in srgb, var(--text-secondary) 20%, transparent);
+  border-radius: 8px;
+  margin-bottom: 10px;
+  background: color-mix(in srgb, var(--bg-primary) 80%, transparent);
+  overflow: hidden;
+  /* CRITICAL: the panel body is a column flex container with overflow-y:
+     auto.  By default each card has flex-shrink: 1, so when the cumulative
+     card heights exceed the body's visible area the cards get *squeezed*
+     instead of pushing the body into overflow.  When cards squeeze, each
+     card's inner Activity / handoff scroll loses room too, so the user
+     can't reach the bottom of the timeline AND can't reach later cards.
+     Pinning shrink to 0 (and basis to auto) keeps each card at its
+     intrinsic content height and lets the body scroll for real. */
+  flex-shrink: 0;
+  flex-basis: auto;
+}
+
+.exec-task-card-focused {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.exec-task-card-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text-primary);
+}
+
+.exec-task-card-header:hover {
+  background: color-mix(in srgb, var(--text-secondary) 5%, transparent);
+}
+
+.exec-task-card-index {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-secondary);
+  min-width: 22px;
+}
+
+.exec-task-card-title {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.exec-task-card-time {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.exec-task-card-chevron {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: inline-block;
+  transition: transform 120ms ease;
+}
+
+.exec-task-card-chevron.open {
+  transform: rotate(90deg);
+}
+
+.exec-task-card-body {
+  padding: 4px 14px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--text-secondary) 12%, transparent);
+}
+
+.exec-task-card-projection {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin: 8px 0 12px;
+}
+
+.exec-task-card-projection svg {
+  width: 13px;
+  height: 13px;
+  color: var(--accent);
+}
+
+.exec-task-card-projection code {
+  font-family: var(--font-mono, monospace);
+  background: color-mix(in srgb, var(--text-secondary) 10%, transparent);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.exec-inline-tag {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--yellow) 18%, transparent);
+  color: var(--yellow);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.exec-activity-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.exec-activity-section {
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--text-secondary) 10%, transparent);
+}
+
+.exec-activity-section:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.exec-activity-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.exec-activity-section-title {
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.exec-activity-section-role {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-secondary) 10%, transparent);
+}
+
+.exec-section-count {
+  font-size: 10px;
+  color: var(--text-secondary);
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text-secondary) 10%, transparent);
+  margin-left: auto;
+}

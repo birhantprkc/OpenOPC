@@ -1,0 +1,514 @@
+"""Streaming-friendly tool executor for Native Runtime V2."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from typing import Any, Awaitable, Callable
+
+from opc.core.models import PermissionResolution
+from opc.layer3_agent.runtime_v2.permissions import ToolPermissionResolver
+from opc.layer3_agent.runtime_v2.tool_hooks import RuntimeToolHookBus, RuntimeToolHookContext
+from opc.layer3_agent.runtime_v2.tool_planner import ToolBatch, ToolPlanner
+from opc.layer4_tools.registry import ToolRegistry
+
+
+RuntimeToolHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+RuntimeEventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
+_HEARTBEAT_INTERVAL_SECONDS = 1.0
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _result_summary(result: dict[str, Any], *, limit: int = 240) -> str:
+    if not result:
+        return ""
+    if result.get("error"):
+        summary = str(result.get("error", "") or "").strip()
+    else:
+        payload = result.get("result", {})
+        summary = ""
+        if isinstance(payload, dict):
+            for key in ("summary", "rendered", "stdout", "stderr", "content", "message"):
+                value = payload.get(key)
+                if value:
+                    summary = str(value).strip()
+                    break
+        if not summary:
+            summary = json.dumps(result, ensure_ascii=False, default=str)
+    if len(summary) <= limit:
+        return summary
+    return summary[:limit].rstrip() + "..."
+
+
+class StreamingToolExecutor:
+    def __init__(
+        self,
+        *,
+        registry: ToolRegistry,
+        planner: ToolPlanner,
+        permission_resolver: ToolPermissionResolver,
+        hook_bus: RuntimeToolHookBus | None = None,
+        runtime_tool_handler: RuntimeToolHandler | None = None,
+        emit_event: RuntimeEventCallback | None = None,
+        max_parallel_read_tools: int = 6,
+        converge_on_parallel_failure: bool = True,
+    ) -> None:
+        self.registry = registry
+        self.planner = planner
+        self.permission_resolver = permission_resolver
+        self.hook_bus = hook_bus
+        self.runtime_tool_handler = runtime_tool_handler
+        self.emit_event = emit_event
+        self.max_parallel_read_tools = max(1, int(max_parallel_read_tools or 1))
+        self.converge_on_parallel_failure = bool(converge_on_parallel_failure)
+
+    async def execute(
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        task: Any = None,
+        on_progress: Any = None,
+    ) -> list[dict[str, Any]]:
+        ordered_results: list[dict[str, Any]] = []
+        for batch in self.planner.partition(tool_calls):
+            batch_id = f"tb_{uuid.uuid4().hex[:12]}"
+            batch_started_at_ms = _now_ms()
+            if self.emit_event:
+                await self.emit_event(
+                    "tool_batch_started",
+                    {
+                        "batch_id": batch_id,
+                        "started_at_ms": batch_started_at_ms,
+                        "concurrency_safe": batch.concurrency_safe,
+                        "tool_names": [str(call.get("function", "") or "") for call in batch.calls],
+                        "tool_call_ids": [str(call.get("id", "") or "") for call in batch.calls],
+                    },
+                )
+            if batch.concurrency_safe:
+                batch_results = await self._run_parallel(batch, task=task, on_progress=on_progress, batch_id=batch_id)
+            else:
+                batch_results: list[dict[str, Any]] = []
+                for call in batch.calls:
+                    batch_results.append(await self._run_one(call, task=task, on_progress=on_progress, batch_id=batch_id))
+            ordered_results.extend(batch_results)
+            if self.emit_event:
+                batch_completed_at_ms = _now_ms()
+                await self.emit_event(
+                    "tool_batch_completed",
+                    {
+                        "batch_id": batch_id,
+                        "started_at_ms": batch_started_at_ms,
+                        "completed_at_ms": batch_completed_at_ms,
+                        "elapsed_ms": max(0, batch_completed_at_ms - batch_started_at_ms),
+                        "concurrency_safe": batch.concurrency_safe,
+                        "success": all(bool(item.get("result", {}).get("success", True)) for item in batch_results),
+                        "tool_count": len(batch_results),
+                    },
+                )
+        return ordered_results
+
+    async def _run_parallel(
+        self,
+        batch: ToolBatch,
+        *,
+        task: Any = None,
+        on_progress: Any = None,
+        batch_id: str = "",
+    ) -> list[dict[str, Any]]:
+        semaphore = asyncio.Semaphore(self.max_parallel_read_tools)
+        batch_state: dict[str, Any] = {
+            "cascade_event": asyncio.Event(),
+            "failed_call_id": "",
+            "failed_tool_name": "",
+        }
+
+        async def _wrapped(call: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                if self.converge_on_parallel_failure and batch_state["cascade_event"].is_set():
+                    return await self._build_converged_result(call, batch_state, batch_id=batch_id)
+                result = await self._run_one(call, task=task, on_progress=on_progress, batch_state=batch_state, batch_id=batch_id)
+                if self.converge_on_parallel_failure and self._should_converge_batch(result):
+                    batch_state["failed_call_id"] = str(call.get("id", "") or "")
+                    batch_state["failed_tool_name"] = str(call.get("function", "") or "")
+                    batch_state["cascade_event"].set()
+                return result
+
+        return list(await asyncio.gather(*[_wrapped(call) for call in batch.calls]))
+
+    async def _run_one(
+        self,
+        call: dict[str, Any],
+        *,
+        task: Any = None,
+        on_progress: Any = None,
+        batch_state: dict[str, Any] | None = None,
+        batch_id: str = "",
+    ) -> dict[str, Any]:
+        tool_name = str(call.get("function", "") or "")
+        arguments = dict(call.get("arguments", {}) or {})
+        tool = self.registry.get(tool_name)
+        predicted = self.permission_resolver.predicted_decision(tool, arguments, task=task)
+        started_at_ms = _now_ms()
+        started_at_monotonic = time.monotonic()
+        if self.emit_event:
+            await self.emit_event(
+                "permission_predicted",
+                {
+                    "batch_id": batch_id,
+                    "tool_call_id": call.get("id", ""),
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "resolution": predicted.resolution.value,
+                    "scope": predicted.scope.value,
+                    "risk_level": predicted.risk_level.value,
+                    "rationale": predicted.rationale,
+                    "source": predicted.source,
+                    "started_at_ms": started_at_ms,
+                },
+            )
+        if self.emit_event and predicted.resolution != PermissionResolution.ALLOW:
+            await self.emit_event(
+                "permission_requested",
+                {
+                    "batch_id": batch_id,
+                    "tool_call_id": call.get("id", ""),
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "resolution": predicted.resolution.value,
+                    "scope": predicted.scope.value,
+                    "risk_level": predicted.risk_level.value,
+                    "rationale": predicted.rationale,
+                    "source": predicted.source,
+                },
+            )
+        if self.emit_event:
+            await self.emit_event(
+                "tool_started",
+                {
+                    "batch_id": batch_id,
+                    "tool_call_id": call.get("id", ""),
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "predicted_permission": predicted.resolution.value,
+                    "started_at_ms": started_at_ms,
+                },
+            )
+
+        if batch_state is not None and self.converge_on_parallel_failure and batch_state["cascade_event"].is_set():
+            return await self._build_converged_result(call, batch_state, batch_id=batch_id)
+
+        hook_context = RuntimeToolHookContext(
+            phase="pre",
+            tool_name=tool_name,
+            call=call,
+            task=task,
+            tool=tool,
+            arguments=dict(arguments),
+            predicted_permission=predicted,
+        )
+        if self.hook_bus is not None:
+            hook_context = await self.hook_bus.run_pre_hooks(hook_context)
+            arguments = dict(hook_context.arguments)
+        elif predicted.resolution == PermissionResolution.DENY:
+            hook_context.result = self.permission_resolver.build_blocked_result(
+                predicted,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+            hook_context.state["stop_batch_on_failure"] = True
+
+        if hook_context.result is not None:
+            result = dict(hook_context.result)
+            decision = self.permission_resolver.decision_from_result(tool_name, arguments, result)
+        elif call.get("arguments_parse_error"):
+            result = {
+                "error": str(call.get("arguments_parse_error", "")),
+                "invalid_arguments": True,
+                "success": False,
+                "raw_arguments": str(call.get("arguments_raw", "")),
+            }
+            decision = self.permission_resolver.decision_from_result(tool_name, arguments, result)
+        else:
+            last_progress: dict[str, str] = {"stream": "", "text": ""}
+            last_progress_at = {"value": time.monotonic()}
+            heartbeat_active = {"value": True}
+
+            async def _heartbeat() -> None:
+                while heartbeat_active["value"]:
+                    await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+                    if not heartbeat_active["value"]:
+                        return
+                    now = time.monotonic()
+                    if now - last_progress_at["value"] < _HEARTBEAT_INTERVAL_SECONDS:
+                        continue
+                    if self.emit_event:
+                        await self.emit_event(
+                            "tool_progress",
+                            {
+                                "batch_id": batch_id,
+                                "tool_call_id": call.get("id", ""),
+                                "tool_name": tool_name,
+                                "phase": "running",
+                                "message": f"{tool_name} still running",
+                                "heartbeat": True,
+                                "elapsed_ms": int((now - started_at_monotonic) * 1000),
+                            },
+                        )
+
+            async def _tool_progress(progress: Any, **progress_kw: Any) -> None:
+                if isinstance(progress, dict):
+                    payload = dict(progress)
+                    text = str(payload.get("text", "") or payload.get("message", "") or "").strip()
+                    stream_name = str(payload.get("stream", "") or "").strip()
+                else:
+                    text = str(progress or "").strip()
+                    stream_name = str(progress_kw.get("stream", "") or "").strip()
+                    payload = {
+                        "text": text,
+                        "stream": stream_name,
+                    }
+                if not text:
+                    return
+                if last_progress["text"] == text and last_progress["stream"] == stream_name:
+                    return
+                last_progress["text"] = text
+                last_progress["stream"] = stream_name
+                last_progress_at["value"] = time.monotonic()
+                if self.emit_event:
+                    await self.emit_event(
+                        "tool_progress",
+                        {
+                            "batch_id": batch_id,
+                            "tool_call_id": call.get("id", ""),
+                            "tool_name": tool_name,
+                            "stream": stream_name,
+                            "elapsed_ms": int((last_progress_at["value"] - started_at_monotonic) * 1000),
+                            **payload,
+                        },
+                    )
+                if on_progress:
+                    try:
+                        await on_progress(text, task_id=getattr(task, "id", None))
+                    except TypeError:
+                        await on_progress(text)
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
+            try:
+                if tool is not None and tool.runtime_managed and self.runtime_tool_handler is not None:
+                    result = await self.runtime_tool_handler(tool_name, arguments)
+                else:
+                    result = await self.registry.execute(
+                        tool_name,
+                        arguments,
+                        task=task,
+                        on_progress=_tool_progress,
+                        skip_approval=True,
+                    )
+                result = await self._maybe_retry_with_escalated_sandbox(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    task=task,
+                    result=result,
+                    on_progress=_tool_progress,
+                    batch_id=batch_id,
+                    call=call,
+                )
+            finally:
+                heartbeat_active["value"] = False
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+            hook_context.phase = "post"
+            hook_context.arguments = dict(arguments)
+            hook_context.result = dict(result)
+            if self.hook_bus is not None:
+                hook_context = await self.hook_bus.run_post_hooks(hook_context)
+                result = dict(hook_context.result or result)
+                if not bool(result.get("success", True)):
+                    hook_context.phase = "failure"
+                    hook_context.result = dict(result)
+                    hook_context = await self.hook_bus.run_failure_hooks(hook_context)
+                    result = dict(hook_context.result or result)
+            decision = self.permission_resolver.decision_from_result(tool_name, arguments, result)
+        if self.emit_event:
+            await self.emit_event(
+                "permission_resolved",
+                {
+                    "batch_id": batch_id,
+                    "tool_call_id": call.get("id", ""),
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                    "resolution": decision.resolution.value,
+                    "scope": decision.scope.value,
+                    "rationale": decision.rationale,
+                },
+            )
+            await self.emit_event(
+                "tool_completed",
+                {
+                    "batch_id": batch_id,
+                    "tool_call_id": call.get("id", ""),
+                    "tool_name": tool_name,
+                    "started_at_ms": started_at_ms,
+                    "completed_at_ms": _now_ms(),
+                    "elapsed_ms": int((time.monotonic() - started_at_monotonic) * 1000),
+                    "success": bool(result.get("success", True)),
+                    "result_summary": _result_summary(result),
+                    "result_preview": json.dumps(result, ensure_ascii=False, default=str)[:800],
+                },
+            )
+
+        return {
+            "tool_call": call,
+            "result": result,
+            "permission_decision": decision,
+            "stop_batch_on_failure": bool(hook_context.state.get("stop_batch_on_failure")),
+            "hook_metadata": {"batch_id": batch_id, **dict(hook_context.state.get("metadata", {}))},
+        }
+
+    async def _maybe_retry_with_escalated_sandbox(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        task: Any,
+        result: dict[str, Any],
+        on_progress: Any,
+        batch_id: str,
+        call: dict[str, Any],
+    ) -> dict[str, Any]:
+        guardian = getattr(self.permission_resolver.config, "guardian", None)
+        if not guardian or not bool(getattr(guardian, "auto_retry_sandbox", False)):
+            return result
+        payload = result.get("result", {})
+        if not isinstance(payload, dict):
+            return result
+        exit_code = payload.get("exit_code")
+        if bool(result.get("success", True)) and exit_code in (None, 0):
+            return result
+        if tool_name not in {"shell_exec", "python_exec"}:
+            return result
+        sandbox_meta = dict(payload.get("sandbox", {}) or {})
+        error_text = str(result.get("error", "") or payload.get("error", "") or "").lower()
+        if not sandbox_meta and "sandbox" not in error_text:
+            return result
+        if task is None:
+            return result
+        execution_context = dict((getattr(task, "metadata", {}) or {}).get("_execution_context", {}) or {})
+        sandbox_context = dict(execution_context.get("sandbox", {}) or {})
+        current_mode = str(sandbox_context.get("mode", "") or "").strip().lower() or "off"
+        next_mode = self._next_sandbox_mode(current_mode)
+        if not next_mode:
+            return result
+        original_context = dict(execution_context)
+        original_sandbox = dict(sandbox_context)
+        retry_started_at_ms = _now_ms()
+        if self.emit_event:
+            await self.emit_event(
+                "sandbox_retry_requested",
+                {
+                    "batch_id": batch_id,
+                    "tool_call_id": call.get("id", ""),
+                    "tool_name": tool_name,
+                    "from_mode": current_mode,
+                    "to_mode": next_mode,
+                    "started_at_ms": retry_started_at_ms,
+                },
+            )
+        sandbox_context["mode"] = next_mode
+        execution_context["sandbox"] = sandbox_context
+        task.metadata = dict(getattr(task, "metadata", {}) or {})
+        task.metadata["_execution_context"] = execution_context
+        try:
+            if self.registry.get(tool_name) is not None and getattr(self.registry.get(tool_name), "runtime_managed", False) and self.runtime_tool_handler is not None:
+                retry_result = await self.runtime_tool_handler(tool_name, arguments)
+            else:
+                retry_result = await self.registry.execute(
+                    tool_name,
+                    arguments,
+                    task=task,
+                    on_progress=on_progress,
+                    skip_approval=True,
+                )
+        finally:
+            original_context["sandbox"] = original_sandbox
+            task.metadata["_execution_context"] = original_context
+        if self.emit_event:
+            await self.emit_event(
+                "sandbox_retry_completed",
+                {
+                    "batch_id": batch_id,
+                    "tool_call_id": call.get("id", ""),
+                    "tool_name": tool_name,
+                    "from_mode": current_mode,
+                    "to_mode": next_mode,
+                    "started_at_ms": retry_started_at_ms,
+                    "completed_at_ms": _now_ms(),
+                    "success": bool(retry_result.get("success", True)),
+                    "result_summary": _result_summary(retry_result),
+                },
+            )
+        return retry_result
+
+    @staticmethod
+    def _next_sandbox_mode(current_mode: str) -> str:
+        normalized = str(current_mode or "").strip().lower()
+        if normalized == "workspace-write":
+            return "elevated"
+        if normalized == "elevated":
+            return "off"
+        return ""
+
+    async def _build_converged_result(
+        self,
+        call: dict[str, Any],
+        batch_state: dict[str, Any],
+        *,
+        batch_id: str = "",
+    ) -> dict[str, Any]:
+        tool_name = str(call.get("function", "") or "")
+        result = {
+            "error": (
+                "Skipped because a concurrent sibling tool failed and the runtime converged the batch. "
+                f"Source: {batch_state.get('failed_tool_name', '') or 'unknown'}"
+            ),
+            "success": False,
+            "converged": True,
+            "converged_from_tool": batch_state.get("failed_tool_name", ""),
+            "converged_from_call_id": batch_state.get("failed_call_id", ""),
+        }
+        if self.emit_event:
+            await self.emit_event(
+                "tool_skipped",
+                {
+                    "batch_id": batch_id,
+                    "tool_call_id": call.get("id", ""),
+                    "tool_name": tool_name,
+                    "reason": "parallel_batch_converged",
+                    "source_tool_name": batch_state.get("failed_tool_name", ""),
+                    "source_call_id": batch_state.get("failed_call_id", ""),
+                },
+            )
+        decision = self.permission_resolver.decision_from_result(tool_name, dict(call.get("arguments", {}) or {}), result)
+        return {
+            "tool_call": call,
+            "result": result,
+            "permission_decision": decision,
+            "stop_batch_on_failure": False,
+            "hook_metadata": {"converged": True, "batch_id": batch_id},
+        }
+
+    @staticmethod
+    def _should_converge_batch(result: dict[str, Any]) -> bool:
+        if bool(result.get("stop_batch_on_failure")):
+            return True
+        payload = result.get("result", {})
+        if isinstance(payload, dict) and payload.get("prevent_continuation"):
+            return True
+        if isinstance(payload, dict):
+            return not bool(payload.get("success", True))
+        return False

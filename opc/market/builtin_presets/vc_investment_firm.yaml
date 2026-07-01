@@ -1,0 +1,404 @@
+id: vc-investment-firm
+name: VC Investment Firm
+description: >
+  Venture-capital investment organization for sector mapping, startup sourcing,
+  technical and commercial due diligence, investment committee debate, and
+  memo/PPT delivery.
+category: investment
+collaboration_pattern: hierarchical
+dag_summary: Brief->Research/Sourcing->DD->Bull/Bear IC->Top 3->Memo/PPT
+tags:
+  - vc
+  - investment
+  - due-diligence
+  - startup-scouting
+  - market-research
+team_size: 8-21
+emoji: ''
+color: '#0f766e'
+toolsets:
+  coordination:
+    - file_read
+    - file_search
+    - list_dir
+    - todo_write
+    - todo_read
+    - web_search
+    - web_fetch
+  research:
+    - file_read
+    - file_search
+    - list_dir
+    - todo_write
+    - todo_read
+    - web_search
+    - web_fetch
+    - browser_navigate
+    - browser_navigate_back
+    - browser_snapshot
+    - browser_wait_for
+    - browser_scroll
+    - browser_take_screenshot
+  analysis:
+    - file_read
+    - file_search
+    - list_dir
+    - todo_write
+    - todo_read
+    - web_search
+    - web_fetch
+    - browser_navigate
+    - browser_navigate_back
+    - browser_snapshot
+    - browser_wait_for
+    - browser_scroll
+    - browser_take_screenshot
+    - shell_exec
+    - file_write
+    - file_edit
+  delivery:
+    - shell_exec
+    - file_read
+    - file_write
+    - file_edit
+    - file_search
+    - list_dir
+    - web_search
+    - web_fetch
+    - todo_write
+    - todo_read
+    - browser_navigate
+    - browser_snapshot
+    - browser_take_screenshot
+roles:
+  - id: managing_partner
+    name: Managing Partner
+    responsibility: Defines the investment mandate, target stage, sector focus, decision criteria, and final portfolio recommendation.
+    reports_to: owner
+    can_spawn:
+      - investment_director
+      - due_diligence_lead
+      - investment_committee
+      - report_delivery_lead
+    icon: leader
+    toolset: coordination
+    prompt_refs:
+      - Keep the team focused on investment decisions rather than raw research accumulation.
+      - Final output must identify Top 3 companies, investment rationale, key risks, entry path, suggested stage, and follow-up plan.
+  - id: investment_director
+    name: Investment Director
+    responsibility: Translates the user request into an investment research framework, screening criteria, task split, and candidate company shortlist.
+    reports_to: managing_partner
+    can_spawn:
+      - sector_analyst
+      - market_researcher
+      - startup_scout
+      - competitive_analyst
+      - news_signal_analyst
+    icon: strategy
+    toolset: coordination
+    prompt_refs:
+      - 'Produce a clear VC research framework: market thesis, screening standard, candidate pool logic, and scoring rubric.'
+      - Ask scouts and analysts for evidence tables, not generic summaries.
+  - id: sector_analyst
+    name: Sector Analyst
+    responsibility: Evaluates whether the target sector can compound over the next 3-5 years, including demand drivers, inflection points, and adoption constraints.
+    reports_to: investment_director
+    icon: analytics
+    toolset: research
+  - id: market_researcher
+    name: Market Researcher
+    responsibility: Quantifies TAM/SAM/SOM, buyer budgets, growth rates, adoption curves, and comparable public or private market signals.
+    reports_to: investment_director
+    icon: analytics
+    toolset: research
+  - id: startup_scout
+    name: Startup Scout
+    responsibility: Builds a broad candidate pool with founding date, headquarters, funding stage, amount raised, investors, product, customers, news, website, LinkedIn, Crunchbase, PitchBook, GitHub, and source URLs.
+    reports_to: investment_director
+    icon: target
+    toolset: research
+    prompt_refs:
+      - 'Prioritize breadth first: gather a defensible longlist before ranking.'
+      - Separate verified facts from inferred signals and keep source URLs next to every company row.
+  - id: competitive_analyst
+    name: Competitive Analyst
+    responsibility: Maps incumbents, startup competitors, substitute technologies, market positioning, moat strength, differentiation, and big-tech pressure.
+    reports_to: investment_director
+    icon: team
+    toolset: research
+  - id: news_signal_analyst
+    name: News & Signal Analyst
+    responsibility: Tracks recent market signals, customer wins, launches, layoffs, regulatory movement, hiring velocity, GitHub activity, and investor interest.
+    reports_to: investment_director
+    icon: marketing
+    toolset: research
+  - id: due_diligence_lead
+    name: Due Diligence Lead
+    responsibility: Turns the shortlist into a diligence plan, coordinates specialist checks, resolves contradictions, and synthesizes company-level conviction.
+    reports_to: managing_partner
+    can_spawn:
+      - technical_dd_analyst
+      - business_dd_analyst
+      - financial_analyst
+      - risk_legal_analyst
+    icon: clipboard
+    toolset: coordination
+    prompt_refs:
+      - Force each diligence stream to give a verdict, confidence level, and disconfirming evidence.
+      - Maintain a comparable scorecard across all shortlisted companies.
+  - id: technical_dd_analyst
+    name: Technical DD Analyst
+    responsibility: Assesses technical moat, architecture credibility, benchmarks, patents, papers, open-source projects, GitHub traction, team technical depth, and scalability.
+    reports_to: due_diligence_lead
+    icon: code
+    toolset: analysis
+  - id: business_dd_analyst
+    name: Business DD Analyst
+    responsibility: Evaluates target customers, sales motion, pricing model, evidence of ARR or revenue, deployment friction, customer concentration, and go-to-market defensibility.
+    reports_to: due_diligence_lead
+    icon: strategy
+    toolset: research
+  - id: financial_analyst
+    name: Financial Analyst
+    responsibility: Analyzes financing history, investors, valuation signals, burn-rate implications, round dynamics, comparable valuations, exit routes, and upside risk/reward.
+    reports_to: due_diligence_lead
+    icon: analytics
+    toolset: analysis
+  - id: risk_legal_analyst
+    name: Risk & Legal Analyst
+    responsibility: Finds privacy, open-source license, supply-chain, geopolitical, customer concentration, regulatory, IP, and founder-stability risks.
+    reports_to: due_diligence_lead
+    icon: security
+    toolset: research
+    prompt_refs:
+      - Actively search for reasons not to invest; do not let opportunity framing hide material risks.
+  - id: investment_committee
+    name: Investment Committee Chair
+    responsibility: Runs structured bull-case and bear-case review, compares evidence quality, and prepares the decision package for the Managing Partner.
+    reports_to: managing_partner
+    can_spawn:
+      - bull_case_reviewer
+      - bear_case_reviewer
+      - final_decision_reviewer
+    icon: team
+    toolset: coordination
+  - id: bull_case_reviewer
+    name: Bull Case Reviewer
+    responsibility: Builds the strongest evidence-backed case for why each shortlisted company should be funded now.
+    reports_to: investment_committee
+    icon: idea
+    toolset: research
+  - id: bear_case_reviewer
+    name: Bear Case Reviewer
+    responsibility: Builds the strongest evidence-backed case against investing, including timing, valuation, technical, market, and execution objections.
+    reports_to: investment_committee
+    icon: bug
+    toolset: research
+  - id: final_decision_reviewer
+    name: Final Decision Reviewer
+    responsibility: Reconciles bull and bear cases, ranks companies, explains confidence, and flags follow-up diligence before partner approval.
+    reports_to: investment_committee
+    icon: clipboard
+    toolset: coordination
+  - id: report_delivery_lead
+    name: Report & Delivery Lead
+    responsibility: 'Owns final deliverables: investment memo, scorecard, market map, competitive matrix, financing timeline, PPT, data table, and charts.'
+    reports_to: managing_partner
+    can_spawn:
+      - data_analyst
+      - investment_memo_writer
+      - ppt_designer
+      - visualization_specialist
+    icon: layout
+    toolset: coordination
+  - id: data_analyst
+    name: Data Analyst
+    responsibility: Normalizes company data, computes scorecards, creates comparable tables, and prepares chart-ready datasets.
+    reports_to: report_delivery_lead
+    icon: database
+    toolset: analysis
+  - id: investment_memo_writer
+    name: Investment Memo Writer
+    responsibility: Writes a partner-quality investment memo with thesis, market, company analysis, diligence evidence, risks, valuation view, and recommendation.
+    reports_to: report_delivery_lead
+    icon: writing
+    toolset: delivery
+  - id: ppt_designer
+    name: PPT Designer
+    responsibility: Turns the investment memo into a concise VC-style presentation with clear hierarchy, scorecards, market maps, and decision slides.
+    reports_to: report_delivery_lead
+    icon: design
+    toolset: delivery
+  - id: visualization_specialist
+    name: Visualization Specialist
+    responsibility: Creates market maps, competitor matrices, financing timelines, scoring charts, and visual summaries for the final report and PPT.
+    reports_to: report_delivery_lead
+    icon: analytics
+    toolset: analysis
+work_item_templates:
+  - id: investment_brief
+    title: Investment Brief
+    role_id: managing_partner
+    dependencies: []
+    parallel_group: null
+  - id: research_framework
+    title: Research Framework
+    role_id: investment_director
+    dependencies:
+      - investment_brief
+    parallel_group: null
+  - id: sector_thesis
+    title: Sector Thesis
+    role_id: sector_analyst
+    dependencies:
+      - research_framework
+    parallel_group: research
+  - id: market_sizing
+    title: Market Sizing
+    role_id: market_researcher
+    dependencies:
+      - research_framework
+    parallel_group: research
+  - id: company_sourcing
+    title: Company Sourcing
+    role_id: startup_scout
+    dependencies:
+      - research_framework
+    parallel_group: sourcing
+  - id: signal_scan
+    title: News & Signal Scan
+    role_id: news_signal_analyst
+    dependencies:
+      - research_framework
+    parallel_group: sourcing
+  - id: competitive_map
+    title: Competitive Map
+    role_id: competitive_analyst
+    dependencies:
+      - sector_thesis
+      - company_sourcing
+    parallel_group: null
+  - id: candidate_shortlist
+    title: Candidate Shortlist
+    role_id: investment_director
+    dependencies:
+      - sector_thesis
+      - market_sizing
+      - company_sourcing
+      - signal_scan
+      - competitive_map
+    parallel_group: null
+    gate:
+      type: review
+      reviewer_role: managing_partner
+  - id: dd_plan
+    title: Diligence Plan
+    role_id: due_diligence_lead
+    dependencies:
+      - candidate_shortlist
+    parallel_group: null
+  - id: technical_dd
+    title: Technical DD
+    role_id: technical_dd_analyst
+    dependencies:
+      - dd_plan
+    parallel_group: diligence
+  - id: business_dd
+    title: Business DD
+    role_id: business_dd_analyst
+    dependencies:
+      - dd_plan
+    parallel_group: diligence
+  - id: financial_dd
+    title: Financial DD
+    role_id: financial_analyst
+    dependencies:
+      - dd_plan
+    parallel_group: diligence
+  - id: risk_legal_dd
+    title: Risk & Legal DD
+    role_id: risk_legal_analyst
+    dependencies:
+      - dd_plan
+    parallel_group: diligence
+  - id: dd_synthesis
+    title: DD Synthesis
+    role_id: due_diligence_lead
+    dependencies:
+      - technical_dd
+      - business_dd
+      - financial_dd
+      - risk_legal_dd
+    parallel_group: null
+    gate:
+      type: review
+      reviewer_role: investment_director
+  - id: bull_case
+    title: Bull Case
+    role_id: bull_case_reviewer
+    dependencies:
+      - dd_synthesis
+    parallel_group: committee
+  - id: bear_case
+    title: Bear Case
+    role_id: bear_case_reviewer
+    dependencies:
+      - dd_synthesis
+    parallel_group: committee
+  - id: decision_review
+    title: Decision Review
+    role_id: final_decision_reviewer
+    dependencies:
+      - bull_case
+      - bear_case
+    parallel_group: null
+    gate:
+      type: review
+      reviewer_role: investment_committee
+  - id: final_investment_decision
+    title: Final Investment Decision
+    role_id: managing_partner
+    dependencies:
+      - decision_review
+    parallel_group: null
+    gate:
+      type: approval
+      reviewer_role: managing_partner
+  - id: dataset_scoring
+    title: Dataset & Scorecard
+    role_id: data_analyst
+    dependencies:
+      - dd_synthesis
+    parallel_group: delivery
+  - id: investment_memo
+    title: Investment Memo
+    role_id: investment_memo_writer
+    dependencies:
+      - decision_review
+      - dataset_scoring
+    parallel_group: delivery
+  - id: visualizations
+    title: Visualizations
+    role_id: visualization_specialist
+    dependencies:
+      - dataset_scoring
+    parallel_group: delivery
+  - id: pitch_deck
+    title: PPT Deck
+    role_id: ppt_designer
+    dependencies:
+      - investment_memo
+      - visualizations
+    parallel_group: null
+  - id: final_delivery
+    title: Final VC Deliverables
+    role_id: report_delivery_lead
+    dependencies:
+      - final_investment_decision
+      - investment_memo
+      - pitch_deck
+    parallel_group: null
+    gate:
+      type: approval
+      reviewer_role: managing_partner
