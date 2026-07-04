@@ -574,6 +574,25 @@ Then verify with `opc status`.
 
 If you prefer not to store the key in the file, leave `api_key` empty and set `api_key_env` to the name of an environment variable that holds it (e.g. `api_key_env: "OPENROUTER_API_KEY"`).
 
+### Approval & Agent Permissions
+
+The `autonomy` section of `.opc/config/system_config.yaml` controls how much an agent can do without asking. The key knob is `max_auto_approve_risk` — the highest risk level that can be auto-approved:
+
+```yaml
+autonomy:
+  max_auto_approve_risk: medium   # low | medium | high | critical
+  allow_native_tool_auto_approval: true
+  tool_first_use_approval: true   # first use of each tool always asks
+```
+
+Every native tool call is risk-classified before it runs: known destructive commands (`rm -rf`, `drop table`, force-push, …) and sensitive keywords (credentials, deploys, …) are `high`/`critical` and always escalate to a human; allowlisted safe prefixes (`ls`, `git status`, …) are `low`; everything else is `medium` and goes through an LLM review before auto-approval.
+
+- `medium` (default): balanced — ordinary commands run without prompts; dangerous ones escalate.
+- `low`: strict — anything not on the safe allowlist asks for approval. Recommended for shared or production machines.
+- `high`/`critical`: permissive — only for throwaway sandboxes.
+
+The first time a tool is used you are always prompted (unless the tool is in `tool_approval_exemptions`), and your "Always allow" choices accumulate in a per-project allowlist.
+
 ### External Agents
 
 Task Mode can explicitly select an execution agent:
