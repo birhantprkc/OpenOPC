@@ -209,6 +209,83 @@ class StaleCheckpointSelfHealTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "company resumed")
         self.engine._execute_multi_agent.assert_not_awaited()
 
+    def _approval_runtime_payload(self) -> dict:
+        return {
+            "runtime_session_id": "rt-1",
+            "permission_requests": [
+                {
+                    "tool_name": "shell_exec",
+                    "resolution": "ask",
+                    "scope": "once",
+                    "risk_level": "medium",
+                    "source": "approval_engine",
+                }
+            ],
+        }
+
+    async def test_plain_chat_is_not_consumed_by_parked_approval_checkpoint(self) -> None:
+        """A live permission prompt is decided via its approval card, never by free chat.
+
+        Deferred approval cards stay pending indefinitely, so an implicit capture
+        here would swallow every later conversation message into the approval reply.
+        """
+        session_id = str(uuid.uuid4())
+        task = await self._save_task(TaskStatus.AWAITING_HUMAN, session_id)
+        checkpoint = await self._save_wait_checkpoint(
+            task,
+            session_id,
+            runtime_v2=self._approval_runtime_payload(),
+        )
+
+        result = await self.engine._maybe_resume_checkpoint(
+            "顺便问一下，进度怎么样了？", session_id=session_id
+        )
+
+        self.assertIsNone(result)  # message continues as a normal turn
+        self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "pending")
+
+    async def test_plain_chat_still_answers_agent_question_checkpoint(self) -> None:
+        """Waits without a permission request (agent asked the user a question)
+        keep accepting typed answers."""
+        session_id = str(uuid.uuid4())
+        task = await self._save_task(TaskStatus.AWAITING_HUMAN, session_id)
+        checkpoint = await self._save_wait_checkpoint(task, session_id)
+
+        self.engine._execute_single_agent = AsyncMock(return_value="answered")
+        self.engine._execute_multi_agent = AsyncMock(return_value="")
+        self.engine._execute_company_mode = AsyncMock(return_value="")
+
+        result = await self.engine._maybe_resume_checkpoint("用蓝色的方案", session_id=session_id)
+
+        self.assertEqual(result, "answered")
+        self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "resolved")
+
+    async def test_explicit_reply_still_resumes_parked_approval_checkpoint(self) -> None:
+        """The approval-card click path targets the checkpoint explicitly and must keep working."""
+        session_id = str(uuid.uuid4())
+        task = await self._save_task(TaskStatus.AWAITING_HUMAN, session_id)
+        checkpoint = await self._save_wait_checkpoint(
+            task,
+            session_id,
+            runtime_v2=self._approval_runtime_payload(),
+        )
+
+        self.engine._execute_single_agent = AsyncMock(return_value="approved and resumed")
+        self.engine._execute_multi_agent = AsyncMock(return_value="")
+        self.engine._execute_company_mode = AsyncMock(return_value="")
+
+        result = await self.engine._maybe_resume_checkpoint(
+            "approve",
+            session_id=session_id,
+            reply_metadata={
+                "response_to_checkpoint_id": checkpoint.checkpoint_id,
+                "response_to_checkpoint_type": "task_user_input",
+            },
+        )
+
+        self.assertEqual(result, "approved and resumed")
+        self.assertEqual(await self._checkpoint_status(checkpoint.checkpoint_id), "resolved")
+
 
 if __name__ == "__main__":
     unittest.main()

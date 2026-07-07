@@ -8979,6 +8979,24 @@ class OPCEngine:
                 f"Superseded {len(superseded)} stale task-wait checkpoint(s) for task {task_id} ({reason})"
             )
 
+    @staticmethod
+    def _checkpoint_awaits_approval_decision(checkpoint: ExecutionCheckpoint) -> bool:
+        """Whether a parked task-wait checkpoint is waiting on a permission decision.
+
+        Approval escalations park the task with the pending permission request
+        recorded under ``payload.runtime_v2.permission_requests``. Those prompts
+        are decided through their approval card, whose reply always targets the
+        checkpoint explicitly; free-form chat text is never the decision.
+        """
+        if str(checkpoint.checkpoint_type or "").strip() != "task_user_input":
+            return False
+        payload = dict(checkpoint.payload or {})
+        runtime_state = payload.get("runtime_v2")
+        if not isinstance(runtime_state, dict):
+            return False
+        requests = runtime_state.get("permission_requests")
+        return isinstance(requests, list) and len(requests) > 0
+
     async def _checkpoint_task_still_waiting(self, checkpoint: ExecutionCheckpoint) -> bool:
         """Whether a task-wait checkpoint still matches a genuinely waiting task.
 
@@ -9534,6 +9552,13 @@ class OPCEngine:
         else:
             checkpoint = await self.get_latest_pending_checkpoint_for_session(session_id)
             if not checkpoint:
+                return None
+            if self._checkpoint_awaits_approval_decision(checkpoint):
+                # A parked permission prompt is answered by its approval card
+                # (the card reply carries an explicit response_to_checkpoint_id).
+                # Deferred cards stay pending indefinitely, so a plain chat
+                # message must not be consumed as the approval answer — let it
+                # continue as a normal conversation turn instead.
                 return None
         metadata_mode = str(dict(reply_metadata or {}).get("mode", "") or "").strip()
         inferred_mode = requested_mode or metadata_mode
