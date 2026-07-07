@@ -1227,6 +1227,120 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, TaskStatus.DONE)
         self.assertIn("Recovered after provider tool protocol fallback.", result.content)
 
+    @staticmethod
+    def _make_provider_reject_llm(fail_times: int):
+        """LLM stub whose stream fails ``fail_times`` times with an
+        unclassified provider rejection (content-filter style), then answers."""
+
+        class _ProviderRejectLLM:
+            def __init__(self) -> None:
+                self.config = type("Cfg", (), {"max_tokens": 2048})()
+                self.stream_calls = 0
+                self.seen_notice_payloads: list[list[str]] = []
+
+            def prepare_user_message_content(self, content: str, attachment_refs=None):
+                _ = attachment_refs
+                return content
+
+            def get_tool_definitions(self, tools):
+                return tools
+
+            def is_context_overflow_error(self, error: Exception) -> bool:
+                _ = error
+                return False
+
+            def is_tool_protocol_error(self, error: Exception) -> bool:
+                _ = error
+                return False
+
+            def sanitize_tool_call_history(self, messages):
+                return list(messages)
+
+            async def chat_stream(self, messages, tools=None):
+                _ = tools
+                self.stream_calls += 1
+                self.seen_notice_payloads.append([
+                    str(m.get("content", ""))
+                    for m in messages
+                    if m.get("role") == "system" and "[runtime notice]" in str(m.get("content", ""))
+                ])
+                if self.stream_calls <= fail_times:
+                    yield type("Evt", (), {"event_type": "message_start", "payload": {}, "model": "stub"})()
+                    raise RuntimeError(
+                        "litellm.BadRequestError: OpenAIException - The request failed "
+                        "because the input may contain sensitive information."
+                    )
+                yield type("Evt", (), {"event_type": "message_start", "payload": {}, "model": "stub"})()
+                yield type("Evt", (), {
+                    "event_type": "assistant_delta",
+                    "payload": {"text": "Rephrased and continued."},
+                    "model": "stub",
+                })()
+                yield type("Evt", (), {"event_type": "message_stop", "payload": {}, "model": "stub"})()
+
+            async def chat(self, messages, tools=None):
+                raise AssertionError("non-stream fallback must not be used for unclassified errors")
+
+        return _ProviderRejectLLM()
+
+    async def test_unclassified_provider_error_feeds_error_back_and_recovers(self) -> None:
+        llm = self._make_provider_reject_llm(fail_times=1)
+        runtime = NativeRuntimeV2(
+            llm=llm,
+            tool_registry=ToolRegistry(),
+            memory_manager=_StubMemoryManager(_StubStore()),
+            config=OPCConfig(),
+            max_iterations=8,
+        )
+
+        result = await runtime.run(
+            system_prompt="You are a resilient runtime.",
+            user_message="Complete the task.",
+            task=Task(
+                title="provider-reject-recover",
+                description="provider-reject-recover",
+                session_id="sess-provider-reject-recover",
+                project_id="proj1",
+                metadata={"mode": "task"},
+            ),
+        )
+
+        self.assertEqual(result.status, TaskStatus.DONE)
+        self.assertIn("Rephrased and continued.", result.content)
+        self.assertEqual(llm.stream_calls, 2)
+        # The retry request must contain the provider's error text as a notice
+        retry_notices = llm.seen_notice_payloads[1]
+        self.assertEqual(len(retry_notices), 1)
+        self.assertIn("sensitive information", retry_notices[0])
+        self.assertIn("not a user action", retry_notices[0])
+
+    async def test_unclassified_provider_error_retries_are_bounded_then_fail(self) -> None:
+        llm = self._make_provider_reject_llm(fail_times=99)
+        runtime = NativeRuntimeV2(
+            llm=llm,
+            tool_registry=ToolRegistry(),
+            memory_manager=_StubMemoryManager(_StubStore()),
+            config=OPCConfig(),
+            max_iterations=20,
+        )
+
+        result = await runtime.run(
+            system_prompt="You are a resilient runtime.",
+            user_message="Complete the task.",
+            task=Task(
+                title="provider-reject-bounded",
+                description="provider-reject-bounded",
+                session_id="sess-provider-reject-bounded",
+                project_id="proj1",
+                metadata={"mode": "task"},
+            ),
+        )
+
+        self.assertEqual(result.status, TaskStatus.FAILED)
+        self.assertIn("sensitive information", result.content)
+        # 1 initial + 2 feedback retries + 1 context-reset retry = 4, never 20
+        self.assertLessEqual(llm.stream_calls, 4)
+
     async def test_todo_write_normalizes_openopc_task_ledger_shape(self) -> None:
         runtime = NativeRuntimeV2(
             llm=_StubLLM(),

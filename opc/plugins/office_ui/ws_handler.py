@@ -1960,6 +1960,9 @@ class WSHandler:
                 logger.warning(f"Failed to resolve escalation task mapping for {source_task_id}: {e}")
                 task = None
             if task is not None:
+                internal_turn_target = self._company_internal_turn_escalation_target(task)
+                if internal_turn_target is not None:
+                    return internal_turn_target or None
                 ui_task_id = self._ui_task_id_for_task(task)
                 if ui_task_id:
                     return ui_task_id
@@ -1974,6 +1977,45 @@ class WSHandler:
                         return mapped_task_id
 
         return source_task_id
+
+    def _company_internal_turn_escalation_target(self, task: Any | None) -> str | None:
+        """Visible routing target for escalations raised by internal
+        company-mode scheduling turns.
+
+        Review/report turn work items get composite ids (``review::<wid>::vN``),
+        so their runtime tasks carry session ids shaped like
+        ``<root_session>:review::<wid>::vN``. The UI deliberately hides those
+        session channels, so an approval card posted to the turn's own channel
+        can never be seen or answered — it silently times out and the work item
+        parks on AWAITING_HUMAN.
+
+        Returns None when ``task`` is not such an internal turn (caller keeps
+        its normal resolution), the primary task id of the run's root session
+        when resolvable, or "" when the turn is internal but no visible session
+        is known (caller should fall back to the activity channel rather than
+        the hidden channel).
+        """
+        if task is None:
+            return None
+        session_id = str(getattr(task, "session_id", "") or "").strip()
+        root_session_id, sep, suffix = session_id.partition(":")
+        if not sep or "::" not in suffix:
+            return None
+        metadata = dict(getattr(task, "metadata", {}) or {})
+        origin_task_id = str(metadata.get("origin_task_id") or "").strip()
+        task_id = str(getattr(task, "id", "") or "").strip()
+        if origin_task_id and origin_task_id != task_id:
+            return origin_task_id
+        for candidate_session_id in (
+            root_session_id,
+            str(getattr(task, "parent_session_id", "") or "").strip(),
+        ):
+            if not candidate_session_id:
+                continue
+            mapped_task_id = str(self._session_to_task.get(candidate_session_id) or "").strip()
+            if mapped_task_id and mapped_task_id != task_id:
+                return mapped_task_id
+        return ""
 
     @staticmethod
     def _pending_escalation_matches_task(record: dict[str, Any], task_id: str | None) -> bool:

@@ -270,6 +270,13 @@ class NativeRuntimeV2:
             1,
             int(self.config.system.native_runtime.reactive_compaction.max_overflow_retries or 1),
         ) if self.config.system.native_runtime.reactive_compaction.enabled else 1
+        # Unclassified provider failures (content filters, transient rejects)
+        # get bounded retries with the provider's error text fed back into the
+        # conversation so the model can adapt; the counter resets after every
+        # successful stream so long runs are not penalized for sporadic blips.
+        stream_error_feedback_retries = 0
+        max_stream_error_feedback_retries = 2
+        stream_error_context_reset_attempted = False
         compaction_boundaries: list[dict[str, Any]] = []
 
         await self._save_runtime_session(
@@ -566,20 +573,55 @@ class NativeRuntimeV2:
                     )
                 else:
                     await self._cancel_early_tool_runs(early_tool_runs)
-                    truncated = self._truncate_to_last_clean_user_turn(messages, base_prefix_len)
-                    if truncated and len(truncated) > base_prefix_len:
+                    if self.llm.is_tool_protocol_error(exc):
+                        truncated = self._truncate_to_last_clean_user_turn(messages, base_prefix_len)
+                        if truncated and len(truncated) > base_prefix_len:
+                            await self._emit_runtime_event(
+                                runtime_session_id,
+                                task,
+                                "tool_protocol_retry",
+                                {
+                                    "iteration": iteration + 1,
+                                    "strategy": "truncate",
+                                    "message": str(exc),
+                                },
+                            )
+                            messages = truncated
+                            continue
+                    elif stream_error_feedback_retries < max_stream_error_feedback_retries:
+                        stream_error_feedback_retries += 1
+                        messages.append(self._provider_error_feedback_message(exc))
                         await self._emit_runtime_event(
                             runtime_session_id,
                             task,
                             "tool_protocol_retry",
                             {
                                 "iteration": iteration + 1,
-                                "strategy": "truncate",
+                                "strategy": "provider_error_feedback",
+                                "attempt": stream_error_feedback_retries,
                                 "message": str(exc),
                             },
                         )
-                        messages = truncated
                         continue
+                    elif not stream_error_context_reset_attempted:
+                        stream_error_context_reset_attempted = True
+                        truncated = self._truncate_to_last_clean_user_turn(messages, base_prefix_len)
+                        if truncated and base_prefix_len < len(truncated) < len(messages):
+                            truncated.append(
+                                self._provider_error_feedback_message(exc, context_reset=True)
+                            )
+                            await self._emit_runtime_event(
+                                runtime_session_id,
+                                task,
+                                "tool_protocol_retry",
+                                {
+                                    "iteration": iteration + 1,
+                                    "strategy": "provider_error_context_reset",
+                                    "message": str(exc),
+                                },
+                            )
+                            messages = truncated
+                            continue
                     await self._emit_runtime_event(
                         runtime_session_id,
                         task,
@@ -607,6 +649,7 @@ class NativeRuntimeV2:
                         token_usage=total_usage,
                     )
 
+            stream_error_feedback_retries = 0
             tool_calls = self._finalize_tool_calls(tool_call_chunks)
             assistant_message = {"role": "assistant", "content": assistant_text}
             if tool_calls:
@@ -1696,6 +1739,41 @@ class NativeRuntimeV2:
                 if not self.llm.is_tool_protocol_error(retry_exc):
                     break
         return None
+
+    @staticmethod
+    def _provider_error_feedback_message(
+        exc: Exception,
+        *,
+        context_reset: bool = False,
+    ) -> dict[str, str]:
+        """Conversation message telling the model why the last request failed.
+
+        Unclassified provider rejections (content filters, transient 4xx) never
+        produce model output, so without this the model has no way to know the
+        request failed or why. Feeding the provider's own error text back lets
+        the model decide how to proceed (rephrase, drop a quote, change tack)
+        instead of the runtime blindly replaying an identical payload.
+        """
+        error_text = " ".join(str(exc).split())[:600]
+        if context_reset:
+            detail = (
+                "The previous LLM request kept failing at the model provider, so the "
+                "intermediate steps of the current turn were dropped from the request."
+            )
+        else:
+            detail = (
+                "The previous LLM request failed at the model provider before any "
+                "output was produced."
+            )
+        return {
+            "role": "system",
+            "content": (
+                f"[runtime notice] {detail} Provider error: {error_text}. "
+                "This was not a user action. Adjust your next step accordingly — for "
+                "example rephrase sensitive wording, avoid quoting flagged content "
+                "verbatim, or choose another way to make progress — then continue the task."
+            ),
+        }
 
     def _truncate_to_last_clean_user_turn(
         self,
