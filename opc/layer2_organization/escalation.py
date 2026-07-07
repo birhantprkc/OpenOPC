@@ -37,10 +37,14 @@ class EscalationEngine:
         message: str,
         options: list[dict[str, str]] | None = None,
         default_action: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str | None:
         """Escalate to the user and wait for a reply.
 
         Returns the user's reply or the default action on timeout.
+        ``context`` carries structured approval data (action, allowlist
+        patterns, scopes) into the UI card so a decision can still be applied
+        after this inline wait has expired.
         """
         # Use a unique escalation id per prompt so repeated approvals for the
         # same task do not alias to older UI cards or stale pending state.
@@ -55,6 +59,7 @@ class EscalationEngine:
                 "message": message,
                 "options": options or [],
                 "default_action": default_action,
+                "approval_context": dict(context or {}),
             },
         ))
 
@@ -97,6 +102,7 @@ class EscalationEngine:
         question: str,
         options: list[dict[str, str]],
         default_action: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> str | None:
         metadata = dict(getattr(task, "metadata", {}) or {})
         execution_mode = str(metadata.get("execution_mode", "") or "").strip()
@@ -118,6 +124,7 @@ class EscalationEngine:
             message=f"[DECISION NEEDED] Task: {task_label}\n{question}",
             options=options,
             default_action=default_action,
+            context=context,
         )
 
     async def escalate_risk(self, task: Task, risk_description: str) -> str | None:

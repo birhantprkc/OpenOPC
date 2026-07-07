@@ -40,6 +40,10 @@ from opc.llm.retry import LLMRetryError, call_llm_json_with_retry
 
 
 _SHELL_CONTROL_TOKENS = {"&&", "||", ";", "|", "&"}
+# Redirections that cannot write to a real file: fd duplication (2>&1, >&2)
+# and discarding output into /dev/null. Everything else keeps counting as a
+# redirection for the safe-prefix check.
+_SAFE_REDIRECTION_RE = re.compile(r"(?:\d?>>?\s*/dev/null\b|\d?>&\d|&>>?\s*/dev/null\b)")
 _LOW_RISK_SHELL_PREFIXES = set(ACQUISITION_SHELL_PREFIXES)
 _EXTERNAL_AGENT_DIRECT_HUMAN_MARKERS = (
     "--dangerously-bypass-approvals-and-sandbox",
@@ -495,7 +499,11 @@ class ApprovalEngine:
             metadata=metadata,
         )
 
-        if tool_requires_allowlist:
+        if tool_requires_allowlist and heuristic.risk_level != RiskLevel.LOW:
+            # First-use approval exists to catch unfamiliar, potentially risky
+            # actions. Actions the heuristic already classified LOW (read-only
+            # safe-prefix shell commands, clean tool arguments) proceed without
+            # a card; MEDIUM and above still require the human gate.
             decision = self._force_first_use_approval(heuristic)
         elif external_direct_prompt_reason:
             decision = ApprovalDecision(
@@ -666,7 +674,20 @@ class ApprovalEngine:
         session_scope_id = self._approval_session_scope_id(task)
         if not session_scope_id:
             return None
-        scope = self._session_allowlist.get(session_scope_id, {})
+        scope = self._session_allowlist.get(session_scope_id)
+        if scope is None:
+            # Hydrate from the persisted allowlist so "Allow for this session"
+            # grants survive `opc ui` restarts and re-entering the session.
+            scope = {}
+            if self.allowlist:
+                try:
+                    scope = self.allowlist.session_scope(session_scope_id)
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "Failed to hydrate persisted session allowlist; using empty scope"
+                    )
+                    scope = {}
+            self._session_allowlist[session_scope_id] = scope
         patterns = ApprovalAllowlistManager._scope_patterns(scope, action_kind, action_name)
         if not patterns:
             return None
@@ -716,7 +737,21 @@ class ApprovalEngine:
         action_name: str,
         patterns: list[str],
     ) -> list[str]:
-        session_scope_id = self._approval_session_scope_id(task)
+        return self._add_session_patterns_by_scope(
+            session_scope_id=self._approval_session_scope_id(task),
+            action_kind=action_kind,
+            action_name=action_name,
+            patterns=patterns,
+        )
+
+    def _add_session_patterns_by_scope(
+        self,
+        *,
+        session_scope_id: str,
+        action_kind: str,
+        action_name: str,
+        patterns: list[str],
+    ) -> list[str]:
         if not session_scope_id:
             return []
         normalized_patterns = ApprovalAllowlistManager._normalize_pattern_list(patterns)
@@ -735,6 +770,13 @@ class ApprovalEngine:
             existing.append(pattern)
             added.append(pattern)
         action_bucket[action_name] = existing
+        if added and self.allowlist:
+            try:
+                self.allowlist.add_session_patterns(session_scope_id, action_kind, action_name, added)
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Failed to persist session allowlist patterns; grant remains in-memory only"
+                )
         return added
 
     def _tool_requires_first_use_approval(
@@ -875,29 +917,48 @@ class ApprovalEngine:
         text = str(command or "")
         if "$(" in text or "`" in text:
             return True
-        # ``eval`` / ``source`` let a "safe" prefix execute an arbitrary follow-up arg.
-        tokens = text.split()
-        if tokens and tokens[0] in {"eval", "source", "."}:
-            return True
-        return any(tok in {"eval", "source"} for tok in tokens)
+        # ``eval`` / ``source`` let a "safe" prefix execute an arbitrary follow-up
+        # arg, but only when they are the command itself. As ordinary arguments
+        # (``grep source config.py``) they are inert; flagging them there only
+        # produces false approval prompts.
+        for tokens in self._split_shell_command_segments(text):
+            if tokens and tokens[0] in {"eval", "source", "."}:
+                return True
+        return False
 
     def _command_matches_safe_prefix(self, command: str, prefixes: list[str]) -> bool:
         cleaned = " ".join(str(command or "").split()).strip()
-        if not cleaned or self._command_has_redirection(cleaned):
+        if not cleaned:
             return False
-        if self._command_has_shell_substitution(cleaned):
+        # Discarding stderr or duplicating fds writes nothing, and agents
+        # habitually append `2>&1` / `2>/dev/null` to read-only commands; strip
+        # those before the redirection check so they alone do not disqualify a
+        # command. Anything else touching `>`/`>>`/`<` still fails.
+        sanitized = _SAFE_REDIRECTION_RE.sub(" ", cleaned)
+        if self._command_has_redirection(sanitized):
             return False
-        commands, command_prefixes = self._extract_shell_command_targets(cleaned)
-        if len(commands) != 1 or len(command_prefixes) != 1:
+        if self._command_has_shell_substitution(sanitized):
             return False
-        prefix = command_prefixes[0].casefold()
-        for item in prefixes:
-            candidate = str(item or "").strip().casefold()
-            if not candidate:
-                continue
-            if prefix == candidate or prefix.startswith(f"{candidate} "):
-                return True
-        return False
+        commands, command_prefixes = self._extract_shell_command_targets(sanitized)
+        if not commands or not command_prefixes:
+            return False
+        candidates = [
+            candidate
+            for candidate in (str(item or "").strip().casefold() for item in prefixes)
+            if candidate
+        ]
+        if not candidates:
+            return False
+        # A compound command (`ls a && echo --- && ls b`, `git status | head`)
+        # qualifies only when every segment independently matches a safe prefix.
+        for prefix in command_prefixes:
+            normalized_prefix = prefix.casefold()
+            if not any(
+                normalized_prefix == candidate or normalized_prefix.startswith(f"{candidate} ")
+                for candidate in candidates
+            ):
+                return False
+        return True
 
     def _is_low_risk_shell_first_use_exempt(self, action_name: str, metadata: dict[str, Any]) -> bool:
         if action_name != "shell_exec":
@@ -1503,11 +1564,25 @@ class ApprovalEngine:
                 {"id": "always_project", "label": "Always allow for this project"},
                 {"id": "always_global", "label": "Always allow globally"},
             ])
+        approval_context = {
+            "action_kind": action_kind,
+            "action_name": action_name,
+            "project_id": str(task.project_id or "") if task else "",
+            "session_scope_id": self._approval_session_scope_id(task),
+            "allowlist_enabled": allowlist_enabled,
+            "allowlist_patterns": list(allowlist_patterns),
+            "candidates": self._build_allowlist_candidates(
+                action_kind=action_kind,
+                action_name=action_name,
+                metadata=metadata,
+            ),
+        }
         reply = await self.escalation.escalate_decision(
             task,
             question,
             options,
             default_action=None,
+            context=approval_context,
         )
         if reply is None:
             return False, ApprovalDecision(
@@ -1573,6 +1648,104 @@ class ApprovalEngine:
             policy_source="human_escalation",
             metadata=result_metadata,
         )
+
+    def apply_deferred_escalation_decision(
+        self,
+        reply: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply a decision clicked on an approval card after its inline wait
+        expired (the blocked task has parked on AWAITING_HUMAN by then).
+
+        Persists the same allowlist grant the live path would have applied, so
+        the re-run of the blocked action passes automatically. ``context`` is
+        the ``approval_context`` the card was created with. Returns a summary
+        {approved, scope, patterns} for UI messaging.
+        """
+        normalized_reply = str(reply or "").strip()
+        context = dict(context or {})
+        action_kind = str(context.get("action_kind", "") or "").strip()
+        action_name = str(context.get("action_name", "") or "").strip()
+        project_id = str(context.get("project_id", "") or "").strip() or None
+        session_scope_id = str(context.get("session_scope_id", "") or "").strip()
+        allowlist_enabled = bool(context.get("allowlist_enabled", False))
+        allowlist_patterns = [
+            str(item).strip() for item in list(context.get("allowlist_patterns", []) or [])
+            if str(item).strip()
+        ]
+        exact_candidates = [
+            str(item).strip() for item in list(context.get("candidates", []) or [])
+            if str(item).strip()
+        ]
+        if not allowlist_enabled and normalized_reply in {"approve_session", "always_project", "always_global"}:
+            normalized_reply = "approve_once"
+        approved = normalized_reply in {"approve_once", "approve_session", "always_project", "always_global"}
+
+        saved_patterns: list[str] = []
+        scope: str | None = None
+        if normalized_reply == "approve_session" and session_scope_id and allowlist_patterns:
+            saved_patterns = self._add_session_patterns_by_scope(
+                session_scope_id=session_scope_id,
+                action_kind=action_kind,
+                action_name=action_name,
+                patterns=allowlist_patterns,
+            )
+            scope = f"session:{session_scope_id}"
+        elif normalized_reply == "approve_once" and session_scope_id:
+            # No one-shot grant store exists; the narrowest durable equivalent
+            # is a session grant for the exact blocked command(s), so the
+            # resumed run passes without widening approval to the whole family.
+            once_patterns = exact_candidates or allowlist_patterns
+            if once_patterns:
+                saved_patterns = self._add_session_patterns_by_scope(
+                    session_scope_id=session_scope_id,
+                    action_kind=action_kind,
+                    action_name=action_name,
+                    patterns=once_patterns,
+                )
+                scope = f"session:{session_scope_id}"
+        elif normalized_reply == "always_project" and self.allowlist and project_id and allowlist_patterns:
+            saved_patterns = self.allowlist.add_patterns(
+                action_kind=action_kind,
+                action_name=action_name,
+                patterns=allowlist_patterns,
+                project_id=project_id,
+            )
+            scope = f"project:{project_id}"
+        elif normalized_reply == "always_global" and self.allowlist and allowlist_patterns:
+            saved_patterns = self.allowlist.add_patterns(
+                action_kind=action_kind,
+                action_name=action_name,
+                patterns=allowlist_patterns,
+                project_id=None,
+            )
+            scope = "global"
+
+        if action_name:
+            try:
+                self.preferences.record_autonomy_feedback(
+                    action_name=action_name,
+                    approved=approved,
+                    project_id=project_id if normalized_reply == "always_project" else None,
+                    explicit=normalized_reply in {"approve_session", "always_project", "always_global"},
+                    notes=(
+                        "User approved via deferred escalation card."
+                        if approved
+                        else "User denied via deferred escalation card."
+                    ),
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "Failed to record autonomy feedback for deferred escalation decision"
+                )
+
+        return {
+            "approved": approved,
+            "reply": normalized_reply,
+            "scope": scope,
+            "patterns": saved_patterns,
+            "action_name": action_name,
+        }
 
     async def _record(
         self,

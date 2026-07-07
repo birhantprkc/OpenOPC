@@ -4889,6 +4889,12 @@ class WSHandler:
             "project_id": pid,
             "approval_group_key": esc_record.get("approval_group_key"),
         }
+        approval_context = dict(p.get("approval_context") or {})
+        if approval_context:
+            # Persisted with the card so a click AFTER the inline wait expired
+            # (or after a restart) can still apply the same allowlist grant and
+            # resume the parked task.
+            esc_meta["approval_context"] = approval_context
         if is_task_mode:
             esc_meta["execution_mode"] = "task_mode"
             esc_meta["permission_group_key"] = esc_record.get("approval_group_key")
@@ -4941,6 +4947,137 @@ class WSHandler:
             if now - created_at <= window_seconds:
                 return True
         return False
+
+    async def _find_pending_approval_park_checkpoint(
+        self,
+        engine: Any,
+        task_id: str,
+        project_id: str,
+    ) -> Any | None:
+        """Locate the pending checkpoint a tool-approval timeout parked on.
+
+        When an approval card's inline wait expires, the blocked runtime task
+        returns AWAITING_HUMAN and the engine saves a durable pause checkpoint
+        (task mode: ``task_user_input``; company mode: ``company_work_item_gate``).
+        A later click on the card resumes execution through that checkpoint.
+        """
+        source_task_id = str(task_id or "").strip()
+        if not source_task_id:
+            return None
+        store = getattr(engine, "store", None)
+        getter = getattr(store, "get_pending_checkpoints", None)
+        if not callable(getter):
+            return None
+        try:
+            pending = await getter(project_id=project_id)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "Failed to load pending checkpoints for deferred escalation resume"
+            )
+            return None
+        candidates = []
+        for checkpoint in pending or []:
+            if str(getattr(checkpoint, "checkpoint_type", "") or "") not in {
+                "task_user_input",
+                "company_work_item_gate",
+            }:
+                continue
+            payload = dict(getattr(checkpoint, "payload", {}) or {})
+            linked_ids = {
+                str(payload.get("task_id") or "").strip(),
+                str(payload.get("waiting_task_id") or "").strip(),
+                str(getattr(checkpoint, "task_id", "") or "").strip(),
+            }
+            linked_ids.update(str(item or "").strip() for item in list(payload.get("task_ids", []) or []))
+            if source_task_id in linked_ids:
+                candidates.append(checkpoint)
+        if not candidates:
+            return None
+
+        def _checkpoint_timestamp(checkpoint: Any) -> float:
+            created = getattr(checkpoint, "created_at", None)
+            try:
+                return float(created.timestamp())
+            except (AttributeError, TypeError, ValueError, OSError):
+                return 0.0
+
+        return max(candidates, key=_checkpoint_timestamp)
+
+    async def _resolve_deferred_escalation_click(
+        self,
+        *,
+        engine: Any,
+        project_id: str,
+        channel_id: str,
+        checkpoint_id: str,
+        card_meta: dict[str, Any],
+        option_id: str,
+    ) -> dict[str, Any]:
+        """Apply a decision clicked on an approval card whose inline wait has
+        expired: persist the allowlist grant, resolve the card, and hand back
+        either a flow-through rewrite (resume the parked task through the
+        normal message pipeline) or a helper reply when nothing is parked."""
+        approval_context = dict(card_meta.get("approval_context") or {})
+        summary: dict[str, Any] = {
+            "approved": option_id in {"approve_once", "approve_session", "always_project", "always_global"},
+            "scope": None,
+        }
+        approval_engine = getattr(engine, "approval_engine", None)
+        apply_decision = getattr(approval_engine, "apply_deferred_escalation_decision", None)
+        if callable(apply_decision):
+            try:
+                summary = apply_decision(option_id, approval_context)
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Deferred approval grant failed; resuming the parked task without a new allowlist entry"
+                )
+        await self._mark_human_escalation_checkpoint_status(
+            checkpoint_id,
+            status="resolved",
+            project_id=project_id,
+            channel_id=channel_id,
+            reply=option_id,
+            reason="deferred_decision",
+        )
+
+        source_task_id = str(
+            card_meta.get("source_task_id") or card_meta.get("task_id") or ""
+        ).strip()
+        park_checkpoint = await self._find_pending_approval_park_checkpoint(
+            engine, source_task_id, project_id
+        )
+        action_name = str(approval_context.get("action_name", "") or "").strip() or "action"
+        approved = bool(summary.get("approved"))
+        scope = str(summary.get("scope") or "").strip()
+        if park_checkpoint is None:
+            return {
+                "action": "reply",
+                "text": (
+                    f"Decision `{option_id}` recorded"
+                    + (f"; allowlist updated ({scope})" if approved and scope else "")
+                    + ". No parked task is currently waiting on this approval — if the runtime "
+                    "is still transitioning, the grant applies on its next attempt."
+                ),
+            }
+        if approved:
+            scope_note = f" (allowlisted: {scope})" if scope else ""
+            crafted = (
+                f"Approval decision: {option_id}. The previously blocked `{action_name}` action "
+                f"is now permitted{scope_note}. Re-run it and continue the task."
+            )
+        else:
+            crafted = (
+                f"Approval decision: deny. Do not run the blocked `{action_name}` action; "
+                "choose an alternative approach or report the limitation to your manager."
+            )
+        return {
+            "action": "flow_through",
+            "content": crafted,
+            "reply_metadata": {
+                "response_to_checkpoint_id": str(getattr(park_checkpoint, "checkpoint_id", "") or ""),
+                "response_to_checkpoint_type": str(getattr(park_checkpoint, "checkpoint_type", "") or ""),
+            },
+        }
 
     async def _mark_human_escalation_checkpoint_status(
         self,
@@ -4997,11 +5134,18 @@ class WSHandler:
         if not escalation_id:
             return
         if event.event_type == "escalation_timeout":
+            default_action = str(payload.get("default_action", "") or "").strip() or None
+            if default_action is None:
+                # No default was applied on timeout — the decision is still the
+                # user's to make. The task parks on AWAITING_HUMAN and the card
+                # stays pending; clicking it later applies the decision and
+                # resumes the parked task (deferred approval path).
+                return
             await self._mark_human_escalation_checkpoint_status(
                 escalation_id,
                 status="timeout",
                 project_id=project_id,
-                default_action=str(payload.get("default_action", "") or "").strip() or None,
+                default_action=default_action,
                 reason="timeout",
             )
             return
@@ -5059,6 +5203,11 @@ class WSHandler:
                 escalation_id=escalation_id,
                 project_id=project_id,
             ):
+                continue
+            if isinstance(metadata.get("approval_context"), dict) and metadata.get("approval_context"):
+                # Deferred-capable approval card: it stays answerable after the
+                # inline wait expired or across restarts, so a missing pending
+                # future does NOT make it stale.
                 continue
             updated = await self._mark_human_escalation_checkpoint_status(
                 escalation_id,
@@ -5625,6 +5774,7 @@ class WSHandler:
             and bool(explicit_checkpoint_id or explicit_escalation_id)
         )
         if stale_human_escalation:
+            handled_as_deferred = False
             if _looks_like_escalation_reply(content):
                 stale_checkpoint_id = explicit_escalation_id or explicit_checkpoint_id
                 # Duplicate clicks on an approval card that was JUST resolved
@@ -5645,6 +5795,7 @@ class WSHandler:
                     )
                 card_meta = dict((card or {}).get("metadata", {}) or {})
                 card_status = str(card_meta.get("checkpoint_status", "") or "").strip().lower()
+                helper_text: str | None = None
                 if card_status in {"resolved", "responded"}:
                     resolution_reply = str(
                         card_meta.get("checkpoint_resolution_reply", "") or ""
@@ -5655,37 +5806,70 @@ class WSHandler:
                         + ". No further action is needed."
                     )
                 else:
-                    await self._mark_human_escalation_checkpoint_status(
-                        stale_checkpoint_id,
-                        status="stale",
-                        project_id=pid,
+                    approval_context = card_meta.get("approval_context")
+                    deferred_option = (
+                        _normalize_escalation_reply(content, list(card_meta.get("options") or []))
+                        if isinstance(approval_context, dict) and approval_context
+                        else None
+                    )
+                    if deferred_option:
+                        # The inline wait expired (or the server restarted), but
+                        # the decision is still the user's to make: apply the
+                        # grant, resolve the card, and resume the parked task.
+                        outcome = await self._resolve_deferred_escalation_click(
+                            engine=run_engine,
+                            project_id=pid,
+                            channel_id=channel_id,
+                            checkpoint_id=stale_checkpoint_id,
+                            card_meta=card_meta,
+                            option_id=deferred_option,
+                        )
+                        if outcome.get("action") == "flow_through":
+                            content = str(outcome.get("content") or content)
+                            for key in (
+                                "response_to_checkpoint_id",
+                                "response_to_checkpoint_type",
+                                "response_to_escalation_id",
+                            ):
+                                reply_metadata.pop(key, None)
+                            reply_metadata.update(dict(outcome.get("reply_metadata") or {}))
+                            handled_as_deferred = True
+                        else:
+                            helper_text = str(outcome.get("text") or "Decision recorded.")
+                    else:
+                        await self._mark_human_escalation_checkpoint_status(
+                            stale_checkpoint_id,
+                            status="stale",
+                            project_id=pid,
+                            channel_id=channel_id,
+                            reason="reply_to_inactive_escalation",
+                        )
+                        helper_text = (
+                            "That approval request is no longer active. "
+                            "The approval card has been marked inactive in the session history."
+                        )
+                if helper_text is not None:
+                    if await self._recent_identical_helper_exists(
+                        channel_id, helper_text, project_id=pid
+                    ):
+                        return
+                    helper = await self.chat_store.insert_message(
                         channel_id=channel_id,
-                        reason="reply_to_inactive_escalation",
+                        sender="assistant",
+                        sender_name="OPC",
+                        content=helper_text,
+                        project_id=pid,
+                        metadata={"type": "system"},
                     )
-                    helper_text = (
-                        "That approval request is no longer active. "
-                        "The approval card has been marked inactive in the session history."
-                    )
-                if await self._recent_identical_helper_exists(
-                    channel_id, helper_text, project_id=pid
-                ):
+                    await self.broadcast({"type": "session_message", "payload": helper})
                     return
-                helper = await self.chat_store.insert_message(
-                    channel_id=channel_id,
-                    sender="assistant",
-                    sender_name="OPC",
-                    content=helper_text,
-                    project_id=pid,
-                    metadata={"type": "system"},
-                )
-                await self.broadcast({"type": "session_message", "payload": helper})
-                return
-            for key in (
-                "response_to_checkpoint_id",
-                "response_to_checkpoint_type",
-                "response_to_escalation_id",
-            ):
-                reply_metadata.pop(key, None)
+            if not handled_as_deferred:
+                for key in (
+                    "response_to_checkpoint_id",
+                    "response_to_checkpoint_type",
+                    "response_to_escalation_id",
+                ):
+                    reply_metadata.pop(key, None)
 
         if (
             explicit_checkpoint_type == "company_delivery_feedback"

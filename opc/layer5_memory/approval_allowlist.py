@@ -23,6 +23,7 @@ def _empty_payload() -> dict[str, Any]:
         "version": 1,
         "global": _empty_scope(),
         "projects": {},
+        "sessions": {},
     }
 
 
@@ -111,6 +112,58 @@ class ApprovalAllowlistManager:
             self.save(payload)
         return added
 
+    # "Allow for this session" grants used to live only in ApprovalEngine
+    # memory, so a `opc ui` restart or re-entering the session re-prompted for
+    # commands the user had already approved. They are now persisted here,
+    # keyed by the session scope id, capped to the most recent entries.
+    _MAX_SESSION_SCOPES = 200
+
+    def session_scope(self, session_id: str) -> dict[str, dict[str, list[str]]]:
+        key = str(session_id or "").strip()
+        if not key:
+            return _empty_scope()
+        payload = self.load()
+        return self._normalize_scope(payload["sessions"].get(key, {}))
+
+    def add_session_patterns(
+        self,
+        session_id: str,
+        action_kind: str,
+        action_name: str,
+        patterns: list[str],
+    ) -> list[str]:
+        key = str(session_id or "").strip()
+        normalized_patterns = [
+            self._normalize_pattern(pattern)
+            for pattern in patterns
+            if self._normalize_pattern(pattern)
+        ]
+        if not key or not normalized_patterns:
+            return []
+
+        payload = self.load()
+        sessions = payload["sessions"]
+        # Re-inserting moves an active session to the newest position so the
+        # recency cap below always evicts the longest-idle session first.
+        scope = self._normalize_scope(sessions.pop(key, {}))
+        sessions[key] = scope
+
+        action_bucket = scope.setdefault(action_kind, {})
+        existing = self._normalize_pattern_list(action_bucket.get(action_name, []))
+        added: list[str] = []
+        for pattern in normalized_patterns:
+            if pattern in existing:
+                continue
+            existing.append(pattern)
+            added.append(pattern)
+        action_bucket[action_name] = existing
+
+        while len(sessions) > self._MAX_SESSION_SCOPES:
+            sessions.pop(next(iter(sessions)))
+        if added:
+            self.save(payload)
+        return added
+
     def reset(self, project_id: str | None = None) -> None:
         payload = self.load()
         if project_id:
@@ -180,6 +233,14 @@ class ApprovalAllowlistManager:
                 if not key:
                     continue
                 normalized["projects"][key] = ApprovalAllowlistManager._normalize_scope(scope)
+
+        sessions = data.get("sessions", {})
+        if isinstance(sessions, dict):
+            for session_id, scope in sessions.items():
+                key = str(session_id).strip()
+                if not key:
+                    continue
+                normalized["sessions"][key] = ApprovalAllowlistManager._normalize_scope(scope)
         return normalized
 
     @staticmethod

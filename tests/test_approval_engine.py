@@ -157,6 +157,47 @@ class ApprovalEngineHeuristicTests(unittest.TestCase):
             self.assertFalse(self.engine._command_has_shell_substitution(payload))
             self.assertTrue(self.engine._command_matches_safe_prefix(payload, prefixes))
 
+    def test_compound_readonly_command_matches_safe_prefix(self) -> None:
+        # Agents habitually chain read-only commands and discard stderr; that
+        # alone must not disqualify the command from LOW risk.
+        prefixes = list(self.engine.config.safe_command_prefixes)
+        payloads = [
+            'ls -la /a 2>&1 && echo "---" && ls -la /b 2>/dev/null',
+            "cd /repo && git status --short 2>&1 | head -20",
+            "git log --oneline -5 | head -3",
+            "grep -rn pattern src | wc -l",
+        ]
+        for payload in payloads:
+            self.assertTrue(
+                self.engine._command_matches_safe_prefix(payload, prefixes),
+                f"compound read-only command must stay safe: {payload}",
+            )
+
+    def test_write_redirection_or_unsafe_segment_still_not_safe(self) -> None:
+        prefixes = list(self.engine.config.safe_command_prefixes)
+        payloads = [
+            "ls -la /a > out.txt",
+            "echo hi >> log.txt",
+            "cat notes.md | tee copy.md",
+            "ls /tmp && rm -rf /tmp/x",
+            "sort data.txt < input.txt",
+        ]
+        for payload in payloads:
+            self.assertFalse(
+                self.engine._command_matches_safe_prefix(payload, prefixes),
+                f"unsafe command must not match a safe prefix: {payload}",
+            )
+
+    def test_source_eval_flag_only_at_command_position(self) -> None:
+        # As arguments these words are inert; flagging them produced false
+        # approval prompts (e.g. `grep source config.py`).
+        self.assertFalse(self.engine._command_has_shell_substitution("grep source config.py"))
+        self.assertFalse(self.engine._command_has_shell_substitution("echo eval"))
+        # At command position they still count, in any segment.
+        self.assertTrue(self.engine._command_has_shell_substitution("source ./env.sh"))
+        self.assertTrue(self.engine._command_has_shell_substitution("ls && source ./env.sh"))
+        self.assertTrue(self.engine._command_has_shell_substitution("eval $CMD"))
+
     def test_external_prompt_text_still_escalates_for_destructive_command(self) -> None:
         metadata = {
             "prompt_text": "Approve command: rm -rf /tmp/demo",
@@ -220,11 +261,13 @@ class _EscalationStub:
         self.reply = reply
         self.calls: list[tuple[str, list[dict]]] = []
         self.default_actions: list[str | None] = []
+        self.contexts: list[dict | None] = []
 
-    async def escalate_decision(self, task, question, options, default_action=None):
+    async def escalate_decision(self, task, question, options, default_action=None, context=None):
         _ = task
         self.calls.append((question, options))
         self.default_actions.append(default_action)
+        self.contexts.append(context)
         return self.reply
 
 
@@ -379,25 +422,25 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
                 escalation=escalation,
                 config=AutonomyConfig(),
             )
-            task = Task(title="Write config", project_id="demo")
+            task = Task(title="Install deps", project_id="demo")
 
             approved, decision = await engine.authorize_tool_call(
                 task=task,
-                tool_name="file_write",
-                arguments={"path": "/tmp/demo.txt", "content": "hello"},
+                tool_name="shell_exec",
+                arguments={"command": "pip install requests"},
             )
 
             self.assertTrue(approved)
             self.assertEqual(decision.policy_source, "human_escalation")
             self.assertEqual(len(escalation.calls), 1)
 
-            rules = ApprovalAllowlistManager(opc_home).list_patterns("tool", "file_write", project_id="demo")
-            self.assertEqual(rules, ["*"])
+            rules = ApprovalAllowlistManager(opc_home).list_patterns("tool", "shell_exec", project_id="demo")
+            self.assertEqual(rules, ["pip install"])
 
             approved, decision = await engine.authorize_tool_call(
                 task=task,
-                tool_name="file_write",
-                arguments={"path": "/tmp/another.txt", "content": "world"},
+                tool_name="shell_exec",
+                arguments={"command": "pip install flask"},
             )
 
             self.assertTrue(approved)
@@ -471,19 +514,19 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             approved, decision = await engine.authorize_tool_call(
                 task=task,
                 tool_name="shell_exec",
-                arguments={"command": "git status --short"},
+                arguments={"command": "git commit -m demo"},
             )
 
             self.assertTrue(approved)
             self.assertEqual(decision.policy_source, "human_escalation")
 
             rules = ApprovalAllowlistManager(opc_home).list_patterns("tool", "shell_exec")
-            self.assertEqual(rules, ["git status"])
+            self.assertEqual(rules, ["git commit"])
 
             approved, decision = await engine.authorize_tool_call(
                 task=task,
                 tool_name="shell_exec",
-                arguments={"command": "git status -sb"},
+                arguments={"command": "git commit -m again"},
             )
 
             self.assertTrue(approved)
@@ -527,6 +570,154 @@ class ApprovalEngineAllowlistTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(decision.risk_level, RiskLevel.LOW)
             self.assertEqual(decision.policy_source, "heuristic")
             self.assertEqual(len(escalation.calls), 0)
+
+    async def test_low_risk_readonly_command_skips_first_use_prompt(self) -> None:
+        with _workspace_tempdir() as opc_home:
+            prefs = PreferenceManager(opc_home)
+            escalation = _EscalationStub("approve_once")
+            engine = ApprovalEngine(
+                llm=_LLMStub(),
+                store=_StoreStub(),
+                preferences=prefs,
+                memory=_MemoryStub(),
+                escalation=escalation,
+                config=AutonomyConfig(),
+            )
+            task = Task(title="Inspect repo", project_id="demo")
+
+            approved, decision = await engine.authorize_tool_call(
+                task=task,
+                tool_name="shell_exec",
+                arguments={"command": "cd /repo && git status --short 2>&1 | head -20"},
+            )
+
+            self.assertTrue(approved)
+            self.assertEqual(decision.action, ApprovalAction.AUTO_APPROVE)
+            self.assertEqual(decision.risk_level, RiskLevel.LOW)
+            self.assertEqual(len(escalation.calls), 0)
+
+    async def test_session_allowlist_persists_across_engine_restart(self) -> None:
+        with _workspace_tempdir() as opc_home:
+            prefs = PreferenceManager(opc_home)
+            escalation = _EscalationStub("approve_session")
+            config = AutonomyConfig()
+            engine = ApprovalEngine(
+                llm=_LLMStub(),
+                store=_StoreStub(),
+                preferences=prefs,
+                memory=_MemoryStub(),
+                escalation=escalation,
+                config=config,
+            )
+            task = Task(title="Check repo", project_id="demo", session_id="sess-persist")
+
+            approved, decision = await engine.authorize_tool_call(
+                task=task,
+                tool_name="shell_exec",
+                arguments={"command": "git commit -m demo"},
+            )
+
+            self.assertTrue(approved)
+            self.assertEqual(decision.policy_source, "human_escalation")
+            self.assertEqual(len(escalation.calls), 1)
+
+            # A fresh engine over the same OPC home simulates an `opc ui`
+            # restart: the session grant must survive, not re-prompt.
+            engine_restarted = ApprovalEngine(
+                llm=_LLMStub(),
+                store=_StoreStub(),
+                preferences=prefs,
+                memory=_MemoryStub(),
+                escalation=escalation,
+                config=config,
+            )
+            approved, decision = await engine_restarted.authorize_tool_call(
+                task=task,
+                tool_name="shell_exec",
+                arguments={"command": "git commit -m again"},
+            )
+
+            self.assertTrue(approved)
+            self.assertEqual(decision.policy_source, "session_approval")
+            self.assertEqual(len(escalation.calls), 1)
+
+    async def test_deferred_escalation_decision_applies_session_grant(self) -> None:
+        with _workspace_tempdir() as opc_home:
+            prefs = PreferenceManager(opc_home)
+            escalation = _EscalationStub(None)  # inline wait times out
+            engine = ApprovalEngine(
+                llm=_LLMStub(),
+                store=_StoreStub(),
+                preferences=prefs,
+                memory=_MemoryStub(),
+                escalation=escalation,
+                config=AutonomyConfig(),
+            )
+            task = Task(title="Install deps", project_id="demo", session_id="sess-deferred")
+
+            approved, decision = await engine.authorize_tool_call(
+                task=task,
+                tool_name="shell_exec",
+                arguments={"command": "pip install requests"},
+            )
+            self.assertFalse(approved)
+            self.assertEqual(decision.action, ApprovalAction.REQUIRE_INPUT)
+            # The card carries the approval context needed for a late decision.
+            context = escalation.contexts[-1]
+            self.assertIsInstance(context, dict)
+            self.assertEqual(context["action_name"], "shell_exec")
+            self.assertEqual(context["session_scope_id"], "sess-deferred")
+            self.assertIn("pip install", context["allowlist_patterns"])
+
+            # The user clicks the card minutes later: the grant persists and
+            # the retried command auto-approves without a new prompt.
+            summary = engine.apply_deferred_escalation_decision("approve_session", context)
+            self.assertTrue(summary["approved"])
+            self.assertEqual(summary["scope"], "session:sess-deferred")
+
+            prompts_before = len(escalation.calls)
+            approved, decision = await engine.authorize_tool_call(
+                task=task,
+                tool_name="shell_exec",
+                arguments={"command": "pip install flask"},
+            )
+            self.assertTrue(approved)
+            self.assertEqual(decision.policy_source, "session_approval")
+            self.assertEqual(len(escalation.calls), prompts_before)
+
+    async def test_deferred_escalation_deny_grants_nothing(self) -> None:
+        with _workspace_tempdir() as opc_home:
+            prefs = PreferenceManager(opc_home)
+            escalation = _EscalationStub(None)
+            engine = ApprovalEngine(
+                llm=_LLMStub(),
+                store=_StoreStub(),
+                preferences=prefs,
+                memory=_MemoryStub(),
+                escalation=escalation,
+                config=AutonomyConfig(),
+            )
+            task = Task(title="Install deps", project_id="demo", session_id="sess-deny")
+
+            await engine.authorize_tool_call(
+                task=task,
+                tool_name="shell_exec",
+                arguments={"command": "pip install requests"},
+            )
+            context = escalation.contexts[-1]
+
+            summary = engine.apply_deferred_escalation_decision("deny", context)
+            self.assertFalse(summary["approved"])
+            self.assertIsNone(summary["scope"])
+
+            prompts_before = len(escalation.calls)
+            approved, _ = await engine.authorize_tool_call(
+                task=task,
+                tool_name="shell_exec",
+                arguments={"command": "pip install requests"},
+            )
+            self.assertFalse(approved)
+            self.assertEqual(len(escalation.calls), prompts_before + 1)
 
     async def test_download_command_outside_acquisition_work_item_does_not_skip_first_use_prompt(self) -> None:
         with _workspace_tempdir() as opc_home:

@@ -994,6 +994,12 @@ class AutonomyConfig(BaseModel):
     safe_command_prefixes: list[str] = Field(default_factory=lambda: [
         "ls", "pwd", "echo", "rg", "find", "git status", "git diff", "python -V",
         "python3 -V", "node -v", "npm -v", "curl", "wget", "yt-dlp", "aria2c", "ffmpeg",
+        # Read-only commands agents chain constantly; each segment of a compound
+        # command must match one of these for the whole command to stay LOW risk.
+        "cd", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "cut", "tr",
+        "stat", "file", "which", "date", "du", "df", "tree", "basename", "dirname",
+        "realpath", "readlink", "uname", "nproc", "whoami", "hostname", "git log",
+        "git show", "git rev-parse",
     ])
     permissions_v2: PermissionsV2Config = Field(default_factory=PermissionsV2Config)
 
