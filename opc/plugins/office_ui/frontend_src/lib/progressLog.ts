@@ -27,9 +27,9 @@ function mergeText(left: string, right: string, kind: 'thinking' | 'tool_call'):
 }
 
 function summarizeThinking(detail: string, fallback: string): string {
-  void detail
-  void fallback
-  return 'Thinking'
+  const text = detail.trim().replace(/\s+/g, ' ')
+  if (!text) return fallback || 'Thinking'
+  return text.length > 120 ? `${text.slice(0, 120).trimEnd()}...` : text
 }
 
 function normalizeProgressEntry(entry: ProgressEntry): ProgressEntry {
@@ -84,7 +84,10 @@ function isDuplicateProgress(left: ProgressEntry, right: ProgressEntry): boolean
 
 function mergeProgress(left: ProgressEntry, right: ProgressEntry): ProgressEntry {
   if (left.type === 'thinking') {
-    const detail = mergeText(left.detail ?? left.summary, right.detail ?? right.summary, 'thinking')
+    // Merge detail text only: summary is a label/preview ("Thinking",
+    // truncated excerpt), so falling back to it would splice label text
+    // into the middle of the merged thinking stream.
+    const detail = mergeText(left.detail ?? '', right.detail ?? '', 'thinking')
     return {
       timestamp: right.timestamp,
       type: 'thinking',

@@ -155,7 +155,7 @@ export function AgentProgressBlock({ entries, agentStatus, currentTool, toolElap
             const cfg = ENTRY_CONFIG[entry.type] || ENTRY_CONFIG.status_change
 
             return (
-              <div key={progressEntryKey(entry, i)} className={`ptl-entry${isLast ? ' ptl-entry-last' : ''}`}>
+              <div key={progressEntryKey(entry, hiddenCount + i)} className={`ptl-entry${isLast ? ' ptl-entry-last' : ''}`}>
                 <div className="ptl-connector">
                   <div className="ptl-dot" style={{ color: cfg.color }}>
                     {cfg.icon}
@@ -183,11 +183,17 @@ export function AgentProgressBlock({ entries, agentStatus, currentTool, toolElap
         </div>
       )}
 
-      {/* ── Collapse button (when expanded) ────────────── */}
+      {/* ── Expand/collapse toggle (below timeline) ────── */}
       {expanded && filteredEntries.length > COLLAPSED_COUNT && (
         <button className="ptl-expand" onClick={() => setExpanded(false)}>
           <IconChevron down />
           <span>Show less</span>
+        </button>
+      )}
+      {!expanded && hiddenCount > 0 && (
+        <button className="ptl-expand" onClick={() => setExpanded(true)}>
+          <IconChevron />
+          <span>Show more ({hiddenCount} earlier step{hiddenCount > 1 ? 's' : ''})</span>
         </button>
       )}
     </div>

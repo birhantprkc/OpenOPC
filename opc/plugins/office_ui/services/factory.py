@@ -50,6 +50,9 @@ class OfficeServiceFactory:
             on_escalation=self.on_escalation,
         )
         self.db = await aiosqlite.connect(str(self.engine.opc_home / "ui_state.db"))
+        # Wait for a concurrent writer (e.g. a running office-UI server)
+        # instead of failing after sqlite's 5s default with 'database is locked'.
+        await self.db.execute("PRAGMA busy_timeout=30000")
         agent_store = AgentStore(self.db)
         await agent_store.initialize()
         chat_store = ChatStore(self.db)

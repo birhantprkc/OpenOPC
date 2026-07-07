@@ -7,6 +7,7 @@ sets up the event adapter pipeline, and serves static files + WebSocket.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,41 @@ def _is_under_path(path: Path, base: Path) -> bool:
         return False
 
 
+def _acquire_single_instance_lock(opc_home: Path) -> Any | None:
+    """Prevent two office-UI servers from sharing one OPC home.
+
+    Two server processes writing the same ui_state.db contend for the sqlite
+    write lock and surface as 'database is locked' failures mid-run. The lock
+    is advisory (flock), scoped to this OPC home, and released automatically
+    when the process exits — including on crash/SIGKILL, so a stale lock file
+    can never block a fresh start.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return None  # Non-POSIX platform: no flock available, skip the guard.
+
+    lock_path = opc_home / "office_ui.lock"
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.seek(0)
+        holder_pid = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        raise SystemExit(
+            f"Another office-UI server (pid {holder_pid}) is already running against "
+            f"{opc_home}. Two instances sharing one ui_state.db cause 'database is "
+            "locked' failures that can crash in-flight agent runs. Stop the other "
+            "instance first, or point this one at a different OPC home."
+        )
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
 # ── Application factory ──────────────────────────────────────────────────
 
 async def create_app(
@@ -72,8 +108,12 @@ async def create_app(
 
     # ── UI-state database (agents + chat) ─────────────────────────────
     opc_home = engine.opc_home
+    instance_lock = _acquire_single_instance_lock(opc_home)
     db_path = opc_home / "ui_state.db"
     db = await aiosqlite.connect(str(db_path))
+    # Wait for a concurrent writer (CLI, tooling) instead of failing after
+    # sqlite's 5s default with 'database is locked'.
+    await db.execute("PRAGMA busy_timeout=30000")
 
     agent_store = AgentStore(db)
     await agent_store.initialize()
@@ -129,6 +169,7 @@ async def create_app(
     app["engine"] = engine
     app["db"] = db
     app["ws_handler"] = ws_handler
+    app["instance_lock"] = instance_lock
 
     # ── Routes ────────────────────────────────────────────────────────
     app.router.add_get("/ws", ws_handler.handle_ws)
@@ -230,6 +271,12 @@ async def _on_shutdown(app: aiohttp.web.Application) -> None:
         await engine.shutdown()
     if db:
         await db.close()
+    instance_lock = app.get("instance_lock")
+    if instance_lock is not None:
+        try:
+            instance_lock.close()
+        except Exception:
+            pass
     logger.info("Office-UI server shut down")
 
 
@@ -263,3 +310,8 @@ def run_server(
         asyncio.run(_start())
     except KeyboardInterrupt:
         terminal_status("Shutting down Office UI", kind="warning")
+    except SystemExit as exc:
+        if exc.code and not isinstance(exc.code, int):
+            terminal_status(str(exc.code), kind="error")
+            raise SystemExit(1) from None
+        raise

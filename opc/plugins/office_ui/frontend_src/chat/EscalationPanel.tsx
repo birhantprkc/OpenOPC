@@ -1,6 +1,10 @@
-import React, { useCallback, useMemo } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ChatMessageMeta, HumanEscalationOption } from '../types/chat'
 import { MarkdownBody } from './MarkdownBody'
+
+// If the server never confirms (click lost on a dropped connection), re-enable
+// the buttons after this long so the user can retry.
+const SUBMIT_CONFIRM_TIMEOUT_MS = 30000
 
 interface EscalationPanelProps {
   meta: ChatMessageMeta
@@ -57,10 +61,20 @@ export const EscalationPanel = React.memo(function EscalationPanel({
   const worktreePath = String(meta.worktree_path ?? '').trim()
   const hasRuntimeState = activeSubagents.length > 0 || permissionRequests.length > 0 || !!worktreePath
 
+  const [submittedOptionId, setSubmittedOptionId] = useState('')
+  const isSubmitting = !!submittedOptionId && !isResponded
+
+  useEffect(() => {
+    if (!isSubmitting) return
+    const timer = window.setTimeout(() => setSubmittedOptionId(''), SUBMIT_CONFIRM_TIMEOUT_MS)
+    return () => window.clearTimeout(timer)
+  }, [isSubmitting, submittedOptionId])
+
   const handleReply = useCallback((option: HumanEscalationOption) => {
-    if (isResponded) return
+    if (isResponded || isSubmitting) return
+    setSubmittedOptionId(option.id)
     onReply(option.label || option.id)
-  }, [isResponded, onReply])
+  }, [isResponded, isSubmitting, onReply])
 
   return (
     <div className="ckpt-panel ckpt-escalation">
@@ -109,12 +123,19 @@ export const EscalationPanel = React.memo(function EscalationPanel({
           {options.map((option) => (
             <button
               key={option.id}
-              className={`ckpt-btn ${option.id.includes('deny') ? 'ckpt-btn-deny' : 'ckpt-btn-approve'}`}
+              className={`ckpt-btn ${option.id.includes('deny') ? 'ckpt-btn-deny' : 'ckpt-btn-approve'}${isSubmitting ? ' ckpt-btn-submitting' : ''}`}
               onClick={() => handleReply(option)}
+              disabled={isSubmitting}
             >
-              {option.label || option.id}
+              {isSubmitting && submittedOptionId === option.id ? 'Submitting…' : (option.label || option.id)}
             </button>
           ))}
+        </div>
+      )}
+
+      {isSubmitting && (
+        <div className="ckpt-escalation-hint">
+          Decision sent — waiting for server confirmation…
         </div>
       )}
 

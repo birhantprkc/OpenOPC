@@ -195,6 +195,14 @@ _TASK_MODE_DEBUG_ONLY_PROGRESS_TYPES: frozenset[str] = frozenset({
 })
 
 
+# Company mode shares the task-mode noise list; runtime bookkeeping events
+# (turns, status snapshots, cost ticks) carry no reviewable content and drown
+# out thinking/tool entries in the per-role activity feed.
+_COMPANY_MODE_HIDDEN_RUNTIME_PROGRESS_TYPES: frozenset[str] = (
+    _TASK_MODE_HIDDEN_RUNTIME_PROGRESS_TYPES | frozenset({"member_inbox_updated"})
+)
+
+
 _TASK_MODE_VISIBLE_RUNTIME_PROGRESS_TYPES: frozenset[str] = frozenset({
     "thinking_delta",
     "tool_started",
@@ -618,22 +626,39 @@ class WSHandler:
 
     def _progress_callback_for_engine(self, engine: Any) -> Any:
         async def _progress(text: str, **kw: Any) -> None:
-            await self.on_progress(
-                text,
-                _runtime_engine=engine,
-                _project_id=self._normalize_project_id(getattr(engine, "project_id", None)),
-                **kw,
-            )
+            # UI progress is a best-effort display copy: a failure here (e.g.
+            # a locked ui_state.db) must never crash the agent execution that
+            # emitted the progress line.
+            try:
+                await self.on_progress(
+                    text,
+                    _runtime_engine=engine,
+                    _project_id=self._normalize_project_id(getattr(engine, "project_id", None)),
+                    **kw,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "UI progress handling failed; agent execution continues"
+                )
 
         return _progress
 
     def _runtime_event_callback_for_engine(self, engine: Any) -> Any:
         async def _runtime_event(event: Any) -> None:
-            await self.on_opc_event(
-                event,
-                runtime_engine=engine,
-                project_id=self._normalize_project_id(getattr(engine, "project_id", None)),
-            )
+            try:
+                await self.on_opc_event(
+                    event,
+                    runtime_engine=engine,
+                    project_id=self._normalize_project_id(getattr(engine, "project_id", None)),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "UI runtime-event handling failed; agent execution continues"
+                )
 
         setattr(_runtime_event, "_opc_ui_handler_id", id(self))
         setattr(_runtime_event, "_opc_ui_project_id", self._normalize_project_id(getattr(engine, "project_id", None)))
@@ -653,7 +678,14 @@ class WSHandler:
 
     def _kanban_callback_for_engine(self, engine: Any) -> Any:
         async def _kanban_changed() -> None:
-            await self.on_kanban_changed(engine=engine)
+            try:
+                await self.on_kanban_changed(engine=engine)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "UI kanban refresh failed; agent execution continues"
+                )
 
         return _kanban_changed
 
@@ -2552,9 +2584,12 @@ class WSHandler:
         if not runtime_type:
             return None
         is_task_mode = WSHandler._runtime_payload_is_task_mode(payload)
-        if is_task_mode and runtime_type in _TASK_MODE_HIDDEN_RUNTIME_PROGRESS_TYPES:
-            return None
-        if is_task_mode and runtime_type not in _TASK_MODE_VISIBLE_RUNTIME_PROGRESS_TYPES:
+        if is_task_mode:
+            if runtime_type in _TASK_MODE_HIDDEN_RUNTIME_PROGRESS_TYPES:
+                return None
+            if runtime_type not in _TASK_MODE_VISIBLE_RUNTIME_PROGRESS_TYPES:
+                return None
+        elif runtime_type in _COMPANY_MODE_HIDDEN_RUNTIME_PROGRESS_TYPES:
             return None
 
         summary = runtime_type.replace("_", " ").title()
@@ -2570,8 +2605,14 @@ class WSHandler:
             return None
         elif runtime_type == "thinking_delta":
             entry_type = "thinking"
-            detail = str(payload.get("text", "") or "").strip()
-            summary = "Thinking"
+            # Keep the raw fragment: streaming deltas are token-sized, so
+            # stripping them destroys the whitespace between tokens once the
+            # fragments are merged back into one entry.
+            detail = str(payload.get("text", "") or "")
+            if not detail.strip():
+                return None
+            preview = " ".join(detail.split())
+            summary = preview[:120].rstrip() + ("..." if len(preview) > 120 else "")
         elif runtime_type == "member_claimed_work_item":
             entry_type = "work_item_started"
             priority = str(payload.get("message_priority", "") or "").strip().lower()
@@ -2595,10 +2636,8 @@ class WSHandler:
             summary = str(payload.get("tool_name", "") or "tool")
             detail = str(payload.get("text", "") or payload.get("message", "") or "").strip()
         elif runtime_type == "tool_completed":
-            entry_type = "tool_call" if is_task_mode else "status_change"
+            entry_type = "tool_call"
             summary = str(payload.get("tool_name", "") or "tool")
-            if not is_task_mode:
-                summary = f"{summary} completed"
             detail = str(payload.get("result_summary", "") or payload.get("result_preview", "") or "").strip()
         elif runtime_type == "status_snapshot":
             entry_type = "status_change"
@@ -2726,7 +2765,7 @@ class WSHandler:
             "detail": detail[:4000] if detail else None,
         }
         tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
-        if is_task_mode and tool_call_id and entry_type in {"tool_call", "autonomy"}:
+        if tool_call_id and entry_type in {"tool_call", "autonomy"}:
             turn_id = str(payload.get("turn_id", "") or "").strip()
             prefix = "permission" if entry_type == "autonomy" else "tool"
             entry.setdefault("item_id", f"{turn_id}:{prefix}:{tool_call_id}" if turn_id else f"{prefix}:{tool_call_id}")
@@ -4818,6 +4857,40 @@ class WSHandler:
         )
         await self.broadcast({"type": "session_message", "payload": msg})
 
+    async def _recent_identical_helper_exists(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        project_id: str,
+        window_seconds: float = 120.0,
+        scan_limit: int = 10,
+    ) -> bool:
+        """True when an identical assistant helper was posted very recently.
+
+        Used to collapse rapid duplicate user clicks into a single helper
+        reply instead of one warning per click.
+        """
+        try:
+            recent = await self.chat_store.get_channel_messages(
+                channel_id, limit=scan_limit, project_id=project_id,
+            )
+        except Exception:
+            return False
+        now = time.time()
+        for item in reversed(recent):
+            if str(item.get("sender", "")) != "assistant":
+                continue
+            if str(item.get("content", "")) != content:
+                continue
+            try:
+                created_at = float(item.get("created_at", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if now - created_at <= window_seconds:
+                return True
+        return False
+
     async def _mark_human_escalation_checkpoint_status(
         self,
         escalation_id: str,
@@ -5503,21 +5576,54 @@ class WSHandler:
         if stale_human_escalation:
             if _looks_like_escalation_reply(content):
                 stale_checkpoint_id = explicit_escalation_id or explicit_checkpoint_id
-                await self._mark_human_escalation_checkpoint_status(
-                    stale_checkpoint_id,
-                    status="stale",
-                    project_id=pid,
-                    channel_id=channel_id,
-                    reason="reply_to_inactive_escalation",
-                )
+                # Duplicate clicks on an approval card that was JUST resolved
+                # (e.g. the user's own first click) are a normal occurrence
+                # when the server is slow: answer idempotently instead of
+                # flipping the card to "stale" and spamming inactive warnings.
+                card = None
+                try:
+                    card = await self.chat_store.get_checkpoint_message(
+                        stale_checkpoint_id,
+                        channel_id=channel_id,
+                        checkpoint_type="human_escalation",
+                        project_id=pid,
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "Failed to load checkpoint card for stale escalation reply"
+                    )
+                card_meta = dict((card or {}).get("metadata", {}) or {})
+                card_status = str(card_meta.get("checkpoint_status", "") or "").strip().lower()
+                if card_status in {"resolved", "responded"}:
+                    resolution_reply = str(
+                        card_meta.get("checkpoint_resolution_reply", "") or ""
+                    ).strip()
+                    helper_text = (
+                        "This approval was already handled"
+                        + (f" (decision: {resolution_reply})" if resolution_reply else "")
+                        + ". No further action is needed."
+                    )
+                else:
+                    await self._mark_human_escalation_checkpoint_status(
+                        stale_checkpoint_id,
+                        status="stale",
+                        project_id=pid,
+                        channel_id=channel_id,
+                        reason="reply_to_inactive_escalation",
+                    )
+                    helper_text = (
+                        "That approval request is no longer active. "
+                        "The approval card has been marked inactive in the session history."
+                    )
+                if await self._recent_identical_helper_exists(
+                    channel_id, helper_text, project_id=pid
+                ):
+                    return
                 helper = await self.chat_store.insert_message(
                     channel_id=channel_id,
                     sender="assistant",
                     sender_name="OPC",
-                    content=(
-                        "That approval request is no longer active. "
-                        "The approval card has been marked inactive in the session history."
-                    ),
+                    content=helper_text,
                     project_id=pid,
                     metadata={"type": "system"},
                 )

@@ -87,22 +87,23 @@ class WSHandlerProgressParsingTests(unittest.TestCase):
 
         self.assertIsNone(entry)
 
-    def test_runtime_status_snapshot_maps_to_status_change_entry(self) -> None:
-        entry = WSHandler._runtime_event_to_progress_entry(
-            {
-                "type": "status_snapshot",
-                "current_tool": "shell_exec",
-                "context_remaining_pct": 64,
-                "turn_cost_usd": 0.0123,
-            },
-        )
-
-        self.assertIsNotNone(entry)
-        assert entry is not None
-        self.assertEqual(entry["type"], "status_change")
-        self.assertEqual(entry["summary"], "Runtime status")
-        self.assertIn("tool=shell_exec", entry["detail"])
-        self.assertIn("context=36% used", entry["detail"])
+    def test_company_mode_hides_runtime_bookkeeping_events(self) -> None:
+        for runtime_type in (
+            "turn_started",
+            "turn_completed",
+            "status_snapshot",
+            "context_usage",
+            "cost_update",
+            "member_inbox_updated",
+        ):
+            entry = WSHandler._runtime_event_to_progress_entry(
+                {
+                    "type": runtime_type,
+                    "current_tool": "shell_exec",
+                    "turn_cost_usd": 0.0123,
+                },
+            )
+            self.assertIsNone(entry, runtime_type)
 
     def test_runtime_member_claimed_work_item_maps_to_started_entry(self) -> None:
         entry = WSHandler._runtime_event_to_progress_entry(
@@ -124,10 +125,10 @@ class WSHandlerProgressParsingTests(unittest.TestCase):
         self.assertNotIn("legacy_title", entry)
         self.assertTrue(entry["is_company_runtime"])
 
-    def test_runtime_context_usage_prefers_token_count_over_remaining_pct(self) -> None:
+    def test_runtime_context_warning_prefers_token_count_over_remaining_pct(self) -> None:
         entry = WSHandler._runtime_event_to_progress_entry(
             {
-                "type": "context_usage",
+                "type": "context_warning",
                 "context_tokens": 3200,
                 "context_window": 8000,
                 "context_remaining_pct": 70,
@@ -137,23 +138,77 @@ class WSHandlerProgressParsingTests(unittest.TestCase):
         self.assertIsNotNone(entry)
         assert entry is not None
         self.assertEqual(entry["type"], "status_change")
-        self.assertEqual(entry["summary"], "Context usage")
+        self.assertEqual(entry["summary"], "Context usage high")
         self.assertEqual(entry["detail"], "3200/8000 tokens | 40% used")
 
-    def test_runtime_cost_update_maps_to_status_change_entry(self) -> None:
+    def test_company_mode_tool_completed_stays_tool_call_with_stable_item_id(self) -> None:
         entry = WSHandler._runtime_event_to_progress_entry(
             {
-                "type": "cost_update",
-                "turn_cost_usd": 0.0123,
-                "session_cost_usd": 0.0456,
+                "type": "tool_completed",
+                "turn_id": "rt-1:2",
+                "tool_call_id": "call-1",
+                "tool_name": "web_search",
+                "result_summary": "3 results",
+                "work_item_projection_id": "engineering_execution",
             },
         )
 
         self.assertIsNotNone(entry)
         assert entry is not None
-        self.assertEqual(entry["type"], "status_change")
-        self.assertEqual(entry["summary"], "Cost update")
-        self.assertIn("turn=$0.0123", entry["detail"])
+        self.assertEqual(entry["type"], "tool_call")
+        self.assertEqual(entry["summary"], "web_search")
+        self.assertEqual(entry["detail"], "3 results")
+        self.assertEqual(entry["item_id"], "rt-1:2:tool:call-1")
+        self.assertEqual(entry["stream_id"], "rt-1:2:tool:call-1")
+        self.assertEqual(entry["tool_call_id"], "call-1")
+        self.assertTrue(entry["is_company_runtime"])
+
+    def test_thinking_delta_preserves_fragment_whitespace(self) -> None:
+        entry = WSHandler._runtime_event_to_progress_entry(
+            {
+                "type": "thinking_delta",
+                "turn_id": "rt-1:1",
+                "item_id": "rt-1:1:thinking",
+                "seq": 2,
+                "text": " wants to analyze",
+            },
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["detail"], " wants to analyze")
+        self.assertEqual(entry["summary"], "wants to analyze")
+
+    def test_thinking_delta_whitespace_only_fragment_is_skipped(self) -> None:
+        entry = WSHandler._runtime_event_to_progress_entry(
+            {
+                "type": "thinking_delta",
+                "turn_id": "rt-1:1",
+                "item_id": "rt-1:1:thinking",
+                "seq": 3,
+                "text": "  \n ",
+            },
+        )
+
+        self.assertIsNone(entry)
+
+    def test_company_mode_thinking_summary_previews_content(self) -> None:
+        entry = WSHandler._runtime_event_to_progress_entry(
+            {
+                "type": "thinking_delta",
+                "turn_id": "rt-1:1",
+                "item_id": "rt-1:1:thinking",
+                "seq": 1,
+                "text": "先梳理竞品清单，再对比功能矩阵。",
+                "work_item_projection_id": "engineering_execution",
+            },
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["type"], "thinking")
+        self.assertEqual(entry["summary"], "先梳理竞品清单，再对比功能矩阵。")
+        self.assertEqual(entry["detail"], "先梳理竞品清单，再对比功能矩阵。")
 
     def test_task_mode_low_value_runtime_events_are_hidden(self) -> None:
         for runtime_type in (
@@ -195,7 +250,7 @@ class WSHandlerProgressParsingTests(unittest.TestCase):
         self.assertIsNotNone(entry)
         assert entry is not None
         self.assertEqual(entry["type"], "thinking")
-        self.assertEqual(entry["summary"], "Thinking")
+        self.assertEqual(entry["summary"], "我先检查。")
         self.assertEqual(entry["detail"], "我先检查。")
         self.assertEqual(entry["turn_id"], "rt-1:1")
         self.assertEqual(entry["item_id"], "rt-1:1:thinking")
@@ -255,24 +310,6 @@ class WSHandlerProgressParsingTests(unittest.TestCase):
         self.assertEqual(entry["type"], "needs_input")
         self.assertEqual(entry["summary"], "Needs input")
         self.assertEqual(entry["detail"], "task_user_input")
-
-    def test_runtime_member_inbox_updated_maps_to_status_change_entry(self) -> None:
-        entry = WSHandler._runtime_event_to_progress_entry(
-            {
-                "type": "member_inbox_updated",
-                "actionable_inbox_count": 2,
-                "protocol_backlog_count": 1,
-                "notification_backlog_count": 3,
-                "resident_status": "idle",
-            },
-        )
-
-        self.assertIsNotNone(entry)
-        assert entry is not None
-        self.assertEqual(entry["type"], "status_change")
-        self.assertEqual(entry["summary"], "Resident inbox updated")
-        self.assertIn("chat=2", entry["detail"])
-        self.assertIn("protocol=1", entry["detail"])
 
     def test_runtime_worker_notification_maps_error_to_work_item_failed_entry(self) -> None:
         entry = WSHandler._runtime_event_to_progress_entry(

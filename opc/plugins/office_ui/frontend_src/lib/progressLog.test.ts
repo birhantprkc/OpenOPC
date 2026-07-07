@@ -28,8 +28,40 @@ for (const [seq, detail] of [
 }
 
 assert.equal(log.length, 1)
-assert.equal(log[0]?.summary, 'Thinking')
+assert.equal(log[0]?.summary, '我先联网抓取')
 assert.equal(log[0]?.detail, '我先联网抓取')
+
+// Token-sized streaming fragments keep their whitespace when merged, and
+// entries without detail never splice their summary label into the text.
+let spacedLog = appendProgressEntry([], {
+  timestamp: 100,
+  type: 'thinking',
+  summary: 'The user',
+  detail: 'The user',
+  turnId: 'rt-2:1',
+  itemId: 'rt-2:1:thinking',
+  seq: 1,
+})
+spacedLog = appendProgressEntry(spacedLog, {
+  timestamp: 101,
+  type: 'thinking',
+  summary: 'wants to',
+  detail: ' wants to',
+  turnId: 'rt-2:1',
+  itemId: 'rt-2:1:thinking',
+  seq: 2,
+})
+spacedLog = appendProgressEntry(spacedLog, {
+  timestamp: 102,
+  type: 'thinking',
+  summary: 'Thinking',
+  turnId: 'rt-2:1',
+  itemId: 'rt-2:1:thinking',
+  seq: 3,
+})
+assert.equal(spacedLog.length, 1)
+assert.equal(spacedLog[0]?.detail, 'The user wants to')
+assert.equal(spacedLog[0]?.summary, 'The user wants to')
 
 const unchanged = appendProgressEntry(log, {
   timestamp: 5,

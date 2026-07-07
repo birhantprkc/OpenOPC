@@ -40,6 +40,7 @@ _MULTI_TEAM_ORG_GUIDELINES = """
 - The WorkItem is the collaboration source of truth. Use WorkItem IDs for collaboration; never use runtime Task IDs as WorkItem IDs.
 - `workspace_root` and `comms_workspace_root` are guaranteed. `output_root` may be blank; if needed, choose a suitable subfolder under `workspace_root` and communicate it in handoffs or delegation briefs.
 - Kanban state is advanced by the runtime from completion reports and review verdicts. Do not manually flip board states.
+- There is no need to poll work items for progress: the runtime watches state changes and re-activates whichever roles need to act once delegated or dependent work completes. So after you have confirmed that your delegation succeeded or that your review verdict advanced the work, end your current run if nothing else requires your own work — the system monitors on your behalf.
 - Use mailbox tools only for coordination, questions, blockers, or handoffs.
 - Cross-team collaboration is request-based; only direct managers delegate executable work.
 - If you are the root final decider, only your finished turn is the authoritative owner-facing result.

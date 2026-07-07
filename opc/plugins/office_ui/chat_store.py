@@ -6,15 +6,26 @@ Channel/message format uses snake_case to match what collabSync.ts expects.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sqlite3
 import time
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import aiosqlite
 from opc.layer3_agent.adapters.codex_adapter import CodexAdapter
+
+_LOCKED_ERROR_MARKERS = ("database is locked", "database table is locked")
+_WRITE_RETRY_ATTEMPTS = 3
+_WRITE_RETRY_BASE_DELAY_SECONDS = 0.25
+
+
+def _is_locked_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        marker in str(exc).lower() for marker in _LOCKED_ERROR_MARKERS
+    )
 
 
 class ChatStore:
@@ -319,6 +330,28 @@ class ChatStore:
             "metadata": metadata,
         }
 
+    async def _retry_locked(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        """Run a write operation, retrying briefly on transient sqlite lock errors.
+
+        Another process sharing ui_state.db (a second server, the CLI) can hold
+        the write lock past busy_timeout; a short backoff usually clears it.
+        """
+        last_error: BaseException | None = None
+        for attempt in range(_WRITE_RETRY_ATTEMPTS):
+            try:
+                return await operation()
+            except sqlite3.OperationalError as exc:
+                if not _is_locked_error(exc):
+                    raise
+                last_error = exc
+                try:
+                    await self._db.rollback()
+                except Exception:
+                    pass
+                await asyncio.sleep(_WRITE_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+        assert last_error is not None
+        raise last_error
+
     async def initialize(self) -> None:
         """Create tables if not exist."""
         await self._db.execute("""
@@ -488,18 +521,13 @@ class ChatStore:
         now = time.time()
         parts = participants or []
         cursor = await self._db.execute(
-            "SELECT created_at FROM channels WHERE channel_id = ? AND project_id = ?",
+            "SELECT type, name, office_id, participants, created_at FROM channels "
+            "WHERE channel_id = ? AND project_id = ?",
             (cid, project_id),
         )
         existing = await cursor.fetchone()
-        created_at = float(existing[0]) if existing and existing[0] is not None else now
-        await self._db.execute(
-            "INSERT OR REPLACE INTO channels (channel_id, type, name, office_id, participants, created_at, project_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (cid, channel_type, name, office_id, json.dumps(parts), created_at, project_id),
-        )
-        await self._db.commit()
-        return {
+        created_at = float(existing[4]) if existing and existing[4] is not None else now
+        channel = {
             "channel_id": cid,
             "type": channel_type,
             "name": name,
@@ -508,6 +536,33 @@ class ChatStore:
             "created_at": created_at,
             "project_id": project_id,
         }
+        if existing is not None:
+            # Callers (e.g. session_detail polling) invoke this on every
+            # request; skip the write when nothing changed so a read-only
+            # view does not generate a constant write load on ui_state.db.
+            try:
+                existing_parts = json.loads(existing[3]) if existing[3] else []
+            except (json.JSONDecodeError, TypeError):
+                existing_parts = None
+            unchanged = (
+                str(existing[0] or "") == channel_type
+                and str(existing[1] or "") == name
+                and (existing[2] or None) == (office_id or None)
+                and existing_parts == parts
+            )
+            if unchanged:
+                return channel
+
+        async def _write() -> None:
+            await self._db.execute(
+                "INSERT OR REPLACE INTO channels (channel_id, type, name, office_id, participants, created_at, project_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (cid, channel_type, name, office_id, json.dumps(parts), created_at, project_id),
+            )
+            await self._db.commit()
+
+        await self._retry_locked(_write)
+        return channel
 
     async def insert_message(
         self,
@@ -525,19 +580,23 @@ class ChatStore:
         """Insert a message. Returns message dict in backend format (snake_case)."""
         mid = message_id or str(uuid.uuid4())
         now = float(created_at) if created_at is not None else time.time()
-        await self._db.execute(
-            "INSERT INTO messages "
-            "(message_id, channel_id, sender, sender_name, content, timestamp, "
-            "reply_to_id, mentions, metadata, project_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                mid, channel_id, sender, sender_name, content, now,
-                reply_to_id,
-                json.dumps(mentions or []),
-                json.dumps(metadata or {}),
-                project_id,
-            ),
-        )
-        await self._db.commit()
+
+        async def _write() -> None:
+            await self._db.execute(
+                "INSERT OR REPLACE INTO messages "
+                "(message_id, channel_id, sender, sender_name, content, timestamp, "
+                "reply_to_id, mentions, metadata, project_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mid, channel_id, sender, sender_name, content, now,
+                    reply_to_id,
+                    json.dumps(mentions or []),
+                    json.dumps(metadata or {}),
+                    project_id,
+                ),
+            )
+            await self._db.commit()
+
+        await self._retry_locked(_write)
         return {
             "message_id": mid,
             "channel_id": channel_id,
@@ -1220,6 +1279,41 @@ class ChatStore:
             project_id=project_id,
         )
 
+    async def get_checkpoint_message(
+        self,
+        checkpoint_id: str,
+        *,
+        channel_id: str | None = None,
+        checkpoint_type: str | None = None,
+        project_id: str = "default",
+    ) -> dict[str, Any] | None:
+        """Read-only lookup of a checkpoint card message by checkpoint id."""
+        normalized_checkpoint_id = str(checkpoint_id or "").strip()
+        if not normalized_checkpoint_id:
+            return None
+        normalized_checkpoint_type = str(checkpoint_type or "").strip()
+        normalized_channel_id = str(channel_id or "").strip()
+        params: list[Any] = [project_id]
+        query = (
+            "SELECT message_id, channel_id, sender, sender_name, content, "
+            "timestamp, reply_to_id, mentions, metadata "
+            "FROM messages WHERE project_id = ?"
+        )
+        if normalized_channel_id:
+            query += " AND channel_id = ?"
+            params.append(normalized_channel_id)
+        query += " ORDER BY timestamp DESC"
+        cursor = await self._db.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        for row in rows:
+            metadata = json.loads(row[8]) if row[8] else {}
+            if str(metadata.get("checkpoint_id", "")).strip() != normalized_checkpoint_id:
+                continue
+            if normalized_checkpoint_type and str(metadata.get("checkpoint_type", "")).strip() != normalized_checkpoint_type:
+                continue
+            return self._row_to_message_dict(row)
+        return None
+
     async def update_checkpoint_status(
         self,
         checkpoint_id: str,
@@ -1434,12 +1528,16 @@ class ChatStore:
         """
         existing = await self.get_progress(task_id, project_id=project_id)
         merged = (existing + new_entries)[-self._PROGRESS_MAX_ENTRIES:]
-        await self._db.execute(
-            "INSERT OR REPLACE INTO task_progress (task_id, entries, updated_at, project_id) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, json.dumps(merged, ensure_ascii=False, default=str), time.time(), project_id),
-        )
-        await self._db.commit()
+
+        async def _write() -> None:
+            await self._db.execute(
+                "INSERT OR REPLACE INTO task_progress (task_id, entries, updated_at, project_id) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, json.dumps(merged, ensure_ascii=False, default=str), time.time(), project_id),
+            )
+            await self._db.commit()
+
+        await self._retry_locked(_write)
 
     async def get_progress(self, task_id: str, project_id: str = "default") -> list[dict[str, Any]]:
         """Read persisted progress entries for a task."""
