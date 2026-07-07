@@ -3068,6 +3068,91 @@ class WSHandler:
             },
         })
 
+    async def _ensure_reply_projected(
+        self,
+        *,
+        channel_id: str,
+        project_id: str,
+        session_id: str | None,
+        engine: Any | None = None,
+    ) -> None:
+        """Last-resort invariant: the session's newest persisted top-level reply
+        must exist in the UI channel once the turn has unwound.
+
+        The transcript sync is the normal projection path; when it is starved,
+        cancelled, or misses the row (project 000, 2026-07-07 19:21/20:27), the
+        engine has replied but the user sees an empty conversation forever.
+        Detection is by the transcript message id, so an already-projected reply
+        (any channel) is never duplicated.
+        """
+        if not session_id:
+            return
+        runtime_engine = engine or self.engine
+        store = getattr(runtime_engine, "store", None)
+        if not self._store_is_ready(store):
+            return
+        lister = getattr(store, "list_session_messages", None)
+        parts_loader = getattr(store, "list_session_parts", None)
+        if not callable(lister) or not callable(parts_loader):
+            return
+        try:
+            records = await lister(session_id)
+        except Exception:
+            logger.opt(exception=True).debug("reply projection: failed to list session messages")
+            return
+        latest = None
+        for record in reversed(records or []):
+            if str(getattr(record, "role", "") or "").strip().lower() != "assistant":
+                continue
+            metadata = dict(getattr(record, "metadata", {}) or {})
+            if str(metadata.get("kind", "") or "").strip() != "top_level_reply":
+                continue
+            latest = record
+            break
+        if latest is None:
+            return
+        message_id = str(getattr(latest, "message_id", "") or "").strip()
+        if not message_id:
+            return
+        try:
+            if await self.chat_store.message_scope(message_id) is not None:
+                return
+        except Exception:
+            return
+        try:
+            parts = await parts_loader(session_id, message_id)
+        except Exception:
+            logger.opt(exception=True).debug("reply projection: failed to load reply parts")
+            return
+        text = "\n".join(
+            chunk
+            for part in parts or []
+            if str(getattr(part, "part_type", "") or "") == "text"
+            for chunk in [str(dict(getattr(part, "payload", {}) or {}).get("text", "") or "")]
+            if chunk
+        ).strip()
+        if not text:
+            return
+        logger.warning(
+            f"Top-level reply {message_id} missing from UI channel {channel_id} after "
+            "transcript sync; projecting it directly"
+        )
+        reply_metadata = dict(getattr(latest, "metadata", {}) or {})
+        reply_metadata.setdefault("kind", "top_level_reply")
+        reply_metadata.setdefault("source", "engine")
+        reply_metadata.setdefault("ui_message_id", message_id)
+        reply_metadata["reply_projection_fallback"] = True
+        msg = await self.chat_store.insert_message(
+            channel_id=channel_id,
+            sender="assistant",
+            sender_name="OPC",
+            content=text,
+            project_id=project_id,
+            metadata=reply_metadata,
+            message_id=message_id,
+        )
+        await self.broadcast({"type": "session_message", "payload": msg})
+
     async def _sync_task_transcript_messages(
         self,
         task_id: str,
@@ -8201,6 +8286,12 @@ class WSHandler:
                     task_id,
                     engine=engine,
                     latest_assistant_metadata=checkpoint_meta if checkpoint_meta else None,
+                )
+                await self._ensure_reply_projected(
+                    channel_id=channel_id,
+                    project_id=pid,
+                    session_id=session_id or (str(getattr(task, "session_id", "") or "").strip() if task else None),
+                    engine=engine,
                 )
 
                 # ── Status: idle only while the engine left the task active ──

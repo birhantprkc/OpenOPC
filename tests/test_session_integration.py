@@ -6476,6 +6476,50 @@ class TestSnapshotBuilderSessionData(unittest.IsolatedAsyncioTestCase):
         finally:
             await chat_store._db.close()
 
+    async def test_backfill_merges_same_scope_row_that_raced_the_snapshot(self) -> None:
+        """A live insert landing after the backfill snapshot must merge in place,
+        never persist a second copy under a `::`-scoped alias id (project 000:
+        the same reply was stored twice in one channel)."""
+        chat_store = await _make_chat_store()
+        try:
+            await chat_store.create_session_channel("race-task", "Race", project_id="p1")
+            channel_id = "session:race-task"
+
+            original_scope = chat_store._message_scope
+
+            async def racing_scope(message_id: str):
+                # Simulate the live insert path landing the same row after the
+                # backfill snapshot was taken but before its INSERT runs.
+                if message_id == "engine-race-1" and await original_scope(message_id) is None:
+                    await chat_store.insert_message(
+                        channel_id=channel_id,
+                        sender="assistant",
+                        sender_name="OPC",
+                        content="Reply text",
+                        message_id="engine-race-1",
+                        project_id="p1",
+                        metadata={"note": "live-copy"},
+                    )
+                return await original_scope(message_id)
+
+            chat_store._message_scope = racing_scope
+
+            await chat_store.backfill_messages(channel_id, [{
+                "message_id": "engine-race-1",
+                "sender": "assistant",
+                "sender_name": "OPC",
+                "content": "Reply text",
+                "timestamp": time.time(),
+                "metadata": {"source": "engine", "role": "assistant"},
+            }], project_id="p1")
+
+            rows = await chat_store.get_channel_messages(channel_id, limit=20, project_id="p1")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["message_id"], "engine-race-1")
+            self.assertNotIn("::", rows[0]["message_id"])
+        finally:
+            await chat_store._db.close()
+
     async def test_build_collab_sync_marks_primary_as_company_runtime_from_children(self) -> None:
         """Legacy primary sessions should still be marked as company runtimes when child work items exist."""
         from opc.plugins.office_ui.snapshot_builder import build_collab_sync

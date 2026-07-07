@@ -299,6 +299,55 @@ class ChatStore:
             return None
         return await self._message_scope(str(message_id).strip())
 
+    async def _merge_into_same_scope_row(
+        self,
+        message_id: str,
+        *,
+        channel_id: str,
+        project_id: str,
+        candidate: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Merge ``candidate`` into an already-persisted row with the same id/scope.
+
+        Returns the merged row when the update happened (or nothing changed), or
+        None when the row could not be loaded. Backfill and the live insert path
+        can race on the same message id; the duplicate must merge in place, never
+        be re-inserted under a scoped alias id in the same channel.
+        """
+        cursor = await self._db.execute(
+            "SELECT message_id, channel_id, sender, sender_name, content, "
+            "timestamp, reply_to_id, mentions, metadata "
+            "FROM messages WHERE message_id = ? AND channel_id = ? AND project_id = ?",
+            (message_id, channel_id, project_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        existing = self._row_to_message_dict(row)
+        merged = self._merge_duplicate_messages(existing, candidate)
+        if self._message_persisted_equal(existing, merged):
+            return merged
+        merged_timestamp = self._message_timestamp(merged) or time.time()
+        await self._db.execute(
+            "UPDATE messages SET sender = ?, sender_name = ?, content = ?, timestamp = ?, "
+            "reply_to_id = ?, mentions = ?, metadata = ? WHERE message_id = ? AND channel_id = ? AND project_id = ?",
+            (
+                merged["sender"],
+                merged["sender_name"],
+                merged["content"],
+                merged_timestamp,
+                merged.get("reply_to_id"),
+                json.dumps(merged.get("mentions", [])),
+                json.dumps(merged.get("metadata", {})),
+                message_id,
+                channel_id,
+                project_id,
+            ),
+        )
+        merged["timestamp"] = merged_timestamp
+        merged["created_at"] = merged_timestamp
+        return merged
+
     async def _allocate_scoped_message_id(
         self,
         message_id: str,
@@ -1070,6 +1119,20 @@ class ChatStore:
                 continue
 
             existing_scope = await self._message_scope(mid)
+            if existing_scope == (channel_id, project_id):
+                # The row appeared after our initial snapshot (a live insert
+                # raced this backfill). Merge in place — never re-insert the
+                # same message under a scoped alias id in its own channel.
+                merged = await self._merge_into_same_scope_row(
+                    mid,
+                    channel_id=channel_id,
+                    project_id=project_id,
+                    candidate=normalized_message,
+                )
+                if merged is not None:
+                    existing_ids.add(mid)
+                    existing_messages.append(merged)
+                    continue
             if existing_scope and existing_scope != (channel_id, project_id):
                 metadata = dict(normalized_message.get("metadata", {}) or {})
                 metadata.setdefault("ui_message_id", mid)
@@ -1114,6 +1177,16 @@ class ChatStore:
                     ),
                 )
             except sqlite3.IntegrityError:
+                merged = await self._merge_into_same_scope_row(
+                    normalized_message["message_id"],
+                    channel_id=channel_id,
+                    project_id=project_id,
+                    candidate=normalized_message,
+                )
+                if merged is not None:
+                    existing_ids.add(normalized_message["message_id"])
+                    existing_messages.append(merged)
+                    continue
                 metadata = dict(normalized_message.get("metadata", {}) or {})
                 metadata.setdefault("ui_message_id", normalized_message["message_id"])
                 normalized_message["metadata"] = metadata
