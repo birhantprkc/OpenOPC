@@ -1620,6 +1620,7 @@ class OPCStore:
             CREATE INDEX IF NOT EXISTS idx_tasks_project_status_created ON tasks(project_id, status, created_at);
             CREATE INDEX IF NOT EXISTS idx_tasks_project_priority_created ON tasks(project_id, priority, created_at);
             CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
             CREATE INDEX IF NOT EXISTS idx_messages_task ON agent_messages(task_id);
             CREATE INDEX IF NOT EXISTS idx_messages_status ON agent_messages(status);
             CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON agent_messages(timestamp);
@@ -2785,6 +2786,24 @@ class OPCStore:
         if parent_id is not None:
             query += " AND parent_id = ?"
             params.append(parent_id)
+        query += " ORDER BY priority ASC, created_at ASC"
+        async with self._db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            tasks = [self._row_to_task(row, cursor.description) for row in rows]
+        await self.hydrate_task_work_item_links(tasks)
+        return tasks
+
+    async def get_tasks_by_session_id(
+        self,
+        session_id: str,
+        project_id: str | None = None,
+    ) -> list[Task]:
+        assert self._db
+        query = "SELECT * FROM tasks WHERE session_id = ?"
+        params: list[Any] = [session_id]
+        if project_id:
+            query += " AND project_id = ?"
+            params.append(project_id)
         query += " ORDER BY priority ASC, created_at ASC"
         async with self._db.execute(query, params) as cursor:
             rows = await cursor.fetchall()

@@ -8043,6 +8043,10 @@ class OPCEngine:
                         result_content=result.content,
                         project=bool(task.project_id and task.project_id != "default"),
                     )
+        if task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            await self._supersede_stale_task_wait_checkpoints(
+                task.id, reason=f"task settled as {task.status.value}"
+            )
         return result
 
     async def _attempt_capability_recovery(self, task: Task, result: TaskResult) -> None:
@@ -8940,6 +8944,116 @@ class OPCEngine:
             preferred = {"inbox", "reply_message", "send_dm", "ask_peer_and_wait", "respond_meeting"}
         return allowed.intersection(preferred)
 
+    # Checkpoint types that represent "a task is parked waiting for user input".
+    # Invariant: a pending row of these types is only valid while its task is
+    # actually in a waiting status; every other path must terminate them.
+    _TASK_WAIT_CHECKPOINT_TYPES = ("task_user_input", "task_peer_wait")
+
+    async def _supersede_stale_task_wait_checkpoints(self, task_id: str, *, reason: str) -> None:
+        """Terminate pending task-wait checkpoints once their task moves on.
+
+        The company runtime can carry a paused work item forward through its own
+        machinery (approval-card grants, a fresh review attempt) without ever
+        replying through the engine checkpoint. If the checkpoint row stays
+        pending it will capture the user's next unrelated chat message and route
+        it into a resume of a task that is no longer waiting.
+        """
+        if not task_id or not self.store:
+            return
+        supersede = getattr(self.store, "supersede_pending_checkpoints", None)
+        if not callable(supersede):
+            return
+        try:
+            superseded = await supersede(
+                project_id=self.project_id or "default",
+                task_id=task_id,
+                checkpoint_types=list(self._TASK_WAIT_CHECKPOINT_TYPES),
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                f"Failed to supersede stale task-wait checkpoints for task {task_id}"
+            )
+            return
+        if superseded:
+            logger.info(
+                f"Superseded {len(superseded)} stale task-wait checkpoint(s) for task {task_id} ({reason})"
+            )
+
+    async def _checkpoint_task_still_waiting(self, checkpoint: ExecutionCheckpoint) -> bool:
+        """Whether a task-wait checkpoint still matches a genuinely waiting task.
+
+        Lazily resolves orphaned rows (task finished, failed, superseded by a
+        new review attempt, or deleted) as ``stale`` so historical dirty data
+        self-heals the first time it is considered for a resume. Non-task-wait
+        checkpoint types are always considered live here.
+        """
+        if str(checkpoint.checkpoint_type or "").strip() not in self._TASK_WAIT_CHECKPOINT_TYPES:
+            return True
+        task_id = str(
+            checkpoint.task_id or dict(checkpoint.payload or {}).get("task_id") or ""
+        ).strip()
+        if not task_id or not self.store:
+            return True
+        try:
+            task = await self.store.get_task(task_id)
+        except Exception:
+            logger.opt(exception=True).debug(
+                f"Could not verify task {task_id} for checkpoint {checkpoint.checkpoint_id}; keeping it"
+            )
+            return True
+        if task is None:
+            stale_reason = f"task {task_id} no longer exists"
+        elif task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            stale_reason = f"task {task_id} settled as {task.status.value}"
+        else:
+            # A non-terminal task status proves nothing on its own:
+            # suspend/restart flows legitimately park a waiting task back at
+            # PENDING or RUNNING. The linked delegation work item is the
+            # authoritative signal — once its phase is terminal (a later review
+            # attempt or the manager closed it) or the item is gone, no runtime
+            # will ever come back to consume this checkpoint.
+            stale_reason = await self._task_work_item_closed_reason(task)
+        if not stale_reason:
+            return True
+        try:
+            await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="stale")
+            logger.info(
+                f"Resolved stale {checkpoint.checkpoint_type} checkpoint "
+                f"{checkpoint.checkpoint_id} ({stale_reason})"
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                f"Failed to resolve stale checkpoint {checkpoint.checkpoint_id}"
+            )
+        return False
+
+    async def _task_work_item_closed_reason(self, task: Task) -> str:
+        """Non-empty reason when the task's delegation work item is closed.
+
+        Returns "" when the task has no linked work item, the item cannot be
+        loaded, or the item is still in a live phase — i.e. keep the checkpoint.
+        """
+        work_item_id = linked_work_item_id_for_task(task)
+        if not work_item_id or not self.store:
+            return ""
+        getter = getattr(self.store, "get_delegation_work_item", None)
+        if not callable(getter):
+            return ""
+        try:
+            work_item = await getter(work_item_id)
+        except Exception:
+            logger.opt(exception=True).debug(
+                f"Could not load work item {work_item_id} while validating a checkpoint; keeping it"
+            )
+            return ""
+        if work_item is None:
+            return f"work item {work_item_id} no longer exists"
+        phase_raw = getattr(work_item, "phase", "")
+        phase = str(getattr(phase_raw, "value", phase_raw) or "").strip()
+        if phase in {Phase.APPROVED.value, Phase.FAILED.value, Phase.CANCELLED.value}:
+            return f"work item {work_item_id} closed with phase={phase}"
+        return ""
+
     async def _save_execution_checkpoint(self, data: dict[str, Any]) -> None:
         assert self.store
         payload = dict(data.get("payload", {}))
@@ -9138,6 +9252,21 @@ class OPCEngine:
             return None
         project_id = self.project_id or "default"
         requested_session_id = str(session_id or "").strip()
+        # Fast path: with no live checkpoint rows in the project there is
+        # nothing to surface, so skip the parent-session resolution below.
+        # Snapshot builders call this once per task on every UI sync tick, and
+        # that resolution loads (and JSON-parses) task rows each time.
+        checkpoint_probe = getattr(self.store, "get_execution_checkpoints", None)
+        if callable(checkpoint_probe):
+            try:
+                live_checkpoints = await checkpoint_probe(
+                    project_id=project_id,
+                    statuses=["pending", "resuming"],
+                )
+            except Exception:
+                live_checkpoints = None
+            if live_checkpoints is not None and len(live_checkpoints) == 0:
+                return None
         company_parent_session_id = await self._company_runtime_parent_session_for_session_id(
             requested_session_id,
         )
@@ -9155,6 +9284,13 @@ class OPCEngine:
             project_id,
             session_id=requested_session_id or None,
         )
+        # Skip (and lazily resolve) orphaned task-wait checkpoints; each stale
+        # row is marked resolved before re-querying, so this terminates.
+        while checkpoint is not None and not await self._checkpoint_task_still_waiting(checkpoint):
+            checkpoint = await self.store.get_latest_pending_checkpoint(
+                project_id,
+                session_id=requested_session_id or None,
+            )
         deferred_suspend_checkpoint: ExecutionCheckpoint | None = None
         if checkpoint and self._checkpoint_is_user_visible(checkpoint):
             if not self._is_company_runtime_suspend_checkpoint(checkpoint.checkpoint_type):
@@ -9189,6 +9325,8 @@ class OPCEngine:
         for pending in checkpoints:
             if not self._checkpoint_is_user_visible(pending):
                 continue
+            if not await self._checkpoint_task_still_waiting(pending):
+                continue
             if self._is_company_runtime_suspend_checkpoint(pending.checkpoint_type):
                 if deferred_suspend_checkpoint is None and str(pending.session_id or "").strip() == session_id:
                     deferred_suspend_checkpoint = pending
@@ -9219,7 +9357,13 @@ class OPCEngine:
         if not sid:
             return ""
         try:
-            tasks = await self.store.get_tasks(project_id=self.project_id or "default")
+            get_by_session = getattr(self.store, "get_tasks_by_session_id", None)
+            if callable(get_by_session):
+                # Targeted lookup: this runs on every UI sync tick, and loading
+                # every task in the project rescans the whole tasks table.
+                tasks = await get_by_session(sid, project_id=self.project_id or "default")
+            else:
+                tasks = await self.store.get_tasks(project_id=self.project_id or "default")
         except Exception:
             logger.opt(exception=True).debug("failed to load tasks while resolving company parent session")
             return ""
@@ -9385,6 +9529,8 @@ class OPCEngine:
                 if str(getattr(checkpoint, "checkpoint_type", "") or "").strip() == "company_delivery_feedback":
                     return None
                 return "This request is no longer active."
+            if not await self._checkpoint_task_still_waiting(checkpoint):
+                return "This request is no longer active."
         else:
             checkpoint = await self.get_latest_pending_checkpoint_for_session(session_id)
             if not checkpoint:
@@ -9503,10 +9649,20 @@ class OPCEngine:
         task.metadata["progress_log"] = progress
         await self.store.save_task(task)
 
-        tasks: list[Task] = []
+        # Sibling ids persisted by older checkpoints can be work-item ids rather
+        # than task UUIDs; unresolvable entries are skipped, but the primary
+        # task must always be part of the resumed set so the resume can never
+        # degenerate into executing an empty task list (which used to return an
+        # empty reply and silently swallow the user's message).
+        tasks: list[Task] = [task]
         for sibling_id in payload.get("task_ids", [task_id]):
+            if str(sibling_id) == str(task_id):
+                continue
             sibling = await self.store.get_task(sibling_id)
             if not sibling:
+                logger.warning(
+                    f"Checkpoint {checkpoint.checkpoint_id} references unknown sibling task {sibling_id!r}; skipping it"
+                )
                 continue
             if sibling.status == TaskStatus.BLOCKED:
                 sibling.status = TaskStatus.PENDING
@@ -9515,21 +9671,25 @@ class OPCEngine:
 
         await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status="resolved")
 
-        execution_mode = str(payload.get("execution_mode", ExecutionMode.SINGLE_AGENT.value))
-        # Re-register child tasks so WSHandler can dual-route progress
-        # events from child work items to the parent session channel.
-        if execution_mode in (ExecutionMode.MULTI_AGENT.value, ExecutionMode.COMPANY_MODE.value):
+        raw_execution_mode = str(payload.get("execution_mode", ExecutionMode.SINGLE_AGENT.value))
+        try:
+            # MULTI_AGENT is a value alias of COMPANY_MODE, so normalizing to the
+            # enum collapses both onto one branch instead of letting the legacy
+            # multi-agent branch shadow the company-mode one.
+            execution_mode = ExecutionMode(raw_execution_mode)
+        except ValueError:
+            execution_mode = ExecutionMode.SINGLE_AGENT
+        if execution_mode == ExecutionMode.COMPANY_MODE:
+            # Re-register child tasks so WSHandler can dual-route progress
+            # events from child work items to the parent session channel.
             self._reregister_company_runtime_children(tasks, checkpoint_session_id=checkpoint.session_id)
-        if execution_mode == ExecutionMode.MULTI_AGENT.value:
-            logger.info("[compat] Resumed MULTI_AGENT checkpoint → routing through company mode parallel")
             plan_data = payload.get("company_work_item_plan") or task.metadata.get("company_work_item_plan")
             if isinstance(plan_data, dict) and plan_data:
                 return await self._execute_company_mode(tasks, deserialize_company_work_item_runtime_plan(plan_data))
-            return await self._execute_multi_agent(tasks)
-        if execution_mode == ExecutionMode.COMPANY_MODE.value:
-            plan_data = payload.get("company_work_item_plan") or task.metadata.get("company_work_item_plan")
-            if isinstance(plan_data, dict) and plan_data:
-                return await self._execute_company_mode(tasks, deserialize_company_work_item_runtime_plan(plan_data))
+            logger.info(
+                f"Resuming company-mode checkpoint {checkpoint.checkpoint_id} without a runtime plan; "
+                f"re-running the paused task {task.id} directly"
+            )
         return await self._execute_single_agent([task], task.assigned_external_agent)
 
     async def _resume_peer_checkpoint(self, checkpoint: ExecutionCheckpoint, user_reply: str) -> str:
