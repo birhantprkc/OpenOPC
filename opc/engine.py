@@ -88,6 +88,7 @@ from opc.layer2_organization.company_mode import (
     deserialize_company_work_item_runtime_plan,
     serialize_company_runtime_spec,
     serialize_company_work_item_runtime_plan,
+    serialized_company_plan_from_metadata,
 )
 from opc.layer2_organization.company_runtime import canonical_role_session_id
 from opc.layer2_organization.metadata_ownership import (
@@ -4988,7 +4989,7 @@ class OPCEngine:
 
         plan_data = None
         for task in sorted(latest_by_projection_id.values(), key=lambda item: (item.created_at, item.id), reverse=True):
-            candidate = task.metadata.get("company_work_item_plan") or task.metadata.get("work_item_runtime_plan")
+            candidate = serialized_company_plan_from_metadata(task.metadata)
             if candidate:
                 plan_data = candidate
                 break
@@ -6458,7 +6459,7 @@ class OPCEngine:
         for parent_session_id, group in runtime_groups.items():
             plan_data = None
             for task in sorted(group, key=lambda item: (item.created_at, item.id), reverse=True):
-                candidate = task.metadata.get("company_work_item_plan") or task.metadata.get("work_item_runtime_plan")
+                candidate = serialized_company_plan_from_metadata(task.metadata)
                 if candidate:
                     plan_data = candidate
                     break
@@ -8112,11 +8113,7 @@ class OPCEngine:
                 or task_metadata.get("company_profile", "")
                 or getattr(self.config.org, "company_profile", "corporate")
             ).strip() or "corporate"
-            plan_payload = (
-                task_metadata.get("company_work_item_plan")
-                or task_metadata.get("work_item_runtime_plan")
-                or {}
-            )
+            plan_payload = serialized_company_plan_from_metadata(task_metadata) or {}
             work_item_plan = (
                 deserialize_company_work_item_runtime_plan(plan_payload)
                 if isinstance(plan_payload, dict) and plan_payload

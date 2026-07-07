@@ -317,6 +317,35 @@ def deserialize_company_work_item_runtime_plan(data: dict[str, Any] | None) -> C
     return deserialize_company_work_item_plan(data)
 
 
+_SERIALIZED_PLAN_MARKER_KEYS = ("projections", "seeds", "root_projection_id", "runtime_model")
+
+
+def is_serialized_company_work_item_runtime_plan(data: Any) -> bool:
+    """Whether ``data`` is a run-level serialized CompanyWorkItemRuntimePlan.
+
+    Work-item tasks overload plan-adjacent metadata keys: ``work_item_runtime_plan``
+    holds a per-item assignment spec (``projection_id``/``turn_type``/``summary``/...),
+    not the run-level plan. Feeding that shape to ``from_dict`` silently yields an
+    empty plan, which downstream misreads as a legacy (non multi-team-org) run and
+    refuses to resume the session.
+    """
+    if not isinstance(data, dict) or not data:
+        return False
+    if "projection_id" in data:
+        return False
+    return any(key in data for key in _SERIALIZED_PLAN_MARKER_KEYS)
+
+
+def serialized_company_plan_from_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the first metadata value that is a real serialized run-level plan."""
+    source = dict(metadata or {})
+    for key in ("company_work_item_plan", "work_item_runtime_plan"):
+        candidate = source.get(key)
+        if is_serialized_company_work_item_runtime_plan(candidate):
+            return candidate
+    return None
+
+
 def _coerce_company_work_item_runtime_plan(plan: Any) -> CompanyWorkItemRuntimePlan | None:
     """Accept projection-plan-like test doubles without consuming obsolete plan fields."""
     if plan is None or isinstance(plan, CompanyWorkItemRuntimePlan):
@@ -1475,7 +1504,7 @@ class CompanyWorkItemExecutor:
             return plan, tasks
         plan_data = None
         for task in sorted(latest_by_projection_id.values(), key=lambda item: (item.created_at, item.id), reverse=True):
-            candidate = task.metadata.get("company_work_item_plan") or task.metadata.get("work_item_runtime_plan")
+            candidate = serialized_company_plan_from_metadata(task.metadata)
             if candidate:
                 plan_data = candidate
                 break
@@ -1601,8 +1630,8 @@ class CompanyWorkItemExecutor:
     def _plan_view_for_task(self, task: Task) -> CompanyWorkItemRuntimePlan | None:
         if self._active_plan is not None:
             return self._active_plan
-        plan_data = task.metadata.get("company_work_item_plan") or task.metadata.get("work_item_runtime_plan")
-        if isinstance(plan_data, dict) and plan_data:
+        plan_data = serialized_company_plan_from_metadata(task.metadata)
+        if plan_data:
             return deserialize_company_work_item_runtime_plan(plan_data)
         return None
 
@@ -8983,9 +9012,8 @@ class CompanyWorkItemExecutor:
             "requires_user_feedback": True,
         }
         plan_data = (
-            intake_meta.get("company_work_item_plan")
-            or intake_meta.get("work_item_runtime_plan")
-            or dict(intake_meta.get("delegation_playbook", {}) or {}).get("company_work_item_plan")
+            serialized_company_plan_from_metadata(intake_meta)
+            or serialized_company_plan_from_metadata(dict(intake_meta.get("delegation_playbook", {}) or {}))
         )
         if isinstance(plan_data, dict) and plan_data:
             try:
