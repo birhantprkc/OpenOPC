@@ -11599,6 +11599,12 @@ class OPCEngine:
             return "company"
         return "task"
 
+    @staticmethod
+    def _is_delegate_usable(delegate: "OPCEngine") -> bool:
+        """A cached delegate is only reusable while its store connection is open."""
+        store = getattr(delegate, "store", None)
+        return bool(store is None or getattr(store, "is_ready", True))
+
     async def _get_project_delegate(self, project_id: str) -> OPCEngine:
         """Return an initialized engine dedicated to ``project_id``.
 
@@ -11611,14 +11617,21 @@ class OPCEngine:
         if normalized_project_id == current_project_id:
             return self
         existing = self._project_engine_delegates.get(normalized_project_id)
-        if existing is not None:
+        if existing is not None and self._is_delegate_usable(existing):
             return existing
         if self._project_delegate_lock is None:
             self._project_delegate_lock = asyncio.Lock()
         async with self._project_delegate_lock:
             existing = self._project_engine_delegates.get(normalized_project_id)
             if existing is not None:
-                return existing
+                if self._is_delegate_usable(existing):
+                    return existing
+                # Store was closed (e.g. project deleted then re-created with
+                # the same id) — drop the stale delegate and build a fresh one.
+                self._project_engine_delegates.pop(normalized_project_id, None)
+                logger.warning(
+                    f"Discarding stale project delegate for '{normalized_project_id}' (store closed)"
+                )
             try:
                 delegate_config = copy.deepcopy(self.config)
             except Exception:

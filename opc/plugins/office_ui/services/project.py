@@ -240,14 +240,13 @@ class ProjectService:
             deleted_channels = int(await delete_chat(project_id) or 0)
             logger.info(f"Deleted {deleted_channels} channels for project '{project_id}'")
 
+        # Close every engine bound to this project AND evict its delegate from
+        # the root engine's cache; a stale delegate would otherwise be reused
+        # (with a closed store) if a project with the same id is re-created.
+        await self._close_project_engine_store(project_id)
+
         projects_dir = self.context.project_dir(project_id)
         if projects_dir.is_dir():
-            active_engine = self.context.engine
-            if was_active and getattr(active_engine, "store", None):
-                try:
-                    await active_engine.store.close()
-                except Exception:
-                    logger.opt(exception=True).debug("Failed to close active project store before delete")
             shutil.rmtree(str(projects_dir), ignore_errors=True)
 
         workplace = self.context.project_workplace(project_id)

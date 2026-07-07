@@ -763,6 +763,15 @@ class WSHandler:
                 )
             maybe_engine = delegate_getter(normalized)
             engine = await maybe_engine if inspect.isawaitable(maybe_engine) else maybe_engine
+        # Self-heal a closed store (project deleted then re-created while this
+        # engine instance stayed bound to it — e.g. the root engine, which can
+        # never be evicted from its own delegate cache).
+        store = getattr(engine, "store", None)
+        if store is not None and not getattr(store, "is_ready", True):
+            ensure_ready = getattr(store, "ensure_ready", None)
+            if callable(ensure_ready):
+                logger.warning(f"Reopening closed store for project '{normalized}'")
+                await ensure_ready()
         self._wire_engine_callbacks(engine)
         return engine
 
