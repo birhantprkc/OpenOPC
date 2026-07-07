@@ -943,7 +943,12 @@ export function WorkspacePage({
     attachments?: OutgoingAttachmentPayload[],
     metadata?: CheckpointReplyMetadata,
   ) => {
-    onSessionSend(taskId, content, attachments, metadata)
+    // Every send carries a client-generated ui_message_id so the backend can
+    // deduplicate re-deliveries (WS pending-queue flush after a reconnect).
+    const outgoing = metadata?.ui_message_id
+      ? metadata
+      : { ...(metadata ?? {}), ui_message_id: makeOptimisticUserMessageId() }
+    onSessionSend(taskId, content, attachments, outgoing)
   }, [onSessionSend])
 
   // ── Composer send ──

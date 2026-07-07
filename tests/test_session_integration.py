@@ -791,6 +791,67 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         metadata = json.loads(rows[0][2])
         self.assertEqual(metadata.get("ui_message_id"), "ui-message-1")
 
+    async def test_session_send_duplicate_delivery_is_deduplicated(self) -> None:
+        """A re-delivered send with the same client ui_message_id (WS pending-queue
+        flush after a reconnect) must not create a second row or a second turn."""
+        ws = MagicMock()
+        dispatched: list = []
+
+        def _record_dispatch(_task_id: str, coro: Any, **_kwargs: Any) -> None:
+            dispatched.append(_task_id)
+            coro.close()
+
+        self.handler._track_session = MagicMock(side_effect=_record_dispatch)
+
+        payload = {
+            "project_id": "test-project",
+            "task_id": self.task_id,
+            "content": "你的交付文件在哪里？",
+            "metadata": {"ui_message_id": "ui-dup-1"},
+        }
+        await self.handler._handle_session_send(ws, dict(payload))
+        await self.handler._handle_session_send(ws, dict(payload))
+
+        channel_id = f"session:{self.task_id}"
+        cursor = await self.chat_store._db.execute(
+            "SELECT message_id FROM messages WHERE channel_id = ? AND sender = 'user'",
+            (channel_id,),
+        )
+        rows = await cursor.fetchall()
+        self.assertEqual(len(rows), 1)
+        # The row is persisted under the client id so later copies are detectable.
+        self.assertEqual(rows[0][0], "ui-dup-1")
+        self.assertEqual(len(dispatched), 1)
+
+        dedup_acks = [
+            call.kwargs
+            for call in self.handler._send_ack.await_args_list
+            if call.kwargs.get("deduplicated")
+        ]
+        self.assertEqual(len(dedup_acks), 1)
+        self.assertEqual(dedup_acks[0].get("message_id"), "ui-dup-1")
+
+    async def test_session_send_same_text_new_id_is_a_new_turn(self) -> None:
+        """Deliberately re-asking the same question (fresh ui_message_id) still works."""
+        ws = MagicMock()
+        self.handler._track_session = MagicMock(side_effect=self._discard_session_dispatch)
+
+        for ui_id in ("ui-ask-1", "ui-ask-2"):
+            await self.handler._handle_session_send(ws, {
+                "project_id": "test-project",
+                "task_id": self.task_id,
+                "content": "进度怎么样了？",
+                "metadata": {"ui_message_id": ui_id},
+            })
+
+        channel_id = f"session:{self.task_id}"
+        cursor = await self.chat_store._db.execute(
+            "SELECT message_id FROM messages WHERE channel_id = ? AND sender = 'user' ORDER BY timestamp",
+            (channel_id,),
+        )
+        rows = await cursor.fetchall()
+        self.assertEqual([row[0] for row in rows], ["ui-ask-1", "ui-ask-2"])
+
     async def test_session_send_auto_titles(self) -> None:
         """First message should auto-generate title from content."""
         ws = MagicMock()

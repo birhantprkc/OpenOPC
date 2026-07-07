@@ -288,6 +288,17 @@ class ChatStore:
             return None
         return str(row[0] or ""), str(row[1] or "default")
 
+    async def message_scope(self, message_id: str) -> tuple[str, str] | None:
+        """(channel_id, project_id) of a persisted message, or None if absent.
+
+        Used for idempotent client sends: a re-delivered ``session_send`` carries
+        the same client-generated ``ui_message_id``, so an existing row in the
+        same scope identifies the duplicate.
+        """
+        if not str(message_id or "").strip():
+            return None
+        return await self._message_scope(str(message_id).strip())
+
     async def _allocate_scoped_message_id(
         self,
         message_id: str,

@@ -5742,6 +5742,34 @@ class WSHandler:
                 if normalized_answers:
                     reply_metadata["user_input_answers"] = normalized_answers
 
+        # Idempotency on the client-generated message id: the WS client queues
+        # sends while disconnected and flushes the queue after a reconnect, so
+        # one typed message can be delivered more than once. The first delivery
+        # persisted a row under this id in this channel; later copies are
+        # acknowledged and dropped instead of dispatching a duplicate turn.
+        client_message_id = str(reply_metadata.get("ui_message_id", "") or "").strip()
+        if client_message_id:
+            existing_scope = await self.chat_store.message_scope(client_message_id)
+            if existing_scope == (channel_id, pid):
+                logger.info(
+                    f"session_send deduplicated re-delivered client message {client_message_id} "
+                    f"for task {task_id}"
+                )
+                await self._send_ack(
+                    ws,
+                    ok=True,
+                    action="session_send",
+                    task_id=task_id,
+                    project_id=pid,
+                    deduplicated=True,
+                    message_id=client_message_id,
+                )
+                return
+            if existing_scope is not None:
+                # Same id already used in another channel/project: never reuse it
+                # as a row id there (insert_message REPLACEs by primary key).
+                client_message_id = ""
+
         explicit_checkpoint_id = str(reply_metadata.get("response_to_checkpoint_id", "")).strip()
         explicit_checkpoint_type = str(reply_metadata.get("response_to_checkpoint_type", "")).strip()
         explicit_escalation_id = str(reply_metadata.get("response_to_escalation_id", "")).strip()
@@ -5900,6 +5928,9 @@ class WSHandler:
             content=content,
             project_id=pid,
             metadata=msg_metadata if msg_metadata else None,
+            # Persist under the client-generated id so re-deliveries of the same
+            # send are detectable and the optimistic bubble merges with the echo.
+            message_id=client_message_id or None,
         )
         await self.broadcast({"type": "session_message", "payload": msg})
 
