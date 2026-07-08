@@ -146,6 +146,13 @@ from opc.layer4_tools.output_budget import clip_text
 from opc.llm.retry import LLMRetryError, call_llm_json_with_retry
 
 
+# Maximum consecutive idle dispatcher ticks (5s each) tolerated while every
+# active task waits on a human but at least one waiter has no pending
+# checkpoint on record yet (e.g. a park write racing this snapshot).  Once
+# exhausted the turn exits with a parked summary instead of spinning forever.
+_HUMAN_WAIT_MAX_STALL_TICKS = 24
+
+
 def review_work_item_id_for_attempt(worker_work_item_id: str, attempt: int) -> str:
     """Compute a per-attempt review work-item ID for a given worker.
 
@@ -4305,12 +4312,43 @@ class CompanyWorkItemExecutor:
                             if t.status in {TaskStatus.AWAITING_HUMAN, TaskStatus.AWAITING_MANAGER_REVIEW, TaskStatus.AWAITING_REVIEW}
                         ]
                         if human_waiting:
+                            # Convergent exit: nothing is in flight, nothing is
+                            # claimable, and every remaining active task waits on
+                            # a human.  The wait is resolved through a separate
+                            # engine turn (checkpoint reply → phase ready →
+                            # re-dispatch), never inside this loop, so polling
+                            # here can only spin forever while the caller's turn
+                            # hangs and its claims block the resuming turn.
+                            pending_task_ids = await self._pending_checkpoint_task_ids(
+                                str(human_waiting[0].project_id or "default")
+                            )
+                            unparked = [t for t in human_waiting if t.id not in pending_task_ids]
+                            self._stall_counter += 1
+                            if not unparked or self._stall_counter >= _HUMAN_WAIT_MAX_STALL_TICKS:
+                                if unparked:
+                                    logger.warning(
+                                        "_execute_multi_team_org: exiting after {} stalled ticks with {} "
+                                        "human-waiting task(s) lacking a pending checkpoint: {}",
+                                        self._stall_counter,
+                                        len(unparked),
+                                        [t.id for t in unparked],
+                                    )
+                                summary = self._summarize_human_parked_exit(tasks, human_waiting)
+                                await self._emit_progress(
+                                    "[Company] runtime turn parked: "
+                                    f"{len(human_waiting)} work item(s) awaiting human input; "
+                                    "answer the pending approval/review card(s) to continue."
+                                )
+                                return summary
                             await asyncio.sleep(5)
                             continue
                         for task in active_tasks:
                             if task.status == TaskStatus.AWAITING_PEER:
                                 await self._save_peer_checkpoint(task)
                         break
+                    self._stall_counter = 0
+                else:
+                    self._stall_counter = 0
                 # Wait on: (a) any active work item completing, (b) a
                 # dispatcher wake signaled by a delegation tool, or (c) a
                 # short poll tick for external/DB-driven state changes.
@@ -13270,6 +13308,43 @@ class CompanyWorkItemExecutor:
             ]:
                 return True
         return False
+
+    async def _pending_checkpoint_task_ids(self, project_id: str) -> set[str]:
+        """Task ids referenced by pending execution checkpoints for the project."""
+        get_pending = getattr(self.store, "get_pending_checkpoints", None)
+        if not callable(get_pending) or not self._store_is_ready(self.store):
+            return set()
+        try:
+            rows = await get_pending(project_id=project_id)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "_pending_checkpoint_task_ids: pending checkpoint load failed"
+            )
+            return set()
+        task_ids: set[str] = set()
+        for row in rows or []:
+            payload = dict(getattr(row, "payload", {}) or {})
+            task_id = str(
+                getattr(row, "task_id", "")
+                or payload.get("waiting_task_id", "")
+                or payload.get("task_id", "")
+                or ""
+            ).strip()
+            if task_id:
+                task_ids.add(task_id)
+        return task_ids
+
+    def _summarize_human_parked_exit(self, tasks: list[Task], human_waiting: list[Task]) -> str:
+        lines = [
+            "## Organization Runtime Parked",
+            "All remaining work items are waiting on human input. "
+            "Answer the pending approval/review card(s) and the run will continue from where it stopped.",
+            "",
+        ]
+        for task in sorted(human_waiting, key=lambda item: (item.created_at, item.id)):
+            status = str(task.status.value if isinstance(task.status, TaskStatus) else task.status)
+            lines.append(f"- {task.title}: {status}")
+        return "\n".join(lines)
 
     def _summarize_multi_team_org_results(self, tasks: list[Task]) -> str:
         if not tasks:

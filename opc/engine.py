@@ -6274,6 +6274,117 @@ class OPCEngine:
             return True
         return bool(str(metadata.get("feedback_scope", "") or "").strip())
 
+    async def _resolved_human_wait_checkpoint_task_ids(self) -> set[str]:
+        """Task ids whose human-wait checkpoint was already answered.
+
+        Covers ``task_user_input`` / ``company_work_item_gate`` checkpoints in
+        ``resolved`` status: the human replied, so a task still parked in
+        ``awaiting_human`` for one of these ids is waiting on input that was
+        already given (the resume was interrupted before the state machine
+        advanced) and can be safely reopened.
+        """
+        if not self.store:
+            return set()
+        try:
+            checkpoints = await self.store.get_execution_checkpoints(
+                project_id=self.project_id or "default",
+                checkpoint_types=["task_user_input", "company_work_item_gate"],
+                statuses=["resolved"],
+            )
+        except Exception:
+            logger.opt(exception=True).debug(
+                "resolved_human_wait_checkpoint_task_ids: checkpoint load failed"
+            )
+            return set()
+        task_ids: set[str] = set()
+        for checkpoint in checkpoints or []:
+            payload = dict(getattr(checkpoint, "payload", {}) or {})
+            task_id = str(
+                checkpoint.task_id
+                or payload.get("waiting_task_id", "")
+                or payload.get("task_id", "")
+                or ""
+            ).strip()
+            if task_id:
+                task_ids.add(task_id)
+        return task_ids
+
+    async def _reopen_answered_human_waits(self, tasks: list[Task]) -> int:
+        """Reverse self-heal for company tasks stuck on an answered human wait.
+
+        A task parked in ``awaiting_human`` whose park checkpoint was already
+        RESOLVED means the human answered but the resume was cut off before the
+        work item advanced (process death between checkpoint resolution and
+        phase write). Reopen it for dispatch instead of preserving a wait
+        nobody can end. Mirror direction of the stale-checkpoint self-heal.
+        """
+        if not self.store or not tasks:
+            return 0
+        candidates = [
+            task
+            for task in tasks
+            if task.status == TaskStatus.AWAITING_HUMAN
+            and str((task.metadata or {}).get("dispatch_hold", "") or "").strip() != "company_runtime_suspended"
+            and str((task.metadata or {}).get("company_runtime_stop_state", "") or "").strip()
+            not in {"suspending", "suspended"}
+            and not self._is_company_feedback_waiting_task(task)
+        ]
+        if not candidates:
+            return 0
+        try:
+            pending_checkpoints = await self.store.get_pending_checkpoints(
+                project_id=self.project_id or "default"
+            )
+        except Exception:
+            logger.opt(exception=True).debug(
+                "reopen_answered_human_waits: pending checkpoint load failed"
+            )
+            return 0
+        pending_task_ids = {
+            str(
+                checkpoint.task_id
+                or checkpoint.payload.get("waiting_task_id")
+                or checkpoint.payload.get("task_id")
+                or ""
+            ).strip()
+            for checkpoint in pending_checkpoints or []
+        }
+        candidates = [task for task in candidates if task.id not in pending_task_ids]
+        if not candidates:
+            return 0
+        resolved_task_ids = await self._resolved_human_wait_checkpoint_task_ids()
+        updated = 0
+        for task in candidates:
+            if task.id not in resolved_task_ids:
+                continue
+            if await self._reopen_answered_human_wait_after_restart(task):
+                updated += 1
+        return updated
+
+    async def _reopen_answered_human_wait_after_restart(self, task: Task) -> bool:
+        """Reopen an ``awaiting_human`` task whose checkpoint was already resolved."""
+        if not self.store:
+            return False
+        released = await self._release_work_item_human_wait(
+            task, reason="startup_resolved_checkpoint"
+        )
+        task.metadata = dict(task.metadata or {})
+        task.metadata["startup_reconcile_reopened_answered_wait"] = {
+            "detected_at": datetime.now().isoformat(),
+            "previous_status": getattr(task.status, "value", str(task.status)),
+            "work_item_phase_released": released,
+        }
+        task.status = TaskStatus.PENDING
+        task.result = None
+        await self.store.save_task(task)
+        logger.info(
+            "Startup recovery reopened task {} left in awaiting_human with an already-resolved "
+            "human-wait checkpoint (work_item_released={})",
+            task.id,
+            released,
+        )
+        return True
+
     async def _preserve_stable_waiting_task_after_restart(
         self,
         task: Task,
@@ -6455,6 +6566,15 @@ class OPCEngine:
                 reason = self._describe_interrupted_task_reason(task, session)
                 if await self._mark_task_interrupted(task, reason=reason, session=session):
                     updated += 1
+
+        if runtime_groups:
+            # Reverse self-heal runs before the plan-gated reconcile below:
+            # modern runs keep the runtime plan in checkpoint payloads /
+            # snapshots rather than task metadata, so groups without a
+            # metadata plan would otherwise skip recovery entirely.
+            updated += await self._reopen_answered_human_waits(
+                [task for group in runtime_groups.values() for task in group]
+            )
 
         for parent_session_id, group in runtime_groups.items():
             plan_data = None
@@ -9168,6 +9288,18 @@ class OPCEngine:
             }
         )
 
+    def _checkpoint_execution_mode_for_task(self, task: Task) -> str:
+        """Execution mode to record on a pause checkpoint.
+
+        Work-item runtime membership is the durable signal; the
+        ``execution_mode`` metadata field is volatile and has been observed to
+        degrade to ``task_mode`` after a resume, which then misroutes the next
+        resume away from the company state machine.
+        """
+        if is_work_item_runtime_metadata(task.metadata):
+            return ExecutionMode.COMPANY_MODE.value
+        return str(task.metadata.get("execution_mode", ExecutionMode.SINGLE_AGENT.value))
+
     async def _save_task_pause_checkpoint(self, task: Task, result: TaskResult) -> None:
         pause_request = dict(result.artifacts.get("pause_request", {})) if result.artifacts else {}
         runtime_payload = self._build_runtime_checkpoint_payload(task, result)
@@ -9221,7 +9353,7 @@ class OPCEngine:
                 "payload": {
                     "task_id": task.id,
                     "session_id": task.session_id,
-                    "execution_mode": task.metadata.get("execution_mode", ExecutionMode.SINGLE_AGENT.value),
+                    "execution_mode": self._checkpoint_execution_mode_for_task(task),
                     "task_ids": list(task.metadata.get("execution_task_ids", [task.id])),
                     "org_version": task.metadata.get("org_version", 1),
                     "runtime_topology_version": task.metadata.get("runtime_topology_version", 1),
@@ -9249,7 +9381,7 @@ class OPCEngine:
                 "payload": {
                     "task_id": task.id,
                     "session_id": task.session_id,
-                    "execution_mode": task.metadata.get("execution_mode", ExecutionMode.SINGLE_AGENT.value),
+                    "execution_mode": self._checkpoint_execution_mode_for_task(task),
                     "task_ids": list(task.metadata.get("execution_task_ids", [task.id])),
                     "org_version": task.metadata.get("org_version", 1),
                     "runtime_topology_version": task.metadata.get("runtime_topology_version", 1),
@@ -9646,6 +9778,67 @@ class OPCEngine:
         response = await self.message_bus.process_single(message)
         return response.content if response else "No response generated after resume."
 
+    async def _release_work_item_human_wait(self, task: Task, *, reason: str) -> bool:
+        """Push a work item parked in ``awaiting_human`` back to ``ready``.
+
+        This is the state-machine half of resuming an answered human wait: the
+        phase moves through the legal ``AWAITING_HUMAN → READY`` recovery exit
+        and any stale claim is released so the company dispatcher can re-claim
+        the item on its next pass. Returns True when a phase write happened.
+        """
+        if not self.store or not hasattr(self.store, "update_delegation_work_item"):
+            return False
+        work_item_id = linked_work_item_id_for_task(task)
+        if not work_item_id:
+            return False
+        try:
+            work_item = await self.store.get_delegation_work_item(work_item_id)
+        except Exception:
+            logger.opt(exception=True).debug(
+                "release_work_item_human_wait: work item load failed for task {}", task.id
+            )
+            return False
+        if work_item is None or getattr(work_item, "phase", None) != Phase.AWAITING_HUMAN:
+            return False
+        metadata = dict(getattr(work_item, "metadata", {}) or {})
+        metadata_unset: list[str] = []
+        if str(metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended":
+            metadata_unset = ["dispatch_hold", "suspended_at", "suspend_reason", "suspended_phase"]
+        try:
+            await self.store.update_delegation_work_item(
+                work_item_id,
+                phase=Phase.READY,
+                blocked_reason="",
+                metadata_updates={
+                    "human_wait_released_at": datetime.now().isoformat(),
+                    "human_wait_release_reason": reason,
+                    "claimed_by_role_session_id": "",
+                    "claimed_task_id": "",
+                },
+                metadata_unset=metadata_unset or None,
+                claimed_by_role_runtime_session_id="",
+                claimed_by_seat_id="",
+            )
+        except InvalidPhaseTransition:
+            logger.opt(exception=True).warning(
+                "release_work_item_human_wait: phase transition rejected for work item {}",
+                work_item_id,
+            )
+            return False
+        except Exception:
+            logger.opt(exception=True).warning(
+                "release_work_item_human_wait: phase write failed for work item {}",
+                work_item_id,
+            )
+            return False
+        logger.info(
+            "Released human wait on work item {} (task {}, reason={}): awaiting_human -> ready",
+            work_item_id,
+            task.id,
+            reason,
+        )
+        return True
+
     async def _resume_task_checkpoint(self, checkpoint: ExecutionCheckpoint, user_reply: str) -> str:
         assert self.store
         checkpoint = await self._ensure_checkpoint_runtime_v2_payload(checkpoint)
@@ -9704,13 +9897,38 @@ class OPCEngine:
             execution_mode = ExecutionMode(raw_execution_mode)
         except ValueError:
             execution_mode = ExecutionMode.SINGLE_AGENT
-        if execution_mode == ExecutionMode.COMPANY_MODE:
+        # Work-item runtime tasks must resume through the delegation state
+        # machine, never through a detached single-agent re-run: the recorded
+        # execution_mode is volatile task metadata and has been observed to
+        # degrade to task_mode after a first resume, which detaches the re-run
+        # from the work item and leaves it parked in awaiting_human forever.
+        is_work_item_task = bool(
+            is_work_item_runtime_metadata(task.metadata) or linked_work_item_id_for_task(task)
+        )
+        if execution_mode == ExecutionMode.COMPANY_MODE or is_work_item_task:
+            if is_work_item_task:
+                await self._release_work_item_human_wait(task, reason="approval_resume")
             # Re-register child tasks so WSHandler can dual-route progress
             # events from child work items to the parent session channel.
             self._reregister_company_runtime_children(tasks, checkpoint_session_id=checkpoint.session_id)
             plan_data = payload.get("company_work_item_plan") or task.metadata.get("company_work_item_plan")
             if isinstance(plan_data, dict) and plan_data:
                 return await self._execute_company_mode(tasks, deserialize_company_work_item_runtime_plan(plan_data))
+            if is_work_item_task:
+                parent_session_id = str(
+                    getattr(task, "parent_session_id", "")
+                    or task.metadata.get("parent_session_id", "")
+                    or checkpoint.session_id
+                    or ""
+                ).strip()
+                snapshot = await self._load_company_runtime_snapshot(parent_session_id)
+                if snapshot is not None:
+                    snapshot_plan, _snapshot_tasks = snapshot
+                    logger.info(
+                        f"Resuming company-mode checkpoint {checkpoint.checkpoint_id} via runtime "
+                        f"snapshot for parent session {parent_session_id}"
+                    )
+                    return await self._execute_company_mode(tasks, snapshot_plan)
             logger.info(
                 f"Resuming company-mode checkpoint {checkpoint.checkpoint_id} without a runtime plan; "
                 f"re-running the paused task {task.id} directly"
