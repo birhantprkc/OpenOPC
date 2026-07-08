@@ -32,6 +32,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: codex
   prompt_refs:
   - You are the Studio Director. You are the owner-facing final decision role for
@@ -79,6 +81,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Game Designer. Turn the user's request into a buildable gameplay brief

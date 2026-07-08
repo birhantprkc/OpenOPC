@@ -640,7 +640,8 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("acquisition_specialist", role_by_id)
         self.assertEqual(role_by_id["acquisition_specialist"].reports_to, "coo")
         self.assertIn("acquisition_specialist", role_by_id["coo"].can_spawn)
-        self.assertNotIn("file_edit", role_by_id["acquisition_specialist"].tools)
+        # Every company role can author files (file_write/file_edit baseline).
+        self.assertIn("file_edit", role_by_id["acquisition_specialist"].tools)
 
     def test_data_acquisition_turn_type_stays_execute_even_with_audit_language(self) -> None:
         builder = CompanyRuntimeSpecBuilder(DummyOrgEngine())

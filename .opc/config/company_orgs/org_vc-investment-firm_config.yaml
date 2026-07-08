@@ -31,6 +31,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Managing Partner. Defines the investment mandate, target stage, sector
@@ -83,6 +85,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Investment Director. Translates the user request into an investment
@@ -137,6 +141,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the Sector Analyst. Evaluates whether the target sector can compound over
@@ -181,6 +187,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the Market Researcher. Quantifies TAM/SAM/SOM, buyer budgets, growth rates,
@@ -226,6 +234,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the Startup Scout. Builds a broad candidate pool with founding date, headquarters,
@@ -274,6 +284,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the Competitive Analyst. Maps incumbents, startup competitors, substitute
@@ -318,6 +330,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the News & Signal Analyst. Tracks recent market signals, customer wins,
@@ -360,6 +374,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Due Diligence Lead. Turns the shortlist into a diligence plan, coordinates
@@ -460,6 +476,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Business DD Analyst. Evaluates target customers, sales motion, pricing
@@ -552,6 +570,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the Risk & Legal Analyst. Finds privacy, open-source license, supply-chain,
@@ -595,6 +615,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Investment Committee Chair. Runs structured bull-case and bear-case
@@ -644,6 +666,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the Bull Case Reviewer. Builds the strongest evidence-backed case for
@@ -688,6 +712,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the Bear Case Reviewer. Builds the strongest evidence-backed case against
@@ -726,6 +752,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - You are the Final Decision Reviewer. Reconciles bull and bear cases, ranks companies,
@@ -768,6 +796,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Report & Delivery Lead. Owns final deliverables: investment memo,

@@ -463,8 +463,10 @@ class TaskModeNativeAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("file_read", allowed)
         self.assertIn("delegate_work", allowed)
         self.assertIn("manager_board_read", allowed)
+        # file_write stays available: coordination turns must be able to
+        # persist in-context content instead of trapping it in DM hand-offs.
+        self.assertIn("file_write", allowed)
         self.assertNotIn("shell_exec", allowed)
-        self.assertNotIn("file_write", allowed)
         self.assertNotIn("web_search", allowed)
         self.assertNotIn("agent_spawn", allowed)
         self.assertNotIn("agent_wait", allowed)

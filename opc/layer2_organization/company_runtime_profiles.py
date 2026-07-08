@@ -40,6 +40,8 @@ _BROWSER_EXECUTION_TOOLS = [
 
 _CORPORATE_COORDINATION_TOOLS = [
     "file_read",
+    "file_write",
+    "file_edit",
     "file_search",
     "list_dir",
     "todo_write",
@@ -49,8 +51,6 @@ _CORPORATE_COORDINATION_TOOLS = [
 _CORPORATE_BOOTSTRAP_TOOLS = [
     *_CORPORATE_COORDINATION_TOOLS,
     "shell_exec",
-    "file_write",
-    "file_edit",
 ]
 
 _CORPORATE_WEB_COORDINATION_TOOLS = [
@@ -76,6 +76,7 @@ _CORPORATE_EXECUTION_TOOLS = [
 _CORPORATE_QA_TOOLS = [
     "file_read",
     "file_write",
+    "file_edit",
     "file_search",
     "list_dir",
     "shell_exec",
@@ -105,6 +106,7 @@ _CORPORATE_DATA_ACQUISITION_TOOLS = [
     "shell_exec",
     "file_read",
     "file_write",
+    "file_edit",
     "file_search",
     "list_dir",
     "web_search",

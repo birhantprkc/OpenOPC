@@ -31,6 +31,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Chief Analyst — the owner-facing final decision role for a lean research
@@ -81,6 +83,8 @@ roles:
   - todo_read
   - web_search
   - web_fetch
+  - file_write
+  - file_edit
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Researcher. Your job is to conduct thorough, evidence-based research

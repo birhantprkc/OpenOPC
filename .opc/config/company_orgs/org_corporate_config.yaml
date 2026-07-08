@@ -70,6 +70,8 @@ roles:
   - web_search
   - web_fetch
   - shell_exec
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - Focus on technical feasibility, architecture quality, and engineering best practices.
@@ -113,6 +115,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - Optimize for audience fit, brand consistency, and content quality.
@@ -157,6 +161,8 @@ roles:
   - browser_wait_for
   - browser_scroll
   - browser_take_screenshot
+  - file_write
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - Ensure operational efficiency, process compliance, and delivery quality.
@@ -205,6 +211,7 @@ roles:
   - browser_select_option
   - browser_take_screenshot
   - browser_close
+  - file_edit
   preferred_external_agent: claude_code
   prompt_refs:
   - 'Run data acquisition in four phases: Discover, Verify, Prepare, Report.'
@@ -440,6 +447,7 @@ roles:
   - browser_scroll
   - browser_select_option
   - browser_take_screenshot
+  - file_edit
   preferred_external_agent: null
   prompt_refs:
   - Test rigorously. Reject unclear or unsafe outputs.

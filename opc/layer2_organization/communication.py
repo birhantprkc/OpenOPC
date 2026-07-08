@@ -1989,6 +1989,11 @@ class CommunicationManager:
         wait = dict(task.metadata.get("peer_wait", {}))
         if not wait:
             return False
+        if str(wait.get("kind") or "") == "comms_blocking":
+            # File-comms blocking waits are owned by the company
+            # dispatcher's per-tick unpark; resolving them here would flip
+            # task.status without the work-item phase and strand the run.
+            return False
         if wait.get("kind") != "meeting":
             msg_id = wait.get("message_id")
             reply = await self.store.get_latest_reply(msg_id) if msg_id else None

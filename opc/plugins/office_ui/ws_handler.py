@@ -8476,6 +8476,16 @@ class WSHandler:
             for item in list(pause_request.get("required_fields", []) or [])
             if str(item).strip()
         ]
+        resume_hint = str(pause_request.get("resume_hint", "") or "").strip()
+        if not resume_hint and "blocked by autonomy policy" in f"{prompt} {summary}".lower():
+            # This park came from a tool-approval timeout. The approval card
+            # posted earlier stays pending and clickable indefinitely, so point
+            # the user at it instead of leaving typed input as the only path.
+            resume_hint = (
+                "Tip: the tool-approval card above is still active — choose an option "
+                "there (e.g. Approve) to grant the permission and resume this task "
+                "automatically. Reply here only to give different instructions."
+            )
 
         return {
             "checkpoint_type": "task_user_input",
@@ -8489,7 +8499,7 @@ class WSHandler:
             "input_questions": input_questions,
             "required_fields": required_fields,
             "context_note": str(pause_request.get("context_note", "") or "").strip(),
-            "resume_hint": str(pause_request.get("resume_hint", "") or "").strip(),
+            "resume_hint": resume_hint,
             "requesting_role_id": str(
                 payload.get("requesting_role_id") or pause_request.get("requesting_role_id") or ""
             ).strip(),

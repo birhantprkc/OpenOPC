@@ -9953,8 +9953,16 @@ class OPCEngine:
         else:
             resolved = False
             wait = dict(task.metadata.get("peer_wait", {}))
-            if wait.get("kind") == "meeting":
+            wait_kind = str(wait.get("kind") or "")
+            if wait_kind == "meeting":
                 resolved = await self.communication.resolve_task_meeting_wait(task)
+            elif wait_kind == "comms_blocking" or not wait:
+                # Comms-blocking (and orphaned) waits resolve from durable
+                # inbox files owned by the company dispatcher's per-tick
+                # unpark. Re-enter the runtime and let it converge: it
+                # either releases the park or re-parks and re-checkpoints
+                # consistently.
+                resolved = True
             else:
                 resolved = await self.communication.resolve_task_peer_wait(task)
             if not resolved:

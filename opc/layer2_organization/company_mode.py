@@ -4236,6 +4236,21 @@ class CompanyWorkItemExecutor:
                         )
                     ] or list(self._active_tasks)
                 self._active_tasks = tasks
+                # Consumer half of `_park_for_blocking_comms`: blocking
+                # replies arrive as durable inbox files, so each tick checks
+                # parked tasks and releases the ones whose replies are all
+                # present. In-flight tasks are skipped — their coroutine
+                # still owns the Task object and a late save_task would
+                # clobber the transition.
+                in_flight_task_ids = {
+                    claimed.id for _member, claimed in active_work_item_tasks.values()
+                }
+                for parked in tasks:
+                    if (
+                        parked.status == TaskStatus.AWAITING_PEER
+                        and parked.id not in in_flight_task_ids
+                    ):
+                        await self._try_unpark_blocking_comms(parked)
                 await self.runtime.refresh_inbox_state(tasks)
                 work_items = await self._load_delegation_work_items(tasks)
                 work_items = await self._refresh_ready_work_items(work_items, tasks=tasks)
@@ -9225,7 +9240,13 @@ class CompanyWorkItemExecutor:
         if task.status != TaskStatus.AWAITING_PEER:
             return False
         peer_wait = dict(task.metadata.get("peer_wait", {}) or {})
-        if str(peer_wait.get("kind") or "") != "comms_blocking":
+        wait_kind = str(peer_wait.get("kind") or "")
+        # An empty kind is an orphaned wait (e.g. a legacy resolver popped
+        # `peer_wait` while the work item stayed WAITING_FOR_PEER); those
+        # are recoverable from the durable comms state below. Waits with a
+        # different explicit kind (meeting, message-id) have their own
+        # resolvers.
+        if wait_kind and wait_kind != "comms_blocking":
             return False
         try:
             from opc.layer2_organization import comms as _comms
@@ -9240,7 +9261,11 @@ class CompanyWorkItemExecutor:
             return False
         blocking_ids = list(peer_wait.get("blocking_message_ids", []) or [])
         if not blocking_ids:
-            # Nothing to wait for — defensively unpark.
+            # No recorded ids (orphaned or empty wait): fall back to the
+            # park predicate itself — any unanswered blocking outbox
+            # message keeps the task parked, none means release.
+            if _comms.find_unresolved_blocking_outbox(layout, role_id):
+                return False
             task.metadata = dict(task.metadata)
             task.metadata.pop("peer_wait", None)
             await transition_work_item_from_task(
