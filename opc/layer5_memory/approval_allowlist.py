@@ -33,19 +33,33 @@ class ApprovalAllowlistManager:
     def __init__(self, opc_home: str | Path) -> None:
         self.opc_home = Path(opc_home)
         self.path = self.opc_home / "config" / "approval_allowlist.yaml"
+        self._cache: dict[str, Any] | None = None
+        self._cache_mtime_ns: int = -1
 
     def ensure_file(self) -> None:
         if not self.path.exists():
             self.save(_empty_payload())
 
     def load(self) -> dict[str, Any]:
-        if not self.path.exists():
+        # The permission predictor consults the allowlist on every tool call;
+        # cache by mtime so repeated loads do not re-read and re-parse the
+        # YAML. External edits to the file are picked up via the mtime change.
+        try:
+            mtime_ns = self.path.stat().st_mtime_ns
+        except OSError:
+            self._cache = None
+            self._cache_mtime_ns = -1
             return _empty_payload()
+        if self._cache is not None and mtime_ns == self._cache_mtime_ns:
+            return deepcopy(self._cache)
         try:
             raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
         except Exception:
             return _empty_payload()
-        return self._normalize_payload(raw)
+        normalized = self._normalize_payload(raw)
+        self._cache = deepcopy(normalized)
+        self._cache_mtime_ns = mtime_ns
+        return normalized
 
     def save(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,6 +73,12 @@ class ApprovalAllowlistManager:
             ),
             encoding="utf-8",
         )
+        try:
+            self._cache = deepcopy(normalized)
+            self._cache_mtime_ns = self.path.stat().st_mtime_ns
+        except OSError:
+            self._cache = None
+            self._cache_mtime_ns = -1
 
     def list_patterns(
         self,

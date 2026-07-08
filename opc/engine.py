@@ -8279,6 +8279,7 @@ class OPCEngine:
             config=self.config,
             communication=self.communication,
             approval_callback=self._tool_approval_callback,
+            permission_policy=self.approval_engine,
         )
 
         scoped_progress = self._make_task_progress_callback(task)

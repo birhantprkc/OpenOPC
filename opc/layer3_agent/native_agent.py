@@ -284,6 +284,7 @@ class NativeAgent:
         config: OPCConfig | None = None,
         communication: Any | None = None,
         approval_callback: Any = None,
+        permission_policy: Any = None,
     ) -> None:
         self.role = role
         self.llm = llm
@@ -297,6 +298,7 @@ class NativeAgent:
         self.config = config or OPCConfig()
         self.communication = communication
         self.approval_callback = approval_callback
+        self.permission_policy = permission_policy
         self.prompt_profiles = PromptProfileManager(role, self.config)
         max_iter = self.config.system.max_agent_iterations
         comp_threshold = self.config.system.context_compression_threshold
@@ -312,6 +314,7 @@ class NativeAgent:
             config=self.config,
             child_agent_factory=self._create_child_agent,
             approval_callback=approval_callback,
+            permission_policy=permission_policy,
             prefetch_provider=self._build_runtime_prefetch_payload,
         )
 
@@ -741,4 +744,5 @@ class NativeAgent:
             config=child_config,
             communication=self.communication,
             approval_callback=self.approval_callback,
+            permission_policy=self.permission_policy,
         )

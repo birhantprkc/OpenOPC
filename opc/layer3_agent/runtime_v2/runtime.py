@@ -22,7 +22,7 @@ from opc.layer2_organization.work_item_identity import (
     turn_type_for_task,
     work_item_identity_payload_for_task,
 )
-from opc.layer3_agent.runtime_v2.permissions import ToolPermissionResolver
+from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
 from opc.layer3_agent.runtime_v2.subagents import ChildAgentFactory, SubagentManager
 from opc.layer3_agent.runtime_v2.tool_hooks import RuntimeToolHookBus, RuntimeToolHookContext
@@ -69,6 +69,7 @@ class NativeRuntimeV2:
         config: OPCConfig | None = None,
         child_agent_factory: ChildAgentFactory | None = None,
         approval_callback: ApprovalCallback | None = None,
+        permission_policy: Any | None = None,
         prefetch_provider: PrefetchProvider | None = None,
     ) -> None:
         self.llm = llm
@@ -82,6 +83,9 @@ class NativeRuntimeV2:
         self.config = config or OPCConfig()
         self.child_agent_factory = child_agent_factory
         self.approval_callback = approval_callback
+        # The single permission policy (ApprovalEngine). Its sync predict()
+        # gates every tool call; ASK routes into approval_callback.
+        self.permission_policy = permission_policy
         self.prefetch_provider = prefetch_provider
         self._pre_tool_hooks: list[tuple[str, Any]] = []
         self._post_tool_hooks: list[tuple[str, Any]] = []
@@ -111,7 +115,6 @@ class NativeRuntimeV2:
             ensure_task_execution_context(task, self.config)
         runtime_session_id = self._runtime_session_id(task)
         conversation_turn_id = self._conversation_turn_id(task, runtime_session_id)
-        permission_session_id = self._permission_session_id(task, runtime_session_id)
         user_content = self.llm.prepare_user_message_content(
             user_message,
             attachment_refs=attachment_refs,
@@ -128,14 +131,10 @@ class NativeRuntimeV2:
             self.tools,
             max_parallel_read_tools=self.config.system.native_runtime.max_parallel_read_tools,
         )
-        permission_resolver = ToolPermissionResolver(
-            self.config.autonomy.permissions_v2,
-            store=getattr(self.memory_manager, "store", None),
-            runtime_session_id=permission_session_id,
-            project_id=task.project_id if task else "default",
-            llm=self.llm,
+        permission_resolver = RuntimePermissionAdapter(
+            self.permission_policy,
+            guardian=self.config.autonomy.permissions_v2.guardian,
         )
-        await permission_resolver.warmup()
         todo_state: list[dict[str, Any]] = self._restore_task_ledger(task)
         current_runtime_messages: list[dict[str, Any]] = []
         runtime_status: dict[str, Any] = {
@@ -797,7 +796,6 @@ class NativeRuntimeV2:
                 compaction_boundaries=compaction_boundaries,
                 active_subagents=active_subagents,
             )
-            await self._persist_permission_grants(permission_session_id, task, execution_results)
             early_return = self._handle_pause_or_peer_wait(
                 execution_results,
                 aggregated_artifacts,
@@ -962,18 +960,12 @@ class NativeRuntimeV2:
             normalized_turn_id = f"turn:{uuid.uuid4().hex}"
         return f"{normalized_turn_id}:iter:{iteration + 1}"
 
-    def _permission_session_id(self, task: Task | None, runtime_session_id: str) -> str:
-        if not task:
-            return runtime_session_id
-        bridged = str(task.metadata.get("_permission_bridge_runtime_session_id", "") or "").strip()
-        return bridged or runtime_session_id
-
     def _build_tool_hook_bus(
         self,
         *,
         runtime_session_id: str,
         task: Task | None,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         on_progress: Any = None,
     ) -> RuntimeToolHookBus:
         hook_bus = RuntimeToolHookBus(
@@ -1008,18 +1000,10 @@ class NativeRuntimeV2:
         self,
         context: RuntimeToolHookContext,
         *,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         on_progress: Any = None,
     ) -> dict[str, Any] | None:
         predicted = context.predicted_permission
-        if predicted is not None and context.tool is not None:
-            predicted = await permission_resolver.refine_decision(
-                predicted,
-                tool=context.tool,
-                arguments=context.arguments,
-                task=context.task,
-            )
-            context.predicted_permission = predicted
         if predicted is not None and getattr(predicted, "resolution", None) == PermissionResolution.DENY:
             return {
                 "result": permission_resolver.build_blocked_result(
@@ -1502,7 +1486,7 @@ class NativeRuntimeV2:
         early_tool_runs: dict[int, dict[str, Any]],
         executor: StreamingToolExecutor,
         planner: ToolPlanner,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         task: Task | None,
         on_progress: Any,
         runtime_session_id: str,
@@ -1538,7 +1522,7 @@ class NativeRuntimeV2:
         self,
         *,
         planner: ToolPlanner,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         call: dict[str, Any],
         task: Task | None,
     ) -> bool:
@@ -3851,54 +3835,6 @@ class NativeRuntimeV2:
             await callback(text, task_id=task.id if task else None)
         except TypeError:
             await callback(text)
-
-    async def _persist_permission_grants(
-        self,
-        runtime_session_id: str,
-        task: Task | None,
-        execution_results: list[dict[str, Any]],
-    ) -> None:
-        store = getattr(self.memory_manager, "store", None)
-        if not store or not hasattr(store, "save_runtime_permission_grant"):
-            return
-        for item in execution_results:
-            decision = item.get("permission_decision")
-            result = item.get("result", {})
-            call = item.get("tool_call", {})
-            if decision is None:
-                continue
-            human_reply = str(
-                (result.get("approval", {}) or {}).get("human_reply")
-                or ""
-            ).strip().lower()
-            if human_reply not in {"approve_session", "always_project", "always_global"}:
-                continue
-            candidate = (
-                str(call.get("arguments", {}).get("path", "") or "").strip()
-                or str(call.get("arguments", {}).get("command", "") or "").strip()
-                or "*"
-            )
-            execution_context = dict((getattr(task, "metadata", {}) or {}).get("_execution_context", {}) or {}) if task else {}
-            sandbox = dict(execution_context.get("sandbox", {}) or {})
-            scope = "session"
-            if human_reply == "always_project":
-                scope = "project"
-            elif human_reply == "always_global":
-                scope = "global"
-            metadata = dict(result.get("approval", {}) or {})
-            metadata.update({
-                "sandbox_mode": str(sandbox.get("mode", "") or "").strip() or "*",
-                "allow_network": str(bool(sandbox.get("allow_network", True))).lower(),
-                "workspace_class": "workspace" if str((getattr(task, "metadata", {}) or {}).get("target_output_dir", "") or "").strip() else "default",
-            })
-            await store.save_runtime_permission_grant(
-                runtime_session_id=runtime_session_id,
-                project_id=task.project_id if task else "default",
-                scope=scope,
-                tool_name=str(call.get("function", "") or ""),
-                candidate=candidate,
-                metadata=metadata,
-            )
 
     def _permission_requests_from_results(self, execution_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         requests: list[dict[str, Any]] = []

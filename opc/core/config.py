@@ -691,21 +691,9 @@ class NativeSubagentProfileConfig(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
 
 
-class ClassifierThresholdsConfig(BaseModel):
-    allow: float = 0.2
-    ask: float = 0.5
-    deny: float = 0.8
-
-
 class DenialMemoryConfig(BaseModel):
     enabled: bool = True
     repeat_threshold: int = 2
-
-
-class SandboxPolicyConfig(BaseModel):
-    treat_network_as_risky: bool = True
-    treat_external_paths_as_high_risk: bool = True
-    explicit_prefix_allowlist: list[str] = Field(default_factory=list)
 
 
 class GuardianConfig(BaseModel):
@@ -717,57 +705,21 @@ class GuardianConfig(BaseModel):
 
 
 class PermissionsV2Config(BaseModel):
+    """Runtime knobs for the unified permission predictor (ApprovalEngine.predict).
+
+    Shell safe-command policy lives in ``autonomy.safe_command_prefixes`` plus
+    the built-in flag-audited classifier (``shell_safety.py``); legacy
+    duplicate fields (safe_shell_prefixes, classifier_*, sandbox_policy, ...)
+    from the removed runtime-side resolver are ignored on load.
+    """
+
     enabled: bool = True
     fail_closed: bool = True
-    classifier_enabled: bool = True
-    shell_ast_validation: bool = True
-    llm_classifier_model: str = ""
-    classifier_thresholds: ClassifierThresholdsConfig = Field(default_factory=ClassifierThresholdsConfig)
     denial_memory: DenialMemoryConfig = Field(default_factory=DenialMemoryConfig)
-    sandbox_policy: SandboxPolicyConfig = Field(default_factory=SandboxPolicyConfig)
-    candidate_extractors: list[str] = Field(default_factory=lambda: [
-        "path",
-        "file_path",
-        "directory",
-        "working_directory",
-        "target_output_dir",
-        "workspace_path",
-        "command",
-        "cmd",
-        "url",
-    ])
-    default_scope: str = "once"
-    allow_scopes: list[str] = Field(default_factory=lambda: ["once", "session", "project", "global"])
     allow_tools: list[str] = Field(default_factory=list)
     deny_tools: list[str] = Field(default_factory=list)
     allowed_paths: list[str] = Field(default_factory=list)
     denied_paths: list[str] = Field(default_factory=list)
-    safe_shell_prefixes: list[str] = Field(default_factory=lambda: [
-        "ls",
-        "pwd",
-        "echo",
-        "rg",
-        "git status",
-        "git diff",
-        "curl",
-        "wget",
-        "yt-dlp",
-        "aria2c",
-        "ffmpeg",
-        "python -V",
-        "python3 -V",
-        "node -v",
-        "npm -v",
-    ])
-    ask_shell_prefixes: list[str] = Field(default_factory=lambda: [
-        "git commit",
-        "git push",
-        "npm install",
-        "pip install",
-        "pnpm install",
-        "cargo test",
-        "pytest",
-    ])
     guardian: GuardianConfig = Field(default_factory=GuardianConfig)
     dangerous_shell_patterns: list[str] = Field(default_factory=lambda: [
         r"\brm\s+-rf\b",

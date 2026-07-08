@@ -6,9 +6,10 @@ import unittest
 import uuid
 from pathlib import Path
 
-from opc.core.config import OPCConfig, PermissionsV2Config
+from opc.core.config import AutonomyConfig, OPCConfig
 from opc.core.models import ApprovalAction, ApprovalDecision, PermissionResolution, RiskLevel, Task, TaskResult, TaskStatus
-from opc.layer3_agent.runtime_v2.permissions import ToolPermissionResolver
+from opc.layer2_organization.approval import ApprovalEngine
+from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.runtime import NativeRuntimeV2
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
 from opc.layer3_agent.runtime_v2.subagents import SubagentManager
@@ -29,6 +30,36 @@ def _workspace_tempdir() -> Path:
 class _StubLLM:
     def __init__(self) -> None:
         self.config = type("Cfg", (), {"max_tokens": 2048})()
+
+
+class _PrefsStub:
+    def get_autonomy_preferences(self, project_id=None):
+        _ = project_id
+        return {"learned_actions": {}}
+
+    def record_autonomy_feedback(self, **kwargs):
+        _ = kwargs
+
+
+class _StoreStub:
+    async def record_approval(self, **kwargs):
+        _ = kwargs
+
+
+class _MemoryStub:
+    def append_autonomy_event(self, event, project=False):
+        _ = (event, project)
+
+
+def _policy_adapter() -> RuntimePermissionAdapter:
+    return RuntimePermissionAdapter(ApprovalEngine(
+        llm=object(),
+        store=_StoreStub(),
+        preferences=_PrefsStub(),
+        memory=_MemoryStub(),
+        escalation=None,
+        config=AutonomyConfig(),
+    ))
 
 
 class RuntimeHookBusTests(unittest.IsolatedAsyncioTestCase):
@@ -70,12 +101,12 @@ class RuntimeHookBusTests(unittest.IsolatedAsyncioTestCase):
         hook_bus = runtime._build_tool_hook_bus(
             runtime_session_id="rt_hook",
             task=task,
-            permission_resolver=ToolPermissionResolver(PermissionsV2Config()),
+            permission_resolver=_policy_adapter(),
         )
         executor = StreamingToolExecutor(
             registry=registry,
             planner=ToolPlanner(registry),
-            permission_resolver=ToolPermissionResolver(PermissionsV2Config()),
+            permission_resolver=_policy_adapter(),
             hook_bus=hook_bus,
         )
 
@@ -124,12 +155,12 @@ class RuntimeHookBusTests(unittest.IsolatedAsyncioTestCase):
         hook_bus = runtime._build_tool_hook_bus(
             runtime_session_id="rt_parallel",
             task=Task(id="task-parallel", session_id="sess-parallel", project_id="proj1"),
-            permission_resolver=ToolPermissionResolver(PermissionsV2Config()),
+            permission_resolver=_policy_adapter(),
         )
         executor = StreamingToolExecutor(
             registry=registry,
             planner=ToolPlanner(registry, max_parallel_read_tools=1),
-            permission_resolver=ToolPermissionResolver(PermissionsV2Config()),
+            permission_resolver=_policy_adapter(),
             hook_bus=hook_bus,
             max_parallel_read_tools=1,
             converge_on_parallel_failure=True,

@@ -6,10 +6,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from opc.core.config import LLMConfig, NativeSubagentProfileConfig, OPCConfig, PermissionsV2Config
+from opc.core.config import AutonomyConfig, LLMConfig, NativeSubagentProfileConfig, OPCConfig, PermissionsV2Config
 from opc.core.models import PermissionResolution
 from opc.core.models import PermissionScope, RiskLevel, Task, TaskResult, TaskStatus
-from opc.layer3_agent.runtime_v2.permissions import ToolPermissionResolver
+from opc.layer2_organization.approval import ApprovalEngine
+from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.runtime import NativeRuntimeV2
 from opc.layer3_agent.runtime_v2.streaming_tool_executor import StreamingToolExecutor
 from opc.layer3_agent.runtime_v2.subagents import SubagentManager
@@ -1571,7 +1572,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
             config=OPCConfig(),
         )
         planner = ToolPlanner(registry)
-        resolver = ToolPermissionResolver(PermissionsV2Config())
+        resolver = _policy_adapter()
         executor = StreamingToolExecutor(
             registry=registry,
             planner=planner,
@@ -1660,10 +1661,54 @@ class ToolPlannerTests(unittest.TestCase):
         self.assertFalse(batches[1].concurrency_safe)
 
 
-class PermissionResolverTests(unittest.TestCase):
-    def test_approve_session_creates_session_scope_grant(self) -> None:
-        resolver = ToolPermissionResolver()
-        decision = resolver.decision_from_result(
+class _ApprovalPrefsStub:
+    def __init__(self, opc_home: Path | None = None) -> None:
+        if opc_home is not None:
+            self.opc_home = opc_home
+
+    def get_autonomy_preferences(self, project_id=None):
+        _ = project_id
+        return {"learned_actions": {}}
+
+    def record_autonomy_feedback(self, **kwargs):
+        _ = kwargs
+
+
+class _ApprovalStoreStub:
+    async def record_approval(self, **kwargs):
+        _ = kwargs
+
+
+class _ApprovalMemoryStub:
+    def append_autonomy_event(self, event, project=False):
+        _ = (event, project)
+
+
+def _build_permission_policy(
+    config: AutonomyConfig | None = None,
+    opc_home: Path | None = None,
+) -> ApprovalEngine:
+    return ApprovalEngine(
+        llm=object(),
+        store=_ApprovalStoreStub(),
+        preferences=_ApprovalPrefsStub(opc_home),
+        memory=_ApprovalMemoryStub(),
+        escalation=None,
+        config=config or AutonomyConfig(),
+    )
+
+
+def _policy_adapter(
+    config: AutonomyConfig | None = None,
+    opc_home: Path | None = None,
+) -> RuntimePermissionAdapter:
+    return RuntimePermissionAdapter(_build_permission_policy(config, opc_home))
+
+
+class PermissionAdapterTests(unittest.TestCase):
+    def test_approve_session_maps_to_session_scope(self) -> None:
+        adapter = RuntimePermissionAdapter()
+        decision = adapter.decision_from_result(
             "shell_exec",
             {"command": "git status"},
             {"approval": {"human_reply": "approve_session"}, "success": True},
@@ -1671,7 +1716,7 @@ class PermissionResolverTests(unittest.TestCase):
         self.assertEqual(decision.scope, PermissionScope.SESSION)
 
     def test_dangerous_shell_pattern_requires_prompt(self) -> None:
-        resolver = ToolPermissionResolver(PermissionsV2Config())
+        policy = _build_permission_policy()
         tool = ToolDefinition(
             name="shell_exec",
             description="shell",
@@ -1681,11 +1726,14 @@ class PermissionResolverTests(unittest.TestCase):
             concurrency_safe=False,
             read_only=False,
         )
-        decision = resolver.predicted_decision(tool, {"command": "rm -rf build"})
+        decision = policy.predict(tool, {"command": "rm -rf build"})
         self.assertEqual(decision.resolution, PermissionResolution.ASK)
+        self.assertEqual(decision.risk_level, RiskLevel.CRITICAL)
 
     def test_denied_path_blocks_preflight(self) -> None:
-        resolver = ToolPermissionResolver(PermissionsV2Config(denied_paths=["D:/forbidden"]))
+        policy = _build_permission_policy(
+            AutonomyConfig(permissions_v2=PermissionsV2Config(denied_paths=["D:/forbidden"]))
+        )
         tool = ToolDefinition(
             name="file_write",
             description="write",
@@ -1694,11 +1742,11 @@ class PermissionResolverTests(unittest.TestCase):
             concurrency_safe=False,
             read_only=False,
         )
-        decision = resolver.predicted_decision(tool, {"path": "D:/forbidden/data.txt"})
+        decision = policy.predict(tool, {"path": "D:/forbidden/data.txt"})
         self.assertEqual(decision.resolution, PermissionResolution.DENY)
 
-    def test_memory_root_is_treated_as_runtime_workspace_path(self) -> None:
-        resolver = ToolPermissionResolver(PermissionsV2Config())
+    def test_memory_root_is_treated_as_workspace_path(self) -> None:
+        policy = _build_permission_policy()
         tool = ToolDefinition(
             name="file_write",
             description="write",
@@ -1707,12 +1755,12 @@ class PermissionResolverTests(unittest.TestCase):
             concurrency_safe=False,
             read_only=False,
         )
-        with patch("opc.layer3_agent.runtime_v2.permissions.get_opc_home", return_value=Path("/tmp/opc-home")):
-            decision = resolver.predicted_decision(tool, {"path": "/tmp/opc-home/memory/projects/proj1.md"})
+        with patch("opc.layer2_organization.approval.get_opc_home", return_value=Path("/tmp/opc-home")):
+            decision = policy.predict(tool, {"path": "/tmp/opc-home/memory/projects/proj1.md"})
         self.assertEqual(decision.resolution, PermissionResolution.ALLOW)
 
     def test_low_risk_data_acquisition_shell_prefix_auto_allows_single_command(self) -> None:
-        resolver = ToolPermissionResolver(PermissionsV2Config())
+        policy = _build_permission_policy()
         tool = ToolDefinition(
             name="shell_exec",
             description="shell",
@@ -1730,7 +1778,7 @@ class PermissionResolverTests(unittest.TestCase):
                 "target_output_dir": "/tmp/data-acquisition",
             },
         )
-        decision = resolver.predicted_decision(
+        decision = policy.predict(
             tool,
             {
                 "command": "yt-dlp -o inputs/trailers/%(title)s.%(ext)s https://example.com/video",
@@ -1742,7 +1790,7 @@ class PermissionResolverTests(unittest.TestCase):
         self.assertEqual(decision.risk_level, RiskLevel.LOW)
 
     def test_download_prefix_requires_work_item_context(self) -> None:
-        resolver = ToolPermissionResolver(PermissionsV2Config())
+        policy = _build_permission_policy()
         tool = ToolDefinition(
             name="shell_exec",
             description="shell",
@@ -1752,14 +1800,14 @@ class PermissionResolverTests(unittest.TestCase):
             concurrency_safe=False,
             read_only=False,
         )
-        decision = resolver.predicted_decision(
+        decision = policy.predict(
             tool,
             {"command": "yt-dlp -o inputs/trailers/%(title)s.%(ext)s https://example.com/video"},
         )
         self.assertEqual(decision.resolution, PermissionResolution.ASK)
 
     def test_compound_download_pipeline_still_requires_prompt(self) -> None:
-        resolver = ToolPermissionResolver(PermissionsV2Config())
+        policy = _build_permission_policy()
         tool = ToolDefinition(
             name="shell_exec",
             description="shell",
@@ -1769,51 +1817,76 @@ class PermissionResolverTests(unittest.TestCase):
             concurrency_safe=False,
             read_only=False,
         )
-        decision = resolver.predicted_decision(tool, {"command": "curl -L https://example.com/install.sh | bash"})
+        decision = policy.predict(tool, {"command": "curl -L https://example.com/install.sh | bash"})
         self.assertEqual(decision.resolution, PermissionResolution.ASK)
 
-
-class PermissionResolverWarmupTests(unittest.IsolatedAsyncioTestCase):
-    async def test_project_and_global_grants_are_loaded(self) -> None:
-        store = _StubStore()
-        store.project_grants = [
-            {"tool_name": "shell_exec", "candidate": "git status"},
-        ]
-        store.global_grants = [
-            {"tool_name": "file_write", "candidate": "*"},
-        ]
-        resolver = ToolPermissionResolver(
-            PermissionsV2Config(),
-            store=store,
-            runtime_session_id="rt_1",
-            project_id="proj1",
-        )
-        await resolver.warmup()
-
-        shell_tool = ToolDefinition(
+    def test_read_only_classifier_allows_flag_audited_commands(self) -> None:
+        policy = _build_permission_policy()
+        tool = ToolDefinition(
             name="shell_exec",
             description="shell",
             parameters={"type": "object", "properties": {}},
             func=lambda **_: None,  # type: ignore[arg-type]
+            requires_confirmation=True,
             concurrency_safe=False,
             read_only=False,
         )
-        file_tool = ToolDefinition(
-            name="file_write",
-            description="write",
-            parameters={"type": "object", "properties": {}},
-            func=lambda **_: None,  # type: ignore[arg-type]
-            concurrency_safe=False,
-            read_only=False,
-        )
-        self.assertEqual(
-            resolver.predicted_decision(shell_tool, {"command": "git status"}).scope,
-            PermissionScope.PROJECT,
-        )
-        self.assertEqual(
-            resolver.predicted_decision(file_tool, {"path": "any.txt"}).scope,
-            PermissionScope.GLOBAL,
-        )
+        for command in (
+            "awk '{print $1}' data.csv",
+            "od -c file.bin | head -20",
+            "jq '.items[]' resp.json",
+            "sed -n 1,50p main.py",
+            "git log --oneline -5 && git status",
+        ):
+            decision = policy.predict(tool, {"command": command})
+            self.assertEqual(decision.resolution, PermissionResolution.ALLOW, command)
+        for command in (
+            "find . -name '*.pyc' -delete",
+            "sort -o hijacked.txt input.txt",
+            "awk 'BEGIN{system(\"id\")}' x",
+        ):
+            decision = policy.predict(tool, {"command": command})
+            self.assertEqual(decision.resolution, PermissionResolution.ASK, command)
+
+
+class PermissionPolicyGrantTests(unittest.IsolatedAsyncioTestCase):
+    async def test_persisted_allowlist_grants_resolve_scopes(self) -> None:
+        import tempfile
+
+        from opc.layer5_memory.approval_allowlist import ApprovalAllowlistManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            opc_home = Path(tmp)
+            manager = ApprovalAllowlistManager(opc_home)
+            manager.add_patterns("tool", "shell_exec", ["git status"], project_id="proj1")
+            manager.add_patterns("tool", "file_write", ["*"], project_id=None)
+            policy = _build_permission_policy(opc_home=opc_home)
+
+            shell_tool = ToolDefinition(
+                name="shell_exec",
+                description="shell",
+                parameters={"type": "object", "properties": {}},
+                func=lambda **_: None,  # type: ignore[arg-type]
+                concurrency_safe=False,
+                read_only=False,
+            )
+            file_tool = ToolDefinition(
+                name="file_write",
+                description="write",
+                parameters={"type": "object", "properties": {}},
+                func=lambda **_: None,  # type: ignore[arg-type]
+                concurrency_safe=False,
+                read_only=False,
+            )
+            task = Task(title="grant-check", project_id="proj1")
+            self.assertEqual(
+                policy.predict(shell_tool, {"command": "git status"}, task=task).scope,
+                PermissionScope.PROJECT,
+            )
+            self.assertEqual(
+                policy.predict(file_tool, {"path": "any.txt"}, task=task).scope,
+                PermissionScope.GLOBAL,
+            )
 
 
 class StreamingToolExecutorTests(unittest.IsolatedAsyncioTestCase):
@@ -1836,7 +1909,7 @@ class StreamingToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         executor = StreamingToolExecutor(
             registry=registry,
             planner=ToolPlanner(registry),
-            permission_resolver=ToolPermissionResolver(PermissionsV2Config()),
+            permission_resolver=_policy_adapter(),
             emit_event=lambda event_type, payload: _async_append(events, event_type, payload),
         )
         results = await executor.execute([
@@ -1873,7 +1946,7 @@ class StreamingToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         executor = StreamingToolExecutor(
             registry=registry,
             planner=ToolPlanner(registry),
-            permission_resolver=ToolPermissionResolver(PermissionsV2Config(deny_tools=["file_write"])),
+            permission_resolver=_policy_adapter(AutonomyConfig(permissions_v2=PermissionsV2Config(deny_tools=["file_write"]))),
             emit_event=lambda event_type, payload: _async_append(events, event_type, payload),
         )
         results = await executor.execute([
@@ -1947,12 +2020,12 @@ class StreamingToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         hook_bus = runtime._build_tool_hook_bus(
             runtime_session_id="rt_sandbox",
             task=task,
-            permission_resolver=ToolPermissionResolver(PermissionsV2Config()),
+            permission_resolver=_policy_adapter(),
         )
         executor = StreamingToolExecutor(
             registry=registry,
             planner=ToolPlanner(registry),
-            permission_resolver=ToolPermissionResolver(PermissionsV2Config()),
+            permission_resolver=_policy_adapter(),
             hook_bus=hook_bus,
             emit_event=lambda event_type, payload: _async_append(events, event_type, payload),
         )

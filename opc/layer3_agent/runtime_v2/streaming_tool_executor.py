@@ -9,7 +9,7 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from opc.core.models import PermissionResolution
-from opc.layer3_agent.runtime_v2.permissions import ToolPermissionResolver
+from opc.layer3_agent.runtime_v2.permissions import RuntimePermissionAdapter
 from opc.layer3_agent.runtime_v2.tool_hooks import RuntimeToolHookBus, RuntimeToolHookContext
 from opc.layer3_agent.runtime_v2.tool_planner import ToolBatch, ToolPlanner
 from opc.layer4_tools.registry import ToolRegistry
@@ -51,7 +51,7 @@ class StreamingToolExecutor:
         *,
         registry: ToolRegistry,
         planner: ToolPlanner,
-        permission_resolver: ToolPermissionResolver,
+        permission_resolver: RuntimePermissionAdapter,
         hook_bus: RuntimeToolHookBus | None = None,
         runtime_tool_handler: RuntimeToolHandler | None = None,
         emit_event: RuntimeEventCallback | None = None,
@@ -381,7 +381,7 @@ class StreamingToolExecutor:
         batch_id: str,
         call: dict[str, Any],
     ) -> dict[str, Any]:
-        guardian = getattr(self.permission_resolver.config, "guardian", None)
+        guardian = getattr(self.permission_resolver, "guardian", None)
         if not guardian or not bool(getattr(guardian, "auto_retry_sandbox", False)):
             return result
         payload = result.get("result", {})
