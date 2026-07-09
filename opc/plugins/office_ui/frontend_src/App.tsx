@@ -749,6 +749,65 @@ export default function App() {
     return () => { bridge.off('agentSelected', handler) }
   }, [])
 
+  // ── Runtime-delta coalescing ────────────────────────────────────────
+  // assistant_delta / thinking_delta arrive at token frequency; writing each
+  // one straight into the stores re-renders the whole app once per token.
+  // Buffer them per task and flush at most every 80ms. Any non-delta event
+  // for the same task flushes first, so store-write ordering (e.g. clearDraft
+  // on turn boundaries) is preserved exactly.
+  const pendingDeltaFlushRef = useRef<Map<string, {
+    draftText: string
+    draftIteration?: number
+    draftTurnId?: string
+    sessionPatch: Partial<import('./types/kanban').Session>
+    kanbanPatch: Partial<KanbanTask>
+  }>>(new Map())
+  const deltaFlushTimerRef = useRef<number | null>(null)
+
+  const flushPendingDeltas = useCallback((onlyTaskId?: string) => {
+    const pending = pendingDeltaFlushRef.current
+    if (pending.size === 0) return
+    const ids = onlyTaskId ? [onlyTaskId] : Array.from(pending.keys())
+    for (const taskId of ids) {
+      const entry = pending.get(taskId)
+      if (!entry) continue
+      pending.delete(taskId)
+      const ss = sessionStoreRef.current
+      if (entry.draftText) {
+        ss?.appendDraft(taskId, entry.draftText, entry.draftIteration, entry.draftTurnId)
+      }
+      ss?.updateSession(taskId, entry.sessionPatch)
+      if (Object.keys(entry.kanbanPatch).length > 0) {
+        boardStoreRef.current?.updateTask(taskId, entry.kanbanPatch)
+      }
+    }
+    if (pending.size === 0 && deltaFlushTimerRef.current !== null) {
+      window.clearTimeout(deltaFlushTimerRef.current)
+      deltaFlushTimerRef.current = null
+    }
+  }, [])
+
+  const scheduleDeltaFlush = useCallback(() => {
+    if (deltaFlushTimerRef.current !== null) return
+    deltaFlushTimerRef.current = window.setTimeout(() => {
+      deltaFlushTimerRef.current = null
+      flushPendingDeltas()
+    }, 80)
+  }, [flushPendingDeltas])
+
+  // uiTick only feeds the office-page visual memos (cards/offices/seats).
+  // A trailing 300ms throttle caps their refresh cost regardless of the
+  // websocket event rate; the office view is cosmetic, so ≤300ms staleness
+  // is invisible.
+  const uiTickTimerRef = useRef<number | null>(null)
+  const bumpUiTickThrottled = useCallback(() => {
+    if (uiTickTimerRef.current !== null) return
+    uiTickTimerRef.current = window.setTimeout(() => {
+      uiTickTimerRef.current = null
+      setUiTick(n => n + 1)
+    }, 300)
+  }, [])
+
   useEffect(() => {
     const client = new VisualSocketClient(wsUrl, {
       onSnapshot: (data) => {
@@ -842,6 +901,11 @@ export default function App() {
             const data = evt.data as Record<string, unknown>
             const taskId = typeof data.task_id === 'string' ? data.task_id : ''
             if (taskId) {
+              const isDeltaEvent = evt.type === 'assistant_delta' || evt.type === 'thinking_delta'
+              // Store-write ordering guarantee: everything buffered for this
+              // task lands before a non-delta event (turn boundaries call
+              // clearDraft; the draft must be flushed first, not after).
+              if (!isDeltaEvent) flushPendingDeltas(taskId)
               const ss = sessionStoreRef.current
               const bs = boardStoreRef.current
               const existingSession = ss?.sessions.find(session => session.taskId === taskId)
@@ -857,7 +921,9 @@ export default function App() {
                   : typeof data.execution_turn_id === 'string' && data.execution_turn_id
                     ? data.execution_turn_id
                     : undefined
-              if (projectionId && projectionId !== 'task_mode_execution' && !isTaskModeRuntime) {
+              const marksCompanyRuntime =
+                !!projectionId && projectionId !== 'task_mode_execution' && !isTaskModeRuntime
+              if (marksCompanyRuntime && !isDeltaEvent && existingSession?.isCompanyRuntime !== true) {
                 ss?.setCompanyRuntime(taskId, true)
               }
 
@@ -866,29 +932,56 @@ export default function App() {
                 ...(evt.type === 'member_inbox_updated' ? {} : { updatedAt: Date.now() }),
                 ...sessionRuntimePatchFromPayload(data),
               }
-              if (evt.type === 'turn_started') {
-                ss?.clearDraft(taskId)
-              } else if (evt.type === 'turn_completed' || evt.type === 'turn_failed' || evt.type === 'checkpoint_saved') {
-                ss?.clearDraft(taskId)
-              } else if (evt.type === 'assistant_delta' && typeof data.text === 'string' && data.text) {
-                ss?.appendDraft(
-                  taskId,
-                  data.text,
-                  typeof data.iteration === 'number'
-                    ? data.iteration
-                    : existingSession?.draftIteration,
-                  turnId,
-                )
-              }
-              ss?.updateSession(taskId, runtimePartial)
               const toolName = typeof data.tool_name === 'string' ? data.tool_name : undefined
-              bs?.updateTask(taskId, {
+              const kanbanPatch: Partial<KanbanTask> = {
                 ...kanbanRuntimePatchFromPayload(data),
                 // currentTool is active-only (clears between tools); displayTool
                 // is sticky and only updates on a real, non-empty tool name.
                 ...(toolName !== undefined ? { currentTool: toolName || undefined } : {}),
                 ...(toolName ? { displayTool: toolName } : {}),
-              })
+              }
+              if (isDeltaEvent) {
+                const pending = pendingDeltaFlushRef.current
+                let entry = pending.get(taskId)
+                const deltaText = evt.type === 'assistant_delta' && typeof data.text === 'string'
+                  ? data.text
+                  : ''
+                // A turn boundary inside the buffer would corrupt the draft
+                // reset logic (APPEND_DRAFT resets on turnId change) — flush
+                // the previous turn's chunk before starting a new one.
+                if (
+                  entry && deltaText && entry.draftText &&
+                  entry.draftTurnId !== undefined && turnId !== undefined &&
+                  entry.draftTurnId !== turnId
+                ) {
+                  flushPendingDeltas(taskId)
+                  entry = undefined
+                }
+                if (!entry) {
+                  entry = { draftText: '', sessionPatch: {}, kanbanPatch: {} }
+                  pending.set(taskId, entry)
+                }
+                if (deltaText) {
+                  entry.draftText += deltaText
+                  entry.draftIteration = typeof data.iteration === 'number'
+                    ? data.iteration
+                    : entry.draftIteration ?? existingSession?.draftIteration
+                  if (turnId !== undefined) entry.draftTurnId = turnId
+                }
+                entry.sessionPatch = {
+                  ...entry.sessionPatch,
+                  ...runtimePartial,
+                  ...(marksCompanyRuntime ? { isCompanyRuntime: true } : {}),
+                }
+                entry.kanbanPatch = { ...entry.kanbanPatch, ...kanbanPatch }
+                scheduleDeltaFlush()
+              } else {
+                if (evt.type === 'turn_started' || evt.type === 'turn_completed' || evt.type === 'turn_failed' || evt.type === 'checkpoint_saved') {
+                  ss?.clearDraft(taskId)
+                }
+                ss?.updateSession(taskId, runtimePartial)
+                bs?.updateTask(taskId, kanbanPatch)
+              }
               const skipDetailRefresh = (
                 isTaskModeRuntime && TASK_MODE_LOW_VALUE_RUNTIME_EVENTS.has(evt.type)
               ) || SESSION_DETAIL_REFRESH_LOW_VALUE_RUNTIME_EVENTS.has(evt.type)
@@ -908,7 +1001,7 @@ export default function App() {
             }
           }
 
-          setUiTick((n) => n + 1)
+          bumpUiTickThrottled()
         } catch (e) { console.error('[onEvent] Error:', e, evt) }
       },
       onAck: (payload) => {
@@ -1838,6 +1931,15 @@ export default function App() {
       timersRef.current.clear()
       for (const tid of pendingSessionDetailRefreshRef.current.values()) clearTimeout(tid)
       pendingSessionDetailRefreshRef.current.clear()
+      if (deltaFlushTimerRef.current !== null) {
+        window.clearTimeout(deltaFlushTimerRef.current)
+        deltaFlushTimerRef.current = null
+      }
+      pendingDeltaFlushRef.current.clear()
+      if (uiTickTimerRef.current !== null) {
+        window.clearTimeout(uiTickTimerRef.current)
+        uiTickTimerRef.current = null
+      }
     }
   }, [wsUrl])
 
@@ -2419,7 +2521,7 @@ export default function App() {
       <main className={`main-grid${activePage !== 'office' ? ' hidden' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
         {/* Phaser Game Canvas */}
         <section className="canvas-wrap">
-          <PhaserGame bridge={bridgeRef.current} />
+          <PhaserGame bridge={bridgeRef.current} active={activePage === 'office'} />
           <button className="canvas-float-btn" onClick={() => setShowSubagents((v) => !v)} title={showSubagents ? 'Hide sub-agents' : 'Show sub-agents'}>
             {showSubagents ? '👥' : '👤'}
           </button>

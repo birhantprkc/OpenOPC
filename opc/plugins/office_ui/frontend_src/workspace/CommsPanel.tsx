@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   CommsStatePayload,
   CommsMessagePayload,
@@ -21,18 +21,23 @@ export function CommsPanel({
   message,
   onRefresh,
   onReadMessage,
-  pollIntervalMs = 8000,
+  // Freshness is driven by the server's comms_state_dirty push (wsClient
+  // refetches immediately on it); this poll is only a slow safety net. Each
+  // tick makes the backend walk every role's comms workspace, so keep it rare.
+  pollIntervalMs = 30000,
   embedded = false,
 }: CommsPanelProps) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
 
-  // Auto-refresh
+  // Auto-refresh fallback. onRefresh goes through a ref so the interval
+  // always calls the latest callback (the old closure pinned a stale one).
+  const onRefreshRef = useRef(onRefresh)
+  onRefreshRef.current = onRefresh
   useEffect(() => {
     if (!pollIntervalMs) return
-    onRefresh()
-    const id = window.setInterval(() => onRefresh(), pollIntervalMs)
+    onRefreshRef.current()
+    const id = window.setInterval(() => onRefreshRef.current(), pollIntervalMs)
     return () => window.clearInterval(id)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pollIntervalMs])
 
   const totalUnread = useMemo(() => {

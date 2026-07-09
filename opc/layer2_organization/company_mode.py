@@ -1391,7 +1391,12 @@ class CompanyWorkItemExecutor:
         # and a single background coroutine coalesces + broadcasts.
         self._kanban_dirty = False
         self._kanban_broadcast_task = None
-        self._kanban_debounce_sec: float = 0.2
+        # Trailing debounce: the broadcaster always fires once more after the
+        # last dirty mark, so the final board state is never lost. Each fire
+        # runs a full build_collab_sync (whole-project snapshot), which is
+        # expensive on large projects — keep the window generous. UI-only;
+        # the state machine never waits on this broadcast.
+        self._kanban_debounce_sec: float = 1.5
         self._runtime_invariant_issue_keys = set()
         self.runtime = CompanyRuntime(
             org_engine=org_engine,

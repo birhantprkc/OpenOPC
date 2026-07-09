@@ -7,12 +7,38 @@ import { OfficeScene } from './scenes/OfficeScene'
 
 interface Props {
   bridge: GameBridge
+  /** False while the office page is hidden — puts the render loop to sleep.
+      Bridge calls still apply synchronously to scene state, so nothing is
+      lost; only the per-frame update/render work stops. */
+  active?: boolean
 }
 
-export function PhaserGame({ bridge }: Props) {
+export function PhaserGame({ bridge, active = true }: Props) {
   const wrapperRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const gameRef = useRef<Phaser.Game | null>(null)
+  const activeRef = useRef(active)
+  activeRef.current = active
+
+  // display:none does NOT stop requestAnimationFrame — without this, the
+  // whole game loop (physics, tweens, full canvas redraw) keeps burning CPU
+  // while the user is on the Workspace/Org pages.
+  useEffect(() => {
+    const game = gameRef.current
+    if (!game || !game.loop) return
+    // TimeStep.running toggles false on sleep() while `started` stays true.
+    if (active) {
+      if (game.loop.started && !game.loop.running) {
+        game.loop.wake()
+        // Re-measure after display:none → visible; in RESIZE mode Phaser's
+        // parent-size poll may still hold the stale hidden bounds.
+        game.scale.getParentBounds()
+        game.scale.refresh()
+      }
+    } else if (game.loop.running) {
+      game.loop.sleep()
+    }
+  }, [active])
 
   useEffect(() => {
     if (!wrapperRef.current || !containerRef.current) return
@@ -26,6 +52,11 @@ export function PhaserGame({ bridge }: Props) {
       config.scene = [BootScene, OfficeScene]
       const game = new Phaser.Game(config)
       game.registry.set('bridge', bridge)
+      // The game is created lazily on first layout; if the page was switched
+      // away before boot finished, park the loop immediately.
+      game.events.once(Phaser.Core.Events.READY, () => {
+        if (!activeRef.current && game.loop.running) game.loop.sleep()
+      })
       gameRef.current = game
     }
 
