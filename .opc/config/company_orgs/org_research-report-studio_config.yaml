@@ -23,16 +23,7 @@ roles:
   can_spawn:
   - researcher
   - report_producer
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Chief Analyst — the owner-facing final decision role for a lean research
@@ -75,16 +66,7 @@ roles:
   reports_to: chief_analyst
   icon: search
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Researcher. Your job is to conduct thorough, evidence-based research
@@ -121,15 +103,7 @@ roles:
   reports_to: chief_analyst
   icon: document
   can_spawn: []
-  tools:
-  - file_read
-  - file_write
-  - file_edit
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - shell
+  tools: []
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Report Producer. Your job is to turn research findings into polished,

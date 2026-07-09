@@ -24,16 +24,7 @@ roles:
   - gameplay_engineer
   - art_ui_designer
   - qa_release_tester
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: codex
   prompt_refs:
   - You are the Studio Director. You are the owner-facing final decision role for
@@ -73,16 +64,7 @@ roles:
   reports_to: studio_director
   icon: idea
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Game Designer. Turn the user's request into a buildable gameplay brief
@@ -115,20 +97,7 @@ roles:
   reports_to: studio_director
   icon: code
   can_spawn: []
-  tools:
-  - shell_exec
-  - file_read
-  - file_write
-  - file_edit
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_snapshot
-  - browser_take_screenshot
+  tools: []
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Gameplay Engineer. Implement the playable game, integrate design and
@@ -159,16 +128,7 @@ roles:
   reports_to: studio_director
   icon: design
   can_spawn: []
-  tools:
-  - file_read
-  - file_write
-  - file_edit
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - browser_snapshot
-  - browser_take_screenshot
+  tools: []
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Art/UI Designer. Define and implement practical visual direction,
@@ -200,18 +160,7 @@ roles:
   reports_to: studio_director
   icon: clipboard
   can_spawn: []
-  tools:
-  - shell_exec
-  - file_read
-  - file_write
-  - file_edit
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - browser_navigate
-  - browser_snapshot
-  - browser_take_screenshot
+  tools: []
   preferred_external_agent: codex
   prompt_refs:
   - 'You are the QA Release Tester. Validate the game like a release gate: run or

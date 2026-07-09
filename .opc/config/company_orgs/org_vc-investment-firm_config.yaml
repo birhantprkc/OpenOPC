@@ -23,16 +23,7 @@ roles:
   - due_diligence_lead
   - investment_committee
   - report_delivery_lead
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Managing Partner. Defines the investment mandate, target stage, sector
@@ -77,16 +68,7 @@ roles:
   - startup_scout
   - competitive_analyst
   - news_signal_analyst
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Investment Director. Translates the user request into an investment
@@ -127,22 +109,7 @@ roles:
   reports_to: investment_director
   icon: analytics
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Sector Analyst. Evaluates whether the target sector can compound over
@@ -173,22 +140,7 @@ roles:
   reports_to: investment_director
   icon: analytics
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Market Researcher. Quantifies TAM/SAM/SOM, buyer budgets, growth rates,
@@ -220,22 +172,7 @@ roles:
   reports_to: investment_director
   icon: target
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Startup Scout. Builds a broad candidate pool with founding date, headquarters,
@@ -270,22 +207,7 @@ roles:
   reports_to: investment_director
   icon: team
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Competitive Analyst. Maps incumbents, startup competitors, substitute
@@ -316,22 +238,7 @@ roles:
   reports_to: investment_director
   icon: marketing
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the News & Signal Analyst. Tracks recent market signals, customer wins,
@@ -366,16 +273,7 @@ roles:
   - business_dd_analyst
   - financial_analyst
   - risk_legal_analyst
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Due Diligence Lead. Turns the shortlist into a diligence plan, coordinates
@@ -414,23 +312,7 @@ roles:
   reports_to: due_diligence_lead
   icon: code
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - shell_exec
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Technical DD Analyst. Assesses technical moat, architecture credibility,
@@ -462,22 +344,7 @@ roles:
   reports_to: due_diligence_lead
   icon: strategy
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: claude_code
   prompt_refs:
   - You are the Business DD Analyst. Evaluates target customers, sales motion, pricing
@@ -509,23 +376,7 @@ roles:
   reports_to: due_diligence_lead
   icon: analytics
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - shell_exec
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Financial Analyst. Analyzes financing history, investors, valuation
@@ -556,22 +407,7 @@ roles:
   reports_to: due_diligence_lead
   icon: security
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Risk & Legal Analyst. Finds privacy, open-source license, supply-chain,
@@ -607,16 +443,7 @@ roles:
   - bull_case_reviewer
   - bear_case_reviewer
   - final_decision_reviewer
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Investment Committee Chair. Runs structured bull-case and bear-case
@@ -652,22 +479,7 @@ roles:
   reports_to: investment_committee
   icon: idea
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Bull Case Reviewer. Builds the strongest evidence-backed case for
@@ -698,22 +510,7 @@ roles:
   reports_to: investment_committee
   icon: bug
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Bear Case Reviewer. Builds the strongest evidence-backed case against
@@ -744,16 +541,7 @@ roles:
   reports_to: investment_committee
   icon: clipboard
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Final Decision Reviewer. Reconciles bull and bear cases, ranks companies,
@@ -788,16 +576,7 @@ roles:
   - investment_memo_writer
   - ppt_designer
   - visualization_specialist
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - 'You are the Report & Delivery Lead. Owns final deliverables: investment memo,
@@ -833,23 +612,7 @@ roles:
   reports_to: report_delivery_lead
   icon: database
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - shell_exec
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Data Analyst. Normalizes company data, computes scorecards, creates
@@ -880,20 +643,7 @@ roles:
   reports_to: report_delivery_lead
   icon: writing
   can_spawn: []
-  tools:
-  - shell_exec
-  - file_read
-  - file_write
-  - file_edit
-  - file_search
-  - list_dir
-  - web_search
-  - web_fetch
-  - todo_write
-  - todo_read
-  - browser_navigate
-  - browser_snapshot
-  - browser_take_screenshot
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Investment Memo Writer. Writes a partner-quality investment memo with
@@ -924,20 +674,7 @@ roles:
   reports_to: report_delivery_lead
   icon: design
   can_spawn: []
-  tools:
-  - shell_exec
-  - file_read
-  - file_write
-  - file_edit
-  - file_search
-  - list_dir
-  - web_search
-  - web_fetch
-  - todo_write
-  - todo_read
-  - browser_navigate
-  - browser_snapshot
-  - browser_take_screenshot
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the PPT Designer. Turns the investment memo into a concise VC-style presentation
@@ -968,23 +705,7 @@ roles:
   reports_to: report_delivery_lead
   icon: analytics
   can_spawn: []
-  tools:
-  - file_read
-  - file_search
-  - list_dir
-  - todo_write
-  - todo_read
-  - web_search
-  - web_fetch
-  - browser_navigate
-  - browser_navigate_back
-  - browser_snapshot
-  - browser_wait_for
-  - browser_scroll
-  - browser_take_screenshot
-  - shell_exec
-  - file_write
-  - file_edit
+  tools: []
   preferred_external_agent: null
   prompt_refs:
   - You are the Visualization Specialist. Creates market maps, competitor matrices,
