@@ -5520,6 +5520,10 @@ class OPCEngine:
         work_item: DelegationWorkItem,
         work_item_by_id: dict[str, DelegationWorkItem],
     ) -> bool:
+        from opc.layer2_organization.work_item_transition import (
+            settled_failure_dependency_ids,
+        )
+
         metadata = dict(getattr(work_item, "metadata", {}) or {})
         dependency_ids = [
             str(item).strip()
@@ -5529,6 +5533,7 @@ class OPCEngine:
         if not dependency_ids:
             return True
         dependency_classes = dict(metadata.get("dependency_classes", {}) or {})
+        settled_failure_ids = settled_failure_dependency_ids(metadata)
         for dep_id in dependency_ids:
             dependency = work_item_by_id.get(dep_id)
             if dependency is None:
@@ -5539,9 +5544,18 @@ class OPCEngine:
                 continue
             if dep_class == "soft":
                 if dep_phase not in DONE_PHASES and dep_phase not in IN_PROGRESS_PHASES:
+                    if dep_id in settled_failure_ids:
+                        continue
                     return False
                 continue
             if dep_phase != Phase.APPROVED:
+                # Failure-triage release: the frontier pass released this
+                # card over the dep (dependency_settlement stamp). Stop/
+                # resume must not regress a released triage card back into
+                # WAITING_* — with the failed dep already terminal, no
+                # later event would ever wake it again.
+                if dep_id in settled_failure_ids:
+                    continue
                 return False
         return True
 

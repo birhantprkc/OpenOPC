@@ -183,12 +183,21 @@ class WorkerExecuteDoneSpawnsReportTests(unittest.IsolatedAsyncioTestCase):
                 org_engine = _make_org_engine(root)
                 executor = _build_executor(store, org_engine)
 
-                # CEO dispatch card. work_kind=dispatch routes directly
-                # to APPROVED — no review, and no report turn.
+                # Dispatch card that actually delegated (a live child card
+                # exists in the store). Delegated output routes directly to
+                # APPROVED — the children carry the reviewable output, so no
+                # review and no report turn for the dispatch card itself.
+                # (A dispatch card WITHOUT children is the self-produced
+                # case and does get the report/review chain.)
                 child = _build_child_work_item()
                 child.metadata = dict(child.metadata or {})
                 child.metadata["work_kind"] = "dispatch"
                 await store.save_delegation_work_item(child)
+                delegated = _build_child_work_item()
+                delegated.work_item_id = "wi-grandchild"
+                delegated.projection_id = "wi-grandchild"
+                delegated.parent_work_item_id = "wi-child"
+                await store.save_delegation_work_item(delegated)
                 worker_task = _build_worker_task()
                 worker_task.metadata = dict(worker_task.metadata or {})
                 worker_task.metadata["work_kind"] = "dispatch"

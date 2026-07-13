@@ -155,7 +155,25 @@ def is_delivery_turn(value_or_metadata: Any) -> bool:
 
 
 def is_manager_reviewable_turn(value_or_metadata: Any) -> bool:
-    """Return True when a finished WorkItem should enter manager review flow."""
+    """Return True when a finished WorkItem should enter manager review flow.
+
+    An explicit persisted ``turn_output_kind`` wins over the turn-type
+    default: delegation-kind turns (dispatch/intake/plan) are review-exempt
+    only because their deliverable is normally a child card set that gets
+    reviewed per child. When such a turn completed with the manager's own
+    work product instead, the done-transition stamps
+    ``turn_output_kind=self_produced`` on the WorkItem and that output is
+    reviewable like any execute turn — every consumer of this predicate
+    (DONE routing, report spawn, report completion, recovery scans) follows
+    automatically.
+    """
+    metadata: Mapping[str, Any] | None = None
+    if isinstance(value_or_metadata, Mapping):
+        metadata = value_or_metadata
+    elif hasattr(value_or_metadata, "metadata"):
+        metadata = getattr(value_or_metadata, "metadata", None) or {}
+    if metadata and str(metadata.get("turn_output_kind", "") or "").strip().lower() == "self_produced":
+        return True
     turn_type = _turn_type_for_value(value_or_metadata, fallback="")
     if not turn_type:
         return False

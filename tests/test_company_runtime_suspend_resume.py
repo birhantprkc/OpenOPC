@@ -1301,6 +1301,108 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed_item.metadata.get("dispatch_hold"), "")
         self.assertEqual(resumed_task.status, TaskStatus.BLOCKED)
 
+    async def test_continue_keeps_settlement_released_triage_card_running(self) -> None:
+        """Stop/Resume must not re-lock a failure-triage card the frontier
+        pass already released over a FAILED dependency: the failed dep is
+        terminal, so after a regression no event would ever wake it again."""
+        store = await self._store()
+        _, task = await self._seed_runtime(store)
+        dependency = DelegationWorkItem(
+            work_item_id="dep-item",
+            run_id="run-1",
+            role_id="designer",
+            seat_id="seat-2",
+            title="Dependency",
+            projection_id="dependency",
+            phase=Phase.FAILED,
+            metadata={"runtime_model": "multi_team_org"},
+        )
+        await store.save_delegation_work_item(dependency)
+        item = await store.get_delegation_work_item("work-item-1")
+        assert item is not None
+        item.metadata = {
+            **dict(item.metadata or {}),
+            "runtime_model": "multi_team_org",
+            "dependency_work_item_ids": ["dep-item"],
+            "dependency_classes": {"dep-item": "hard"},
+            "dependency_settlement": {
+                "failed": ["dep-item"],
+                "cancelled": [],
+                "stuck": [],
+                "settled_at": "2026-07-13T00:00:00",
+            },
+        }
+        await store.save_delegation_work_item(item)
+        engine = self._engine(store)
+        await engine.suspend_company_runtime(
+            origin_task_id=task.id,
+            session_id="sess-parent",
+            reason="user_stop",
+        )
+        captured: dict[str, Any] = {}
+
+        class DummyCompanyExecutor:
+            async def execute(self, plan: CompanyWorkItemRuntimePlan, tasks: list[Task]) -> str:
+                captured["tasks"] = tasks
+                return "runtime resumed"
+
+        engine.company_executor = DummyCompanyExecutor()
+
+        await engine._maybe_resume_checkpoint(
+            "continue",
+            "sess-parent",
+            reply_metadata={"ui_force_resume": True},
+        )
+        refreshed_item = await store.get_delegation_work_item("work-item-1")
+
+        assert refreshed_item is not None
+        self.assertEqual(refreshed_item.phase, Phase.RUNNING)
+
+    def test_resume_dependency_check_honors_settlement_for_soft_stuck_deps(self) -> None:
+        """The soft-class branch must honor the settlement stamp too: a
+        soft dep parked in WAITING_DEPENDENCIES (not in-progress, not
+        terminal) that the frontier stamped as stuck must not re-lock the
+        released card on resume."""
+        stuck_dep = DelegationWorkItem(
+            work_item_id="soft-dep",
+            run_id="run-soft",
+            role_id="w",
+            seat_id="seat-w",
+            title="Stuck soft dep",
+            projection_id="soft-dep",
+            phase=Phase.WAITING_DEPENDENCIES,
+        )
+        card = DelegationWorkItem(
+            work_item_id="soft-card",
+            run_id="run-soft",
+            role_id="m",
+            seat_id="seat-m",
+            title="Released triage card",
+            projection_id="soft-card",
+            phase=Phase.RUNNING,
+            metadata={
+                "dependency_work_item_ids": ["soft-dep"],
+                "dependency_classes": {"soft-dep": "soft"},
+                "dependency_settlement": {
+                    "failed": [],
+                    "cancelled": [],
+                    "stuck": ["soft-dep"],
+                    "settled_at": "2026-07-13T00:00:00",
+                },
+            },
+        )
+        by_id = {"soft-dep": stuck_dep, "soft-card": card}
+        self.assertTrue(
+            OPCEngine._company_runtime_dependencies_satisfied(card, by_id)
+        )
+        card.metadata = {
+            **dict(card.metadata or {}),
+            "dependency_settlement": {},
+        }
+        self.assertFalse(
+            OPCEngine._company_runtime_dependencies_satisfied(card, by_id)
+        )
+
     async def test_continue_does_not_use_synthetic_external_session_id_as_provider_token(self) -> None:
         store = await self._store()
         _, task = await self._seed_runtime(

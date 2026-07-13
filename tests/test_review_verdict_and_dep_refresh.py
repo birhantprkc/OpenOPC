@@ -333,8 +333,10 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after.metadata.get("waiting_on_work_item_ids"), [])
 
     async def test_child_cancelled_triggers_parent_refresh(self) -> None:
-        """Fix 3 core: non-APPROVED terminal (CANCELLED) must still fire
-        the refresh hook. Before Fix 3, only APPROVED did."""
+        """Fix 3 core + failure-triage release: a non-APPROVED terminal
+        (CANCELLED) fires the refresh hook, and because every dependency is
+        now settled the parent is RELEASED for a triage turn instead of
+        waiting on the dead child forever (the project-4444 deadlock)."""
         parent = _make_work_item(
             work_item_id="parent-c",
             run_id="run-b",
@@ -357,14 +359,534 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         await self.store.update_delegation_work_item(
             "child-b", phase=Phase.CANCELLED
         )
-        # Parent still WAITING_FOR_CHILDREN (not all approved), but the
-        # hook ran — verify by checking waiting_on_work_item_ids.
         after = await self.store.get_delegation_work_item("parent-c")
+        self.assertEqual(after.phase, Phase.RUNNING)
+        self.assertEqual(after.claimed_by_role_runtime_session_id, "")
+        settlement = dict(after.metadata.get("dependency_settlement", {}) or {})
+        self.assertEqual(list(settlement.get("cancelled", [])), ["child-b"])
+        self.assertEqual(list(settlement.get("failed", [])), [])
+        self.assertEqual(list(after.metadata.get("waiting_on_work_item_ids", [])), [])
+
+    async def test_failed_child_releases_parent_for_triage_synthesis(self) -> None:
+        """Project-4444 regression: a FAILED child must release the
+        delegating parent into a synthesis/triage turn with the failure
+        stamped, not pin it in WAITING_FOR_CHILDREN forever."""
+        parent = _make_work_item(
+            work_item_id="parent-f",
+            run_id="run-f",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            dependency_ids=["child-ok", "child-bad"],
+            claimed_by="claim-y",
+            metadata={"delegated_children_pending": True},
+        )
+        child_ok = _make_work_item(
+            work_item_id="child-ok", run_id="run-f", phase=Phase.APPROVED
+        )
+        child_bad = _make_work_item(
+            work_item_id="child-bad", run_id="run-f", phase=Phase.RUNNING
+        )
+        await self._save(parent, child_ok, child_bad)
+
+        await self.store.update_delegation_work_item("child-bad", phase=Phase.FAILED)
+
+        after = await self.store.get_delegation_work_item("parent-f")
+        self.assertEqual(after.phase, Phase.READY)
+        self.assertEqual(after.claimed_by_role_runtime_session_id, "")
+        self.assertEqual(after.metadata.get("work_kind"), "synthesize")
+        self.assertEqual(after.metadata.get("current_turn_mode"), "synthesize_required")
+        settlement = dict(after.metadata.get("dependency_settlement", {}) or {})
+        self.assertEqual(list(settlement.get("failed", [])), ["child-bad"])
+        self.assertIn("failed/cancelled", str(after.summary or ""))
+
+    async def test_doomed_chain_marks_stuck_and_releases_parent(self) -> None:
+        """Transitive settlement: sibling B hard-depends on FAILED A, so B
+        can never run. The parent (deps [A, B]) must still be released,
+        with B recorded as stuck rather than waited on forever."""
+        parent = _make_work_item(
+            work_item_id="parent-chain",
+            run_id="run-chain",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            dependency_ids=["chain-a", "chain-b"],
+            metadata={"runtime_model": "multi_team_org"},
+        )
+        chain_a = _make_work_item(
+            work_item_id="chain-a", run_id="run-chain", phase=Phase.RUNNING
+        )
+        chain_b = _make_work_item(
+            work_item_id="chain-b",
+            run_id="run-chain",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["chain-a"],
+        )
+        await self._save(parent, chain_a, chain_b)
+
+        await self.store.update_delegation_work_item("chain-a", phase=Phase.FAILED)
+
+        after_parent = await self.store.get_delegation_work_item("parent-chain")
+        after_b = await self.store.get_delegation_work_item("chain-b")
+        self.assertEqual(after_parent.phase, Phase.RUNNING)
+        settlement = dict(after_parent.metadata.get("dependency_settlement", {}) or {})
+        self.assertEqual(list(settlement.get("failed", [])), ["chain-a"])
+        self.assertEqual(list(settlement.get("stuck", [])), ["chain-b"])
+        # The stuck sibling itself is NOT released — the triage turn decides.
+        self.assertEqual(after_b.phase, Phase.WAITING_DEPENDENCIES)
+        # The released parent must actually be claimable despite the
+        # non-terminal stuck dep, or the release is cosmetic.
+        run_items = await self.store.list_delegation_work_items("run-chain")
+        by_id = {item.work_item_id: item for item in run_items}
+        self.assertTrue(
+            CompanyWorkItemExecutor._work_item_is_runnable(by_id["parent-chain"], by_id)
+        )
+
+    async def test_transitive_only_failure_still_releases_parent(self) -> None:
+        """`parent → B → FAILED A` where A is NOT a direct dep of the
+        parent: no direct dep ever turns FAILED, but B is doomed, so the
+        parent must still be released instead of waiting forever."""
+        parent = _make_work_item(
+            work_item_id="parent-t",
+            run_id="run-t",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            dependency_ids=["t-b"],
+            metadata={"runtime_model": "multi_team_org"},
+        )
+        t_b = _make_work_item(
+            work_item_id="t-b",
+            run_id="run-t",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["t-a"],
+        )
+        t_a = _make_work_item(work_item_id="t-a", run_id="run-t", phase=Phase.RUNNING)
+        await self._save(t_b, parent, t_a)
+
+        await self.store.update_delegation_work_item("t-a", phase=Phase.FAILED)
+
+        after_parent = await self.store.get_delegation_work_item("parent-t")
+        self.assertEqual(after_parent.phase, Phase.RUNNING)
+        settlement = dict(after_parent.metadata.get("dependency_settlement", {}) or {})
+        self.assertEqual(list(settlement.get("failed", [])), [])
+        self.assertEqual(list(settlement.get("stuck", [])), ["t-b"])
+        run_items = await self.store.list_delegation_work_items("run-t")
+        by_id = {item.work_item_id: item for item in run_items}
+        self.assertTrue(
+            CompanyWorkItemExecutor._work_item_is_runnable(by_id["parent-t"], by_id)
+        )
+
+    async def test_delivery_rollup_released_over_failed_dependency(self) -> None:
+        """A delivery card WAITING_DEPENDENCIES on a FAILED child is released
+        READY so the failure report reaches the user instead of wedging."""
+        delivery = _make_work_item(
+            work_item_id="delivery-f",
+            run_id="run-dlv",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["dlv-child"],
+            metadata={"work_kind": "delivery"},
+        )
+        child = _make_work_item(
+            work_item_id="dlv-child", run_id="run-dlv", phase=Phase.RUNNING
+        )
+        await self._save(delivery, child)
+
+        await self.store.update_delegation_work_item("dlv-child", phase=Phase.FAILED)
+
+        after = await self.store.get_delegation_work_item("delivery-f")
+        self.assertEqual(after.phase, Phase.READY)
+        settlement = dict(after.metadata.get("dependency_settlement", {}) or {})
+        self.assertEqual(list(settlement.get("failed", [])), ["dlv-child"])
+
+    async def test_settlement_cascade_cancels_unrebuilt_stuck_children(self) -> None:
+        """Once the settled triage card is APPROVED, leftover doomed stuck
+        children are cancelled so the run can reach a fully-terminal state."""
+        parent = _make_work_item(
+            work_item_id="parent-casc",
+            run_id="run-casc",
+            phase=Phase.RUNNING,
+            dependency_ids=["casc-a", "casc-b"],
+            metadata={
+                "dependency_settlement": {
+                    "failed": ["casc-a"],
+                    "cancelled": [],
+                    "stuck": ["casc-b"],
+                    "settled_at": "2026-07-13T00:00:00",
+                },
+            },
+        )
+        casc_a = _make_work_item(
+            work_item_id="casc-a", run_id="run-casc", phase=Phase.FAILED
+        )
+        casc_b = _make_work_item(
+            work_item_id="casc-b",
+            run_id="run-casc",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["casc-a"],
+        )
+        await self._save(casc_b, casc_a, parent)
+
+        await self.store.update_delegation_work_item("parent-casc", phase=Phase.APPROVED)
+
+        after_b = await self.store.get_delegation_work_item("casc-b")
+        after_parent = await self.store.get_delegation_work_item("parent-casc")
+        self.assertEqual(after_b.phase, Phase.CANCELLED)
+        self.assertEqual(
+            after_b.metadata.get("last_transition_reason"),
+            "upstream_dependency_failed_parent_settled",
+        )
+        settlement = dict(after_parent.metadata.get("dependency_settlement", {}) or {})
+        self.assertTrue(settlement.get("cascaded_at"))
+
+    async def test_settlement_cascade_cancels_deep_doomed_chain(self) -> None:
+        """Closure: C hard-depends on stuck B; C is in no released card's
+        direct dependency list, but cancelling B dooms it — the cascade
+        must cancel the whole chain or the run never terminalizes."""
+        parent = _make_work_item(
+            work_item_id="parent-deep",
+            run_id="run-deep",
+            phase=Phase.RUNNING,
+            dependency_ids=["deep-a", "deep-b"],
+            metadata={
+                "dependency_settlement": {
+                    "failed": ["deep-a"],
+                    "cancelled": [],
+                    "stuck": ["deep-b"],
+                    "settled_at": "2026-07-13T00:00:00",
+                },
+            },
+        )
+        deep_a = _make_work_item(
+            work_item_id="deep-a", run_id="run-deep", phase=Phase.FAILED
+        )
+        deep_b = _make_work_item(
+            work_item_id="deep-b",
+            run_id="run-deep",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["deep-a"],
+        )
+        deep_c = _make_work_item(
+            work_item_id="deep-c",
+            run_id="run-deep",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["deep-b"],
+        )
+        await self._save(deep_c, deep_b, deep_a, parent)
+
+        await self.store.update_delegation_work_item("parent-deep", phase=Phase.APPROVED)
+
+        after_b = await self.store.get_delegation_work_item("deep-b")
+        after_c = await self.store.get_delegation_work_item("deep-c")
+        self.assertEqual(after_b.phase, Phase.CANCELLED)
+        self.assertEqual(after_c.phase, Phase.CANCELLED)
+
+    async def test_settlement_cascade_spares_rewired_children(self) -> None:
+        """Stuck children the manager rewired onto a live replacement stay
+        alive: rewiring drops them out of the doomed set."""
+        parent = _make_work_item(
+            work_item_id="parent-rw",
+            run_id="run-rw",
+            phase=Phase.RUNNING,
+            dependency_ids=["rw-a", "rw-b"],
+            metadata={
+                "dependency_settlement": {
+                    "failed": ["rw-a"],
+                    "cancelled": [],
+                    "stuck": ["rw-b"],
+                    "settled_at": "2026-07-13T00:00:00",
+                },
+            },
+        )
+        # Failed child was manager-deleted with a replacement, so rw-b's
+        # dependency normalizes onto the live replacement card.
+        rw_a = _make_work_item(
+            work_item_id="rw-a",
+            run_id="run-rw",
+            phase=Phase.CANCELLED,
+            metadata={
+                "deleted_by_manager_tool": True,
+                "replacement_dependency_work_item_ids": ["rw-a2"],
+            },
+        )
+        rw_a2 = _make_work_item(
+            work_item_id="rw-a2", run_id="run-rw", phase=Phase.RUNNING
+        )
+        rw_b = _make_work_item(
+            work_item_id="rw-b",
+            run_id="run-rw",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["rw-a"],
+        )
+        await self._save(rw_a2, rw_b, rw_a, parent)
+
+        await self.store.update_delegation_work_item("parent-rw", phase=Phase.APPROVED)
+
+        after_b = await self.store.get_delegation_work_item("rw-b")
+        self.assertEqual(after_b.phase, Phase.WAITING_DEPENDENCIES)
+
+    async def test_park_does_not_wait_on_settled_failed_or_doomed_deps(self) -> None:
+        """A triage turn that accepts partial results must be able to
+        finish: settled deps (terminal or doomed) are not pending, so the
+        card completes instead of re-parking forever on the FAILED child
+        it just triaged."""
+        parent = _make_work_item(
+            work_item_id="park-parent",
+            run_id="run-park",
+            phase=Phase.RUNNING,
+            dependency_ids=["park-ok", "park-bad", "park-stuck"],
+            metadata={
+                "dependency_settlement": {
+                    "failed": ["park-bad"],
+                    "cancelled": [],
+                    "stuck": ["park-stuck"],
+                    "settled_at": "2026-07-13T00:00:00",
+                },
+            },
+        )
+        park_ok = _make_work_item(
+            work_item_id="park-ok", run_id="run-park", phase=Phase.APPROVED
+        )
+        park_bad = _make_work_item(
+            work_item_id="park-bad", run_id="run-park", phase=Phase.FAILED
+        )
+        park_stuck = _make_work_item(
+            work_item_id="park-stuck",
+            run_id="run-park",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["park-bad"],
+        )
+        await self._save(park_ok, park_bad, park_stuck, parent)
+
+        task = Task(
+            id="park-task",
+            title="Triage turn",
+            project_id="proj1",
+            assigned_to="m",
+            status=TaskStatus.RUNNING,
+            metadata={"work_item_projection_id": "park-parent"},
+        )
+        set_linked_work_item_id(task, "park-parent")
+        await self.store.save_task(task)
+
+        executor = self._executor()
+        parked = await executor._park_for_delegated_children(task)
+
+        self.assertFalse(parked)
+        after = await self.store.get_delegation_work_item("park-parent")
+        self.assertEqual(after.phase, Phase.RUNNING)
+        # Settlement stamp survives (needed by the cascade at APPROVED).
+        self.assertTrue(dict(after.metadata.get("dependency_settlement", {}) or {}))
+
+    async def test_park_race_releases_triage_when_failure_beat_the_park(self) -> None:
+        """Race: children failed while the manager turn was still running,
+        so the failure hook fired before the card parked (and may have
+        regressed it to WAITING_FOR_CHILDREN without a stamp). Park must
+        re-arm the triage release instead of silently returning False."""
+        parent = _make_work_item(
+            work_item_id="race-parent",
+            run_id="run-race",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            dependency_ids=["race-bad"],
+        )
+        race_bad = _make_work_item(
+            work_item_id="race-bad", run_id="run-race", phase=Phase.FAILED
+        )
+        await self._save(race_bad, parent)
+
+        task = Task(
+            id="race-task",
+            title="Dispatch turn",
+            project_id="proj1",
+            assigned_to="m",
+            status=TaskStatus.RUNNING,
+            metadata={"work_item_projection_id": "race-parent"},
+        )
+        set_linked_work_item_id(task, "race-parent")
+        await self.store.save_task(task)
+
+        executor = self._executor()
+        parked = await executor._park_for_delegated_children(task)
+
+        self.assertTrue(parked)
+        after = await self.store.get_delegation_work_item("race-parent")
+        self.assertNotEqual(after.phase, Phase.WAITING_FOR_CHILDREN)
+        settlement = dict(after.metadata.get("dependency_settlement", {}) or {})
+        self.assertEqual(list(settlement.get("failed", [])), ["race-bad"])
+
+    async def test_released_triage_card_is_not_doomed_for_upper_parents(self) -> None:
+        """A released (stamped) triage card is alive: it must not count as
+        doomed, or the upper parent settles early and its cascade could
+        cancel a triage card that is about to run."""
+        triage = _make_work_item(
+            work_item_id="alive-triage",
+            run_id="run-alive",
+            phase=Phase.READY,
+            dependency_ids=["alive-bad"],
+            metadata={
+                "runtime_model": "multi_team_org",
+                "work_kind": "synthesize",
+                "dependency_settlement": {
+                    "failed": ["alive-bad"],
+                    "cancelled": [],
+                    "stuck": [],
+                    "settled_at": "2026-07-13T00:00:00",
+                },
+            },
+        )
+        alive_bad = _make_work_item(
+            work_item_id="alive-bad", run_id="run-alive", phase=Phase.FAILED
+        )
+        upper = _make_work_item(
+            work_item_id="alive-upper",
+            run_id="run-alive",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            dependency_ids=["alive-triage"],
+        )
+        await self._save(alive_bad, triage, upper)
+
+        from opc.layer2_organization.work_item_transition import (
+            compute_doomed_work_item_ids,
+        )
+
+        run_items = await self.store.list_delegation_work_items("run-alive")
+        by_id = {item.work_item_id: item for item in run_items}
+        doomed = compute_doomed_work_item_ids(by_id)
+        self.assertNotIn("alive-triage", doomed)
+
+        changed = await refresh_dependents_for_run(self.store, run_id="run-alive")
+        after_upper = await self.store.get_delegation_work_item("alive-upper")
+        # The upper parent keeps waiting for the live triage card — no
+        # premature settlement over it.
+        self.assertEqual(after_upper.phase, Phase.WAITING_FOR_CHILDREN)
+        self.assertFalse(
+            dict(after_upper.metadata.get("dependency_settlement", {}) or {})
+        )
+
+    async def test_settlement_cascade_retries_after_partial_failure(self) -> None:
+        """Retry: B (stamped stuck) was cancelled by a previous cascade
+        attempt but deeper C failed to cancel. The next pass must still
+        traverse through terminal B and cancel C before stamping."""
+        parent = _make_work_item(
+            work_item_id="retry-parent",
+            run_id="run-retry",
+            phase=Phase.APPROVED,
+            dependency_ids=["retry-a", "retry-b"],
+            metadata={
+                "dependency_settlement": {
+                    "failed": ["retry-a"],
+                    "cancelled": [],
+                    "stuck": ["retry-b"],
+                    "settled_at": "2026-07-13T00:00:00",
+                },
+            },
+        )
+        retry_a = _make_work_item(
+            work_item_id="retry-a", run_id="run-retry", phase=Phase.FAILED
+        )
+        retry_b = _make_work_item(
+            work_item_id="retry-b",
+            run_id="run-retry",
+            phase=Phase.CANCELLED,
+            dependency_ids=["retry-a"],
+        )
+        retry_c = _make_work_item(
+            work_item_id="retry-c",
+            run_id="run-retry",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["retry-b"],
+        )
+        await self._save(retry_c, retry_b, retry_a, parent)
+
+        await refresh_dependents_for_run(self.store, run_id="run-retry")
+
+        after_c = await self.store.get_delegation_work_item("retry-c")
+        after_parent = await self.store.get_delegation_work_item("retry-parent")
+        self.assertEqual(after_c.phase, Phase.CANCELLED)
+        settlement = dict(after_parent.metadata.get("dependency_settlement", {}) or {})
+        self.assertTrue(settlement.get("cascaded_at"))
+
+    async def test_info_dependency_does_not_block_settlement(self) -> None:
+        """Info-class deps never gate claiming, so an in-flight info dep
+        must not keep a failed board from settling either."""
+        parent = _make_work_item(
+            work_item_id="info-parent",
+            run_id="run-info",
+            phase=Phase.WAITING_FOR_CHILDREN,
+            dependency_ids=["info-bad", "info-fyi"],
+            metadata={"dependency_classes": {"info-fyi": "info"}},
+        )
+        info_bad = _make_work_item(
+            work_item_id="info-bad", run_id="run-info", phase=Phase.RUNNING
+        )
+        info_fyi = _make_work_item(
+            work_item_id="info-fyi", run_id="run-info", phase=Phase.RUNNING
+        )
+        await self._save(info_fyi, info_bad, parent)
+
+        await self.store.update_delegation_work_item("info-bad", phase=Phase.FAILED)
+
+        after = await self.store.get_delegation_work_item("info-parent")
+        self.assertNotEqual(after.phase, Phase.WAITING_FOR_CHILDREN)
+        settlement = dict(after.metadata.get("dependency_settlement", {}) or {})
+        self.assertEqual(list(settlement.get("failed", [])), ["info-bad"])
+        self.assertNotIn("info-fyi", list(settlement.get("stuck", [])))
+
+    async def test_late_created_rollup_card_gets_settlement_on_dispatcher_tick(self) -> None:
+        """A delivery card created AFTER its dependency failed sees no
+        failure hook; the dispatcher tick must run the frontier for it."""
+        late_bad = _make_work_item(
+            work_item_id="late-bad", run_id="run-late", phase=Phase.FAILED
+        )
+        await self._save(late_bad)
+        delivery = _make_work_item(
+            work_item_id="late-delivery",
+            run_id="run-late",
+            phase=Phase.WAITING_DEPENDENCIES,
+            dependency_ids=["late-bad"],
+            metadata={"work_kind": "delivery"},
+        )
+        await self._save(delivery)
+
+        executor = self._executor()
+        run_items = await self.store.list_delegation_work_items("run-late")
+        await executor._refresh_ready_work_items(run_items, tasks=[])
+
+        after = await self.store.get_delegation_work_item("late-delivery")
+        self.assertEqual(after.phase, Phase.READY)
+        settlement = dict(after.metadata.get("dependency_settlement", {}) or {})
+        self.assertEqual(list(settlement.get("failed", [])), ["late-bad"])
+
+    async def test_park_still_waits_on_live_children(self) -> None:
+        """Control: genuinely in-flight children still park the manager."""
+        parent = _make_work_item(
+            work_item_id="live-parent",
+            run_id="run-live",
+            phase=Phase.RUNNING,
+            dependency_ids=["live-ok", "live-running"],
+        )
+        live_ok = _make_work_item(
+            work_item_id="live-ok", run_id="run-live", phase=Phase.APPROVED
+        )
+        live_running = _make_work_item(
+            work_item_id="live-running", run_id="run-live", phase=Phase.RUNNING
+        )
+        await self._save(live_ok, live_running, parent)
+
+        task = Task(
+            id="live-task",
+            title="Dispatch turn",
+            project_id="proj1",
+            assigned_to="m",
+            status=TaskStatus.RUNNING,
+            metadata={"work_item_projection_id": "live-parent"},
+        )
+        set_linked_work_item_id(task, "live-parent")
+        await self.store.save_task(task)
+
+        executor = self._executor()
+        parked = await executor._park_for_delegated_children(task)
+
+        self.assertTrue(parked)
+        after = await self.store.get_delegation_work_item("live-parent")
         self.assertEqual(after.phase, Phase.WAITING_FOR_CHILDREN)
-        # Waiting list should reflect the deps (hook wrote it).
         self.assertEqual(
             list(after.metadata.get("waiting_on_work_item_ids", [])),
-            ["child-a", "child-b"],
+            ["live-running"],
         )
 
     async def test_manager_deleted_child_is_pruned_from_parent_dependencies(self) -> None:

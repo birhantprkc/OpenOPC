@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import asdict, dataclass, field
@@ -101,8 +102,12 @@ from opc.layer2_organization.recruiter import (
 )
 from opc.layer2_organization.seat_executor import SeatExecutor
 from opc.layer2_organization.work_item_transition import (
+    DEPENDENCY_CLASS_DEFAULT,
+    compute_doomed_work_item_ids,
+    has_pending_settlement_release,
     normalize_dependency_work_item_ids,
     refresh_dependents_for_run,
+    settled_failure_dependency_ids,
     transition_work_item_from_task,
 )
 from opc.layer2_organization.work_item_identity import (
@@ -151,6 +156,23 @@ from opc.llm.retry import LLMRetryError, call_llm_json_with_retry
 # checkpoint on record yet (e.g. a park write racing this snapshot).  Once
 # exhausted the turn exits with a parked summary instead of spinning forever.
 _HUMAN_WAIT_MAX_STALL_TICKS = 24
+
+# Matches the manager dispatch guard's escape line while tolerating the
+# markdown decoration models routinely wrap protocol tokens in — bold
+# (`**NO_DELEGATION_JUSTIFICATION**:`), headings, quotes, list markers,
+# `_`/`-`/space separator variants, and fullwidth colons. A bare
+# ``startswith("NO_DELEGATION_JUSTIFICATION:")`` here cost project 4444 its
+# CTO card: the justification was written but bold-wrapped, went unparsed,
+# and the guard drove the work item to FAILED.
+_NO_DELEGATION_JUSTIFICATION_LINE = re.compile(
+    r"^\s*(?:>+\s*)*"                     # blockquote markers
+    r"(?:[-*+•]\s+|\d+[.)]\s+)?"          # list markers
+    r"[\s#*_`~\"']*"                       # heading/bold/quote decoration
+    r"NO[_\s-]?DELEGATION[_\s-]?JUSTIFICATION"
+    r"[\s*_`~\"']*"                        # decoration between token and colon
+    r"[:：]\s*(?P<reason>.*?)\s*$",
+    re.IGNORECASE,
+)
 
 
 def review_work_item_id_for_attempt(worker_work_item_id: str, attempt: int) -> str:
@@ -2700,19 +2722,31 @@ class CompanyWorkItemExecutor:
                 owner_work_item_id=str(getattr(work_item, "work_item_id", "") or "").strip(),
             )
             dependency_classes = dict(metadata.get("dependency_classes", {}) or {})
+            settled_failure_ids = settled_failure_dependency_ids(metadata)
             for dep_id in dependency_ids:
                 dependency = work_item_by_id.get(dep_id)
                 if dependency is None:
                     continue
                 dep_phase = dependency.phase
-                dep_class = str(dependency_classes.get(dep_id, "hard") or "hard").strip().lower()
+                dep_class = str(
+                    dependency_classes.get(dep_id, DEPENDENCY_CLASS_DEFAULT)
+                    or DEPENDENCY_CLASS_DEFAULT
+                ).strip().lower()
                 if dep_class == "info":
                     continue
                 if dep_class == "soft":
                     if dep_phase not in DONE_PHASES and dep_phase not in IN_PROGRESS_PHASES:
+                        if dep_id in settled_failure_ids:
+                            continue
                         return False
                     continue
                 if dep_phase != Phase.APPROVED:
+                    # Failure-triage release: the frontier pass stamped this
+                    # card's dependency_settlement over the dep (terminal
+                    # failure, or stuck behind one), so it is settled
+                    # context here, not a blocker.
+                    if dep_id in settled_failure_ids:
+                        continue
                     return False
             return True
         adaptive = cls._normalize_adaptive_metadata(metadata.get("adaptive", {}))
@@ -2730,15 +2764,24 @@ class CompanyWorkItemExecutor:
             work_item_by_id,
             owner_work_item_id=str(getattr(work_item, "work_item_id", "") or "").strip(),
         )
+        settled_failure_ids = settled_failure_dependency_ids(metadata)
         for dep_id in all_dep_ids:
-            dep_class = dep_classes_map.get(dep_id, "soft")
+            # Default must match _dependency_release_state and the doomed
+            # computation (both DEPENDENCY_CLASS_DEFAULT="hard"): a "soft"
+            # default here let a card count as runnable while the frontier
+            # counted it doomed — divergent verdicts on the same dep.
+            dep_class = dep_classes_map.get(dep_id, DEPENDENCY_CLASS_DEFAULT)
             dependency = work_item_by_id.get(dep_id)
             if dependency is None:
                 continue
             dep_phase = dependency.phase
             if dep_class == "hard" and dep_phase != Phase.APPROVED:
+                if dep_id in settled_failure_ids:
+                    continue
                 return False
             if dep_class == "soft" and dep_phase not in DONE_PHASES and dep_phase not in IN_PROGRESS_PHASES:
+                if dep_id in settled_failure_ids:
+                    continue
                 return False
         if str(adaptive.get("normalized_state", "") or "").strip().lower() == "invalidated":
             return False
@@ -3366,6 +3409,7 @@ class CompanyWorkItemExecutor:
         if not self.store or not work_items:
             return work_items
         work_items = await self._repair_stuck_aggregate_review_items(work_items)
+        work_items = await self._reconcile_missing_review_chain(work_items)
         work_item_by_id = {item.work_item_id: item for item in work_items}
         changed = False
         for work_item in work_items:
@@ -3408,6 +3452,22 @@ class CompanyWorkItemExecutor:
                     metadata_updates=dependency_state["metadata_updates"],
                 )
                 changed = True
+        # Failure frontier for late-created cards: a delivery/aggregate card
+        # created AFTER its dependency already failed never sees a failure
+        # transition hook, and the per-item pass above only releases on
+        # all-approved. Detection is cheap and idempotent — released cards
+        # (stamp present, phase moved) stop matching.
+        if has_pending_settlement_release(work_item_by_id):
+            run_id = str(work_items[0].run_id or "").strip()
+            if run_id:
+                try:
+                    if await refresh_dependents_for_run(self.store, run_id=run_id):
+                        changed = True
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "Best-effort settlement frontier refresh failed for run "
+                        f"{run_id}"
+                    )
         if not changed:
             return work_items
         try:
@@ -3544,6 +3604,99 @@ class CompanyWorkItemExecutor:
                     )
                 except Exception:
                     logger.debug("Best-effort aggregate repair event persistence failed")
+        run_id = str(work_items[0].run_id or "").strip()
+        if run_id and hasattr(self.store, "list_delegation_work_items"):
+            return await self.store.list_delegation_work_items(run_id)
+        return work_items
+
+    @staticmethod
+    def _task_carrier_for_work_item(item: DelegationWorkItem) -> Task:
+        """Minimal Task stand-in for lifecycle helpers when the original
+        runtime task row is unavailable (legacy DB rows, crash recovery).
+        Metadata keys mirror what _ensure_report_work_item_for_work_item
+        reads off a real runtime task."""
+        item_metadata = dict(getattr(item, "metadata", {}) or {})
+        task = Task(
+            id=f"reconcile::{item.work_item_id}",
+            title=str(item.title or "").strip() or item.work_item_id,
+            description=str(item.summary or "").strip(),
+            project_id="default",
+            assigned_to=str(item.role_id or "").strip(),
+            status=TaskStatus.DONE,
+            metadata={
+                "execution_mode": "company_mode",
+                "runtime_model": str(item_metadata.get("runtime_model", "") or "multi_team_org"),
+                **build_work_item_owner_execution_copy(item),
+            },
+        )
+        set_linked_work_item_id(task, item.work_item_id)
+        return task
+
+    async def _reconcile_missing_review_chain(
+        self,
+        work_items: list[DelegationWorkItem],
+    ) -> list[DelegationWorkItem]:
+        """Idempotently rebuild the report card for reviewable work items
+        parked in AWAITING_MANAGER_REVIEW with no live report/review card.
+
+        A card in that phase is only ever advanced by its report→review
+        auxiliary chain; if the chain is missing (legacy DBs where the
+        report spawn refused self-produced dispatch parents before
+        ``turn_output_kind`` existed, or a crash between the phase write
+        and the spawn), nothing will ever consume the review and the card
+        waits forever. Detection is cheap (set lookup over the run
+        snapshot), and _ensure_report_work_item_for_work_item is
+        idempotent per attempt, so re-running every tick is safe.
+        """
+        if not self.store or not work_items or not hasattr(self.store, "save_delegation_work_item"):
+            return work_items
+        waiting = [
+            item for item in work_items
+            if item.phase == Phase.AWAITING_MANAGER_REVIEW and is_manager_reviewable_turn(item)
+        ]
+        if not waiting:
+            return work_items
+        live_aux_targets: set[str] = set()
+        for item in work_items:
+            if item.phase in DONE_PHASES:
+                continue
+            item_metadata = dict(item.metadata or {})
+            for key in ("report_target_work_item_id", "review_target_work_item_id"):
+                target = str(item_metadata.get(key, "") or "").strip()
+                if target:
+                    live_aux_targets.add(target)
+        rebuilt_ids: list[str] = []
+        for item in waiting:
+            if item.work_item_id in live_aux_targets:
+                continue
+            worker_task: Task | None = None
+            claimed_task_id = str((item.metadata or {}).get("claimed_task_id", "") or "").strip()
+            if claimed_task_id and hasattr(self.store, "get_task"):
+                try:
+                    worker_task = await self.store.get_task(claimed_task_id)
+                except Exception:
+                    worker_task = None
+            if worker_task is None:
+                worker_task = self._task_carrier_for_work_item(item)
+            try:
+                spawned = await self._ensure_report_work_item_for_work_item(
+                    item.work_item_id,
+                    worker_task=worker_task,
+                )
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Failed to rebuild missing report card for reviewable work item "
+                    f"work_item_id={item.work_item_id}"
+                )
+                continue
+            if spawned is not None:
+                rebuilt_ids.append(item.work_item_id)
+        if not rebuilt_ids:
+            return work_items
+        logger.info(
+            "Rebuilt missing report cards for work items awaiting manager review: "
+            + ", ".join(rebuilt_ids)
+        )
         run_id = str(work_items[0].run_id or "").strip()
         if run_id and hasattr(self.store, "list_delegation_work_items"):
             return await self.store.list_delegation_work_items(run_id)
@@ -5079,6 +5232,12 @@ class CompanyWorkItemExecutor:
 
         while True:
             task.metadata.pop("_retry_contract_enforcement", None)
+            # Turn-scoped: the dispatch guard sets this when THIS turn
+            # mutated the board. Left over from a previous turn it would
+            # let a later non-delegating turn skip the guard entirely (and
+            # clear the justification markers), so a manager that delegated
+            # once could self-produce unreviewed forever after.
+            task.metadata.pop("manager_board_mutation_performed", None)
             manager_dispatch_retry_count = int(
                 task.metadata.get("_manager_dispatch_retry_count", 0) or 0
             )
@@ -5273,37 +5432,23 @@ class CompanyWorkItemExecutor:
                         task_id=task.id,
                     )
                     continue
-                # Retries exhausted. Preserve whatever the agent produced
-                # (content + artifacts) so the user can inspect the work
-                # even though the dispatch policy was never satisfied —
-                # historically this content was overwritten with the
-                # violation message and the turn output was lost.
+                # Retries exhausted. Dispatch is a soft constraint: the org
+                # chart fixes who *can* delegate, but not every task needs
+                # every seat, so accept the turn output as normal completion
+                # instead of failing the work item. Record the unresolved
+                # guard note so reviewers and the delivery report can weigh
+                # the output accordingly.
                 task.metadata = dict(task.metadata or {})
-                preserved_content = str(getattr(result, "content", "") or "")
-                if preserved_content:
-                    task.metadata["last_turn_preserved_content"] = preserved_content
-                task.metadata["manager_dispatch_guard_terminal_violation"] = violation_text
-                await transition_work_item_from_task(
-                    self.store, task,
-                    target_status_or_phase=Phase.FAILED,
-                    reason="manager_dispatch_guard_violation",
+                task.metadata["manager_dispatch_guard_unresolved"] = violation_text
+                await self._append_progress(
+                    task,
+                    "Dispatch guard reminders exhausted; accepting the turn output "
+                    "without delegation (noted for review).",
                 )
-                await self.save_task(task)
                 await self._emit_progress(
-                    f"[Company:{projection_id}] failed manager dispatch guard",
+                    f"[Company:{projection_id}] accepted manager turn without delegation "
+                    f"after dispatch guard reminders were exhausted",
                     task_id=task.id,
-                )
-                failure_content = violation_text
-                if preserved_content:
-                    failure_content = (
-                        f"{violation_text}\n\n---\n"
-                        f"Preserved agent output (not accepted as work-item output):\n"
-                        f"{preserved_content}"
-                    )
-                return TaskResult(
-                    status=TaskStatus.FAILED,
-                    content=failure_content,
-                    artifacts=dict(result.artifacts or {}),
                 )
             task.metadata.pop("_manager_dispatch_retry_count", None)
             task.metadata.pop("manager_dispatch_guard_terminal_violation", None)
@@ -5414,6 +5559,74 @@ class CompanyWorkItemExecutor:
                         task_id=task.id,
                     )
             return result
+
+    # Turn types whose completion is review-exempt ONLY because their
+    # deliverable is normally a delegated child card set (each child gets
+    # its own manager review). When such a turn instead completes with the
+    # manager's own work product — no live children — that output must go
+    # through manager review like any execute turn.
+    _DELEGATION_OUTPUT_TURN_TYPES = frozenset({"dispatch", "intake", "plan"})
+
+    async def _classify_delegation_turn_output(
+        self,
+        task: Task,
+        work_item_id: str,
+    ) -> tuple[str, str]:
+        """Classify what a delegation-kind turn actually delivered.
+
+        Ground truth is the store, not transient task markers: a card that
+        completes with live (non-deleted, non-auxiliary) children delivered
+        a delegated board; one without any delivered its own work product.
+
+        Returns ``(output_kind, output_source)`` where output_kind is
+        ``"delegated"`` or ``"self_produced"`` and output_source records how
+        the dispatch guard was satisfied for self-produced output
+        (``justified`` / ``dispatch_guard_exhausted`` / ``no_child_work``).
+        """
+        run_id = str((task.metadata or {}).get("delegation_run_id", "") or "").strip()
+        if run_id and self.store and hasattr(self.store, "list_delegation_work_items"):
+            try:
+                run_items = await self.store.list_delegation_work_items(run_id)
+            except Exception:
+                run_items = []
+            for item in run_items:
+                if str(getattr(item, "parent_work_item_id", "") or "").strip() != work_item_id:
+                    continue
+                item_metadata = dict(getattr(item, "metadata", {}) or {})
+                if bool(item_metadata.get("deleted_by_manager_tool", False)):
+                    continue
+                # Hidden report/review cards are runtime plumbing spawned
+                # under the worker card, not delegated business work.
+                if bool(item_metadata.get("report_execution_work_item", False)) or bool(
+                    item_metadata.get("review_execution_work_item", False)
+                ):
+                    continue
+                return ("delegated", "")
+        if str((task.metadata or {}).get("manager_no_delegation_justification", "") or "").strip():
+            return ("self_produced", "justified")
+        if str((task.metadata or {}).get("manager_dispatch_guard_unresolved", "") or "").strip():
+            return ("self_produced", "dispatch_guard_exhausted")
+        return ("self_produced", "no_child_work")
+
+    def _has_agent_manager_above(self, task: Task, linked_work_item: Any) -> bool:
+        """True when the card's manager is a real agent role that can run a
+        review turn. Top seats report to the human ``owner`` — a review card
+        assigned there is unclaimable (the a7846729 stuck-review case), so
+        self-produced output at the top auto-approves and is covered by the
+        final delivery's human acceptance instead."""
+        manager_role_id = (
+            str((task.metadata or {}).get("manager_role_id", "") or "").strip()
+            or str(getattr(linked_work_item, "manager_role_id", "") or "").strip()
+        )
+        if not manager_role_id or manager_role_id == "owner":
+            return False
+        get_agent = getattr(getattr(self, "org_engine", None), "get_agent", None)
+        if callable(get_agent):
+            try:
+                return get_agent(manager_role_id) is not None
+            except Exception:
+                return True
+        return True
 
     async def _apply_done_transition(
         self,
@@ -5529,6 +5742,21 @@ class CompanyWorkItemExecutor:
             is_delivery_turn(task.metadata)
             or str(task.metadata.get("review_owner_kind", "") or "").strip().lower() == "human"
         )
+        turn_output_kind = ""
+        turn_output_source = ""
+        if (
+            not manager_reviewable
+            and not is_attention_work_item
+            and not is_delivery_card
+            and work_kind in self._DELEGATION_OUTPUT_TURN_TYPES
+        ):
+            turn_output_kind, turn_output_source = await self._classify_delegation_turn_output(
+                task, work_item_id,
+            )
+            if turn_output_kind == "self_produced" and self._has_agent_manager_above(
+                task, linked_work_item,
+            ):
+                manager_reviewable = True
         if is_attention_work_item:
             # Attention work items are wake-up wrappers that let a parked
             # manager consume inbox/board state and call orchestration tools.
@@ -5556,6 +5784,16 @@ class CompanyWorkItemExecutor:
             **work_item_identity_payload_for_task(task),
             "adaptive": dict(task.metadata.get("adaptive", {}) or {}),
         }
+        if turn_output_kind:
+            # Persist the classification on the WorkItem so every downstream
+            # consumer of is_manager_reviewable_turn (report spawn, report
+            # completion, recovery scans) reads the same fact instead of
+            # re-deriving it from the static turn type.
+            metadata_updates["turn_output_kind"] = turn_output_kind
+            task.metadata["turn_output_kind"] = turn_output_kind
+            if turn_output_source:
+                metadata_updates["turn_output_source"] = turn_output_source
+                task.metadata["turn_output_source"] = turn_output_source
         if is_attention_work_item:
             metadata_updates["attention_work_item_outcome"] = "completed"
         if target_phase in {Phase.AWAITING_MANAGER_REVIEW, Phase.AWAITING_HUMAN}:
@@ -7997,6 +8235,57 @@ class CompanyWorkItemExecutor:
         if counts:
             counts_text = ", ".join(f"{phase}={count}" for phase, count in sorted(counts.items()))
             lines.append(f"Children by phase: {counts_text}")
+        settlement = {}
+        if current_item is not None:
+            settlement = dict(
+                (current_item.metadata or {}).get("dependency_settlement", {}) or {}
+            )
+        failed_board_items = [
+            item for item in board_items
+            if getattr(item, "phase", None) in (Phase.FAILED, Phase.CANCELLED)
+        ]
+        if failed_board_items or settlement:
+            lines.append("### Failed or cancelled children (triage needed)")
+            for item in failed_board_items[:8]:
+                item_meta = dict(item.metadata or {})
+                reason = str(item_meta.get("last_transition_reason", "") or "").strip()
+                summary_text = str(item.summary or "").strip()
+                entry = (
+                    f"- `{str(item.work_item_id or '').strip()}` [{item.phase.value}] "
+                    f"{str(item.role_id or '').strip()}"
+                )
+                if reason:
+                    entry += f" reason={reason}"
+                if summary_text:
+                    entry += ": " + clip_text(
+                        summary_text, limit=240, marker="failed child summary truncated"
+                    ).text
+                lines.append(entry)
+                preserved = str(item_meta.get("last_turn_preserved_content", "") or "").strip()
+                if preserved:
+                    lines.append(
+                        "  Output preserved from its final turn (not lost): "
+                        + clip_text(preserved, limit=700, marker="preserved output truncated").text
+                    )
+            stuck_ids = [
+                str(item).strip()
+                for item in list(settlement.get("stuck", []) or [])
+                if str(item).strip()
+            ]
+            if stuck_ids:
+                lines.append(
+                    "Downstream children blocked by these failures: "
+                    + ", ".join(f"`{sid}`" for sid in stuck_ids[:8])
+                    + (" ..." if len(stuck_ids) > 8 else "")
+                    + ". They are cancelled automatically when this turn completes "
+                    "unless you rebuild or rewire them."
+                )
+            lines.append(
+                "You can rebuild the failed work with `delegate_work` (pair it with "
+                "`delete_work_item` + `replacement_dependency_work_item_ids` to rewire "
+                "dependents), continue with the successful results only, or record the "
+                "gap in your handoff so the upper role or user can decide."
+            )
         lines.append(
             "Use `manager_board_read` without `parent_work_item_id` to inspect this business board. "
             "Do not call `delegate_work` again for any existing `scope_key`; use `modify_work_item` or `delete_work_item` "
@@ -8230,6 +8519,25 @@ class CompanyWorkItemExecutor:
         }
 
     @staticmethod
+    def _genuine_no_delegation_justification(text: str) -> str:
+        """Cleaned justification text, or "" for empty input or an echo of
+        the instruction template's `<specific reason>` placeholder — with
+        any markdown decoration, quoting, or trailing punctuation around
+        the placeholder stripped before the check."""
+        reason = re.sub(r"[\s*_`~\"']+$", "", str(text or "")).strip()
+        if not reason:
+            return ""
+        core = reason
+        previous = None
+        while previous != core:
+            previous = core
+            core = core.strip().strip("*_~`\"'")
+            core = re.sub(r"[\s.。!！,，;；:：]+$", "", core)
+        if re.fullmatch(r"<[^<>]*>", core):
+            return ""
+        return reason
+
+    @staticmethod
     def _extract_no_delegation_justification(task: Task, result: TaskResult | None) -> str:
         artifact_candidates = []
         if result and getattr(result, "artifacts", None):
@@ -8249,15 +8557,19 @@ class CompanyWorkItemExecutor:
             ]
         )
         for candidate in artifact_candidates:
-            if candidate:
-                return candidate
+            cleaned = CompanyWorkItemExecutor._genuine_no_delegation_justification(candidate)
+            if cleaned:
+                return cleaned
         content = str(getattr(result, "content", "") or "").strip()
         for line in content.splitlines():
-            stripped = str(line).strip()
-            if not stripped:
+            match = _NO_DELEGATION_JUSTIFICATION_LINE.match(str(line))
+            if not match:
                 continue
-            if stripped.upper().startswith("NO_DELEGATION_JUSTIFICATION:"):
-                return stripped.split(":", 1)[1].strip()
+            reason = CompanyWorkItemExecutor._genuine_no_delegation_justification(
+                match.group("reason")
+            )
+            if reason:
+                return reason
         return ""
 
     @staticmethod
@@ -8344,6 +8656,7 @@ class CompanyWorkItemExecutor:
             task.metadata = dict(task.metadata or {})
             task.metadata["manager_board_mutation_performed"] = True
             task.metadata.pop("manager_no_delegation_justification", None)
+            task.metadata.pop("manager_dispatch_guard_unresolved", None)
             return []
         justification = self._extract_no_delegation_justification(task, result)
         if justification:
@@ -8355,6 +8668,7 @@ class CompanyWorkItemExecutor:
                 ]
             task.metadata = dict(task.metadata or {})
             task.metadata["manager_no_delegation_justification"] = justification
+            task.metadata.pop("manager_dispatch_guard_unresolved", None)
             return []
         direct_reports = [
             str(item).strip()
@@ -8994,15 +9308,84 @@ class CompanyWorkItemExecutor:
                     )
                 await self.save_task(task)
                 return False  # intake does not park; it closes out
+        # A dependency only counts as pending while it can still move on its
+        # own: terminal deps (APPROVED/FAILED/CANCELLED) and doomed deps
+        # (transitively blocked by a terminal failure) are settled. Without
+        # this, a triage turn that accepts partial results re-parks forever
+        # on the already-FAILED child it just triaged — the settlement
+        # release and this gate must agree on what "settled" means.
+        park_doomed_ids: set[str] = set()
+        park_items_by_id: dict[str, Any] = {}
+        if parent_work_item is not None and hasattr(self.store, "list_delegation_work_items"):
+            try:
+                park_run_items = await self.store.list_delegation_work_items(parent_work_item.run_id)
+            except Exception:
+                park_run_items = []
+            park_items_by_id = {
+                str(getattr(item, "work_item_id", "") or "").strip(): item
+                for item in park_run_items
+                if str(getattr(item, "work_item_id", "") or "").strip()
+            }
+            park_doomed_ids = compute_doomed_work_item_ids(park_items_by_id)
         pending_dependency_ids: list[str] = []
+        settled_failures_present = False
         for dep_id in dependency_ids:
-            dependency = await self.store.get_delegation_work_item(dep_id)
-            if dependency is None or dependency.phase != Phase.APPROVED:
+            dependency = park_items_by_id.get(dep_id)
+            if dependency is None:
+                dependency = await self.store.get_delegation_work_item(dep_id)
+            if dependency is None:
                 pending_dependency_ids.append(dep_id)
+                continue
+            if dependency.phase == Phase.APPROVED:
+                continue
+            if dependency.phase in DONE_PHASES or dep_id in park_doomed_ids:
+                settled_failures_present = True
+                continue
+            pending_dependency_ids.append(dep_id)
         task.metadata = dict(task.metadata)
         task.metadata["delegation_wait_for_work_item_ids"] = dependency_ids
         if not pending_dependency_ids:
             task.metadata.pop("delegation_pending_work_item_ids", None)
+            parent_meta_for_stamp = (
+                dict(getattr(parent_work_item, "metadata", {}) or {})
+                if parent_work_item is not None
+                else {}
+            )
+            has_settlement_stamp = bool(
+                dict(parent_meta_for_stamp.get("dependency_settlement", {}) or {})
+            )
+            if settled_failures_present and not has_settlement_stamp:
+                # Race: the children settled with failures while this turn
+                # was still running, so the failure's transition hook fired
+                # before this card could park — no triage release has been
+                # scheduled (and the concurrent refresh may already have
+                # regressed our phase to WAITING_FOR_CHILDREN without a
+                # stamp). Park now and run the frontier immediately: the
+                # settlement release re-arms the triage turn.
+                await transition_work_item_from_task(
+                    self.store, task,
+                    target_status_or_phase=Phase.WAITING_FOR_CHILDREN,
+                    reason="park_for_settled_failures",
+                    metadata_updates={
+                        "dependency_work_item_ids": dependency_ids,
+                        "waiting_on_work_item_ids": [],
+                        "delegated_children_pending": True,
+                    },
+                )
+                await self.save_task(task)
+                try:
+                    await refresh_dependents_for_run(
+                        self.store,
+                        run_id=str(getattr(parent_work_item, "run_id", "") or "").strip(),
+                        source_work_item_id=parent_work_item_id,
+                        source_task_id=task.id,
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "park_for_settled_failures: frontier refresh failed for "
+                        f"{parent_work_item_id}"
+                    )
+                return True
             return False
         task.metadata["delegation_pending_work_item_ids"] = pending_dependency_ids
         await self._append_progress(
@@ -9011,6 +9394,33 @@ class CompanyWorkItemExecutor:
             + ", ".join(pending_dependency_ids[:8])
             + (" ..." if len(pending_dependency_ids) > 8 else ""),
         )
+        park_metadata_updates: dict[str, Any] = {
+            "dependency_work_item_ids": dependency_ids,
+            "waiting_on_work_item_ids": pending_dependency_ids,
+            "delegated_children_pending": True,
+        }
+        parent_meta_now = (
+            dict(getattr(parent_work_item, "metadata", {}) or {})
+            if parent_work_item is not None
+            else {}
+        )
+        if bool(parent_meta_now.get("synthesis_turn_started")) or parent_meta_now.get(
+            "dependency_settlement"
+        ):
+            # Re-parking after a synthesis / failure-triage turn rebuilt the
+            # board: reset the one-shot synthesis marker and the stale
+            # settlement stamp so the next wake runs a clean synthesis pass
+            # over the new children (and the old failed-dep release cannot
+            # leak into the rebuilt card's runnability check).
+            park_metadata_updates["synthesis_turn_started"] = False
+            park_metadata_updates["dependency_settlement"] = {}
+            pre_kind = str(parent_meta_now.get("pre_synthesis_work_kind", "") or "").strip()
+            if pre_kind and str(parent_meta_now.get("work_kind", "") or "").strip().lower() in {
+                "synthesis",
+                "synthesize",
+            }:
+                park_metadata_updates["work_kind"] = pre_kind
+                park_metadata_updates["delegation_turn_kind"] = pre_kind
         # Phase A: single phase write, hook projects task.status=BLOCKED and
         # syncs local. Replaces the old "write task.status BLOCKED, save,
         # then separately write work_item.phase=WAITING_FOR_CHILDREN" double-pass.
@@ -9018,11 +9428,7 @@ class CompanyWorkItemExecutor:
             self.store, task,
             target_status_or_phase=Phase.WAITING_FOR_CHILDREN,
             reason="park_for_delegated_children",
-            metadata_updates={
-                "dependency_work_item_ids": dependency_ids,
-                "waiting_on_work_item_ids": pending_dependency_ids,
-                "delegated_children_pending": True,
-            },
+            metadata_updates=park_metadata_updates,
         )
         await self.save_task(task)
         return True
@@ -13321,6 +13727,10 @@ class CompanyWorkItemExecutor:
     @staticmethod
     def _task_has_delegated_downstream_work(task: Task) -> bool:
         metadata = dict(getattr(task, "metadata", {}) or {})
+        # Persisted completion classification (survives the per-turn reset
+        # of manager_board_mutation_performed below).
+        if str(metadata.get("turn_output_kind", "") or "").strip().lower() == "delegated":
+            return True
         if bool(metadata.get("manager_board_mutation_performed", False)):
             return True
         if bool(metadata.get("delegated_children_pending", False)):
