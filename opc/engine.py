@@ -7,11 +7,11 @@ import copy
 import hashlib
 import inspect
 import json
-import os
 import re
 import shutil
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +21,10 @@ from loguru import logger
 
 from opc.core.attachment_store import AttachmentRef, AttachmentStore
 from opc.core.attachment_content import can_extract_text, extract_attachment_text
+from opc.core.active_task_runs import (
+    ActiveTaskRunAdmissionClosed,
+    ActiveTaskRunRegistry,
+)
 from opc.core.company_tools import (
     company_collaboration_enabled_for_task,
     resolve_company_turn_mode,
@@ -81,6 +85,7 @@ from opc.layer2_organization.communication import CommunicationManager
 from opc.layer2_organization.collaboration_policy import ownership_guard_violation
 from opc.layer2_organization.secretary import SecretaryService
 from opc.layer2_organization.company_mode import (
+    CompanyExecutorDriverOwnership,
     CompanyRuntimeSpec,
     CompanyRuntimeSpecBuilder,
     CompanyWorkItemExecutor,
@@ -91,6 +96,12 @@ from opc.layer2_organization.company_mode import (
     serialized_company_plan_from_metadata,
 )
 from opc.layer2_organization.company_runtime import canonical_role_session_id
+from opc.layer2_organization.company_runtime_identity import (
+    build_company_runtime_identity_index,
+    is_company_runtime_task,
+    is_pure_company_ui_anchor,
+    load_company_runtime_identity_index,
+)
 from opc.layer2_organization.metadata_ownership import (
     build_work_item_owner_execution_copy,
 )
@@ -354,6 +365,8 @@ class OPCEngine:
         store: OPCStore | None = None,
         owns_store: bool = True,
         run_startup_reconcile: bool = True,
+        active_task_run_registry: ActiveTaskRunRegistry | None = None,
+        owns_active_task_run_registry: bool | None = None,
         on_progress: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_runtime_event: Callable[[OPCEvent], Coroutine[Any, Any, None]] | None = None,
         on_escalation: Callable[[str, list[dict]], Coroutine[Any, Any, str | None]] | None = None,
@@ -373,6 +386,17 @@ class OPCEngine:
         self.store: OPCStore | None = store
         self._owns_store = bool(owns_store)
         self._run_startup_reconcile = bool(run_startup_reconcile)
+        if active_task_run_registry is None:
+            self._active_task_run_registry = ActiveTaskRunRegistry()
+            default_registry_owner = True
+        else:
+            self._active_task_run_registry = active_task_run_registry
+            default_registry_owner = False
+        self._owns_active_task_run_registry = (
+            default_registry_owner
+            if owns_active_task_run_registry is None
+            else bool(owns_active_task_run_registry)
+        )
         self.llm: LLMProvider | None = None
         self.attachment_store: AttachmentStore | None = None
 
@@ -410,7 +434,7 @@ class OPCEngine:
         self.task_router: TaskRouter | None = None
 
         self._initialized = False
-        self._active_task_runs: set[str] = set()
+        self._shutting_down = False
         self._runtime_config_signature: tuple[tuple[str, float], ...] | None = None
         self._project_delegate_lock: asyncio.Lock | None = None
         self._project_engine_delegates: dict[str, OPCEngine] = {}
@@ -661,6 +685,7 @@ class OPCEngine:
             emit_runtime_event=self._emit_company_runtime_event,
             work_item_timeout=self.config.system.task_mode.sub_agent_timeout_sec,
             role_prompt_runner=self._run_role_prompt_via_task_execution_agent,
+            active_task_run_registry=self._active_task_run_registry,
         )
         self.communication.set_meeting_turn_runner(self._run_meeting_turn)
         self.reorg_manager = ReorgManager(
@@ -729,14 +754,16 @@ class OPCEngine:
                 reconciled = await self._reconcile_interrupted_project_tasks()
             except InvalidPhaseTransition:
                 logger.opt(exception=True).error(
-                    "Startup reconcile hit an invalid work-item phase transition for project {}; continuing initialization",
+                    "Startup reconcile hit an invalid work-item phase transition for project {}; aborting initialization",
                     self.project_id or "default",
                 )
+                raise
             except Exception:
                 logger.opt(exception=True).error(
-                    "Startup reconcile failed for project {}; continuing initialization",
+                    "Startup reconcile failed for project {}; aborting initialization",
                     self.project_id or "default",
                 )
+                raise
         if self.comms_reactivation_sweeper is not None:
             await self.comms_reactivation_sweeper.start()
         self._initialized = True
@@ -4963,14 +4990,24 @@ class OPCEngine:
     ) -> tuple[CompanyWorkItemRuntimePlan, list[Task]] | None:
         if not self.store or not parent_session_id:
             return None
-        tasks = await self.store.get_tasks(project_id=self.project_id or "default")
+        identity_index = await load_company_runtime_identity_index(
+            self.store,
+            self.project_id or "default",
+        )
+        identity = identity_index.resolve(runtime_session_id=parent_session_id)
+        if identity is None:
+            return None
         work_item_tasks = [
             task
-            for task in tasks
-            if str(getattr(task, "parent_session_id", "") or "").strip() == parent_session_id
+            for task_id in identity.runtime_task_ids
+            if task_id != identity.ui_anchor_task_id
+            for task in [identity_index.task(task_id)]
+            if task is not None
+            and is_company_runtime_task(task)
             and (
                 work_item_projection_id_from_metadata(getattr(task, "metadata", {}) or {})
                 or is_work_item_runtime_metadata(getattr(task, "metadata", {}) or {})
+                or linked_work_item_id_for_task(task)
             )
         ]
         if not work_item_tasks:
@@ -4989,7 +5026,17 @@ class OPCEngine:
             return None
 
         plan_data = None
-        for task in sorted(latest_by_projection_id.values(), key=lambda item: (item.created_at, item.id), reverse=True):
+        plan_sources = list(latest_by_projection_id.values())
+        config_source = identity_index.task(identity.config_source_task_id)
+        if config_source is not None and config_source.id not in {
+            task.id for task in plan_sources
+        }:
+            plan_sources.append(config_source)
+        for task in sorted(
+            plan_sources,
+            key=lambda item: (item.created_at, item.id),
+            reverse=True,
+        ):
             candidate = serialized_company_plan_from_metadata(task.metadata)
             if candidate:
                 plan_data = candidate
@@ -5215,6 +5262,38 @@ class OPCEngine:
         payload["basis_hash"] = self._checkpoint_basis_hash(payload)
         return payload
 
+    async def _build_company_runtime_suspend_checkpoint(
+        self,
+        *,
+        checkpoint_type: str,
+        reason: str,
+        parent_session_id: str,
+        origin_task_id: str | None,
+        plan: CompanyWorkItemRuntimePlan,
+        tasks: list[Task],
+        stop_intent_id: str | None = None,
+        payload_updates: dict[str, Any] | None = None,
+    ) -> ExecutionCheckpoint:
+        payload = await self._company_runtime_checkpoint_payload(
+            checkpoint_type=checkpoint_type,
+            reason=reason,
+            parent_session_id=parent_session_id,
+            origin_task_id=origin_task_id,
+            plan=plan,
+            tasks=tasks,
+            stop_intent_id=stop_intent_id,
+        )
+        if payload_updates:
+            payload.update(dict(payload_updates))
+            payload["basis_hash"] = self._checkpoint_basis_hash(payload)
+        return ExecutionCheckpoint(
+            project_id=self.project_id or "default",
+            session_id=parent_session_id,
+            checkpoint_type=checkpoint_type,
+            task_id=origin_task_id,
+            payload=payload,
+        )
+
     async def _save_company_runtime_suspend_checkpoint(
         self,
         *,
@@ -5225,9 +5304,10 @@ class OPCEngine:
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
         stop_intent_id: str | None = None,
-    ) -> ExecutionCheckpoint:
+        payload_updates: dict[str, Any] | None = None,
+    ) -> tuple[ExecutionCheckpoint, bool]:
         assert self.store
-        payload = await self._company_runtime_checkpoint_payload(
+        checkpoint = await self._build_company_runtime_suspend_checkpoint(
             checkpoint_type=checkpoint_type,
             reason=reason,
             parent_session_id=parent_session_id,
@@ -5235,24 +5315,12 @@ class OPCEngine:
             plan=plan,
             tasks=tasks,
             stop_intent_id=stop_intent_id,
+            payload_updates=payload_updates,
         )
-        checkpoint = ExecutionCheckpoint(
-            project_id=self.project_id or "default",
-            session_id=parent_session_id,
-            checkpoint_type=checkpoint_type,
-            task_id=origin_task_id,
-            payload=payload,
+        return await self.store.get_or_create_active_execution_checkpoint(
+            checkpoint,
+            checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
         )
-        await self.store.save_execution_checkpoint(checkpoint)
-        supersede = getattr(self.store, "supersede_pending_checkpoints", None)
-        if callable(supersede):
-            await supersede(
-                project_id=checkpoint.project_id,
-                session_id=parent_session_id,
-                checkpoint_types=list(_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES),
-                exclude_checkpoint_id=checkpoint.checkpoint_id,
-            )
-        return checkpoint
 
     async def get_pending_company_runtime_suspend_checkpoint(
         self,
@@ -5309,6 +5377,73 @@ class OPCEngine:
             return phase
         return Phase.READY
 
+    async def _company_runtime_task_is_fully_suspended(
+        self,
+        task: Task,
+        *,
+        checkpoint_type: str,
+    ) -> bool:
+        if not self.store:
+            return False
+        metadata = dict(task.metadata or {})
+        if (
+            str(metadata.get("company_runtime_stop_state", "") or "").strip() != "suspended"
+            or str(metadata.get("company_runtime_suspend_checkpoint_type", "") or "").strip()
+            != checkpoint_type
+            or not str(metadata.get("company_runtime_suspended_at", "") or "").strip()
+            or task.execution_lock
+            or task.execution_locked_at is not None
+        ):
+            return False
+
+        work_item_id = linked_work_item_id_for_task(task)
+        if work_item_id:
+            getter = getattr(self.store, "get_delegation_work_item", None)
+            if not callable(getter):
+                return False
+            try:
+                work_item = await getter(work_item_id)
+            except Exception:
+                return False
+            if work_item is None:
+                return False
+            work_item_metadata = dict(getattr(work_item, "metadata", {}) or {})
+            if getattr(work_item, "phase", None) not in {Phase.APPROVED, Phase.FAILED, Phase.CANCELLED}:
+                if (
+                    str(metadata.get("dispatch_hold", "") or "").strip()
+                    != "company_runtime_suspended"
+                    or str(work_item_metadata.get("dispatch_hold", "") or "").strip()
+                    != "company_runtime_suspended"
+                    or str(work_item_metadata.get("suspend_checkpoint_type", "") or "").strip()
+                    != checkpoint_type
+                    or str(getattr(work_item, "claimed_by_role_runtime_session_id", "") or "").strip()
+                    or str(getattr(work_item, "claimed_by_seat_id", "") or "").strip()
+                    or str(work_item_metadata.get("claimed_by_role_session_id", "") or "").strip()
+                    or str(work_item_metadata.get("claimed_task_id", "") or "").strip()
+                ):
+                    return False
+
+        role_session_id = str(metadata.get("delegation_role_session_id", "") or "").strip()
+        if role_session_id:
+            getter = getattr(self.store, "get_delegation_role_session", None)
+            if callable(getter):
+                try:
+                    role_session = await getter(role_session_id)
+                except Exception:
+                    return False
+                if role_session is not None and (
+                    str(getattr(role_session, "focused_work_item_id", "") or "").strip()
+                    or str(getattr(role_session, "status", "") or "").strip().lower() != "idle"
+                ):
+                    return False
+
+        latest_session = await self._load_latest_external_session_for_task(task)
+        if latest_session is not None:
+            session_status = str(getattr(latest_session, "status", "") or "").strip().lower()
+            if session_status not in {"suspended", "failed", "cancelled", "denied", "rejected"}:
+                return False
+        return True
+
     async def _suspend_company_runtime_tasks(
         self,
         tasks: list[Task],
@@ -5325,7 +5460,41 @@ class OPCEngine:
         update_role_session = getattr(self.store, "update_delegation_role_session", None)
         update_work_item = getattr(self.store, "update_delegation_work_item", None)
         for task in tasks:
-            if task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            work_item_id = linked_work_item_id_for_task(task)
+            work_item = None
+            if work_item_id:
+                if not callable(get_work_item) or not callable(update_work_item):
+                    raise RuntimeError(
+                        f"company runtime cannot durably suspend work item {work_item_id}"
+                    )
+                try:
+                    work_item = await get_work_item(work_item_id)
+                except Exception:
+                    logger.opt(exception=True).error(
+                        "company runtime suspend: failed to load authoritative work item {}",
+                        work_item_id,
+                    )
+                    raise
+                if work_item is None:
+                    raise RuntimeError(
+                        f"company runtime work item {work_item_id} no longer exists"
+                    )
+            task_is_terminal = task.status in {
+                TaskStatus.DONE,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }
+            work_item_is_active = bool(
+                work_item is not None
+                and getattr(work_item, "phase", None)
+                not in {Phase.APPROVED, Phase.FAILED, Phase.CANCELLED}
+            )
+            if task_is_terminal and not work_item_is_active:
+                continue
+            if await self._company_runtime_task_is_fully_suspended(
+                task,
+                checkpoint_type=checkpoint_type,
+            ):
                 continue
             affected.append(task.id)
             task.metadata = dict(task.metadata or {})
@@ -5341,17 +5510,11 @@ class OPCEngine:
             task.execution_locked_at = None
             task.result = task.result if task.result else None
 
-            work_item_id = linked_work_item_id_for_task(task)
             suspended_phase: Phase | None = None
-            if work_item_id and callable(get_work_item):
-                try:
-                    work_item = await get_work_item(work_item_id)
-                except Exception:
-                    work_item = None
+            if work_item_id:
                 if (
-                    work_item is not None
-                    and callable(update_work_item)
-                    and getattr(work_item, "phase", None) not in {Phase.APPROVED, Phase.FAILED, Phase.CANCELLED}
+                    getattr(work_item, "phase", None)
+                    not in {Phase.APPROVED, Phase.FAILED, Phase.CANCELLED}
                 ):
                     current_phase = getattr(work_item, "phase", None)
                     suspended_phase = current_phase if isinstance(current_phase, Phase) else self._suspend_target_phase(current_phase)
@@ -5381,10 +5544,11 @@ class OPCEngine:
                             claimed_by_seat_id="",
                         )
                     except Exception:
-                        logger.opt(exception=True).debug(
-                            "company runtime suspend: hold/release failed for %s",
+                        logger.opt(exception=True).error(
+                            "company runtime suspend: authoritative hold/release failed for {}",
                             work_item_id,
                         )
+                        raise
                     else:
                         task.metadata["dispatch_hold"] = "company_runtime_suspended"
                         task.metadata["suspended_phase"] = suspended_phase.value
@@ -5410,7 +5574,14 @@ class OPCEngine:
             target.metadata = {**dict(getattr(target, "metadata", {}) or {}), **dict(task.metadata or {})}
             target.execution_lock = False
             target.execution_locked_at = None
-            if target.status not in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            if task_is_terminal:
+                # The WorkItem hold write fires the generic phase projection
+                # hook, which can briefly rewrite a stale terminal Task to the
+                # authoritative nonterminal phase.  A suspend is not a resume:
+                # retain the pre-existing Task projection while attaching the
+                # durable hold; resume will project the WorkItem deliberately.
+                target.status = task.status
+            elif target.status not in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
                 if suspended_phase is not None:
                     target.status = task_status_for_phase(suspended_phase)
                 elif original_task_status:
@@ -5438,6 +5609,127 @@ class OPCEngine:
                     logger.opt(exception=True).debug("company runtime suspend: role session idle update failed")
         return affected
 
+    async def _checkpoint_and_suspend_company_runtime_scope(
+        self,
+        *,
+        checkpoint_type: str,
+        reason: str,
+        parent_session_id: str,
+        origin_task_id: str | None,
+        plan: CompanyWorkItemRuntimePlan,
+        tasks: list[Task],
+        stop_intent_id: str | None = None,
+    ) -> tuple[ExecutionCheckpoint, bool, list[str]]:
+        """Install durable holds before publishing a resumable checkpoint.
+
+        A pending checkpoint is an execution capability, so exposing it before
+        WorkItem/Task holds are committed lets another controller resume while
+        Stop is still suspending the scope.  Build the pre-stop snapshot first,
+        commit all holds, and only then atomically create (or normalize) the
+        single active checkpoint.
+        """
+
+        assert self.store
+        candidate = await self._build_company_runtime_suspend_checkpoint(
+            checkpoint_type=checkpoint_type,
+            reason=reason,
+            parent_session_id=parent_session_id,
+            origin_task_id=origin_task_id,
+            plan=plan,
+            tasks=tasks,
+            stop_intent_id=stop_intent_id,
+        )
+        existing = await self.get_active_company_runtime_suspend_checkpoint(
+            parent_session_id
+        )
+        checkpoint = existing or candidate
+        payload = dict(checkpoint.payload or {})
+        effective_reason = str(payload.get("reason", "") or reason)
+        effective_type = str(checkpoint.checkpoint_type or checkpoint_type)
+        effective_stop_intent_id = str(
+            payload.get("stop_intent_id", "") or stop_intent_id or ""
+        )
+        affected = await self._suspend_company_runtime_tasks(
+            tasks,
+            reason=effective_reason,
+            checkpoint_type=effective_type,
+            stop_intent_id=effective_stop_intent_id,
+        )
+
+        created = False
+        if existing is None:
+            checkpoint, created = (
+                await self.store.get_or_create_active_execution_checkpoint(
+                    candidate,
+                    checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+                )
+            )
+            if checkpoint.checkpoint_id != candidate.checkpoint_id:
+                payload = dict(checkpoint.payload or {})
+                affected.extend(
+                    await self._suspend_company_runtime_tasks(
+                        tasks,
+                        reason=str(payload.get("reason", "") or reason),
+                        checkpoint_type=str(
+                            checkpoint.checkpoint_type or checkpoint_type
+                        ),
+                        stop_intent_id=str(
+                            payload.get("stop_intent_id", "")
+                            or stop_intent_id
+                            or ""
+                        ),
+                    )
+                )
+
+        # Stop wins over an in-flight resume only after its holds are durable.
+        # If resume completed in the meantime, create a fresh checkpoint over
+        # those already-installed holds instead of leaving the scope held with
+        # no resumable fact.
+        for _attempt in range(4):
+            status = str(checkpoint.status or "").strip().lower()
+            if status in {"pending", "resuming"}:
+                transitioned = await self._mark_company_runtime_checkpoint_status(
+                    checkpoint,
+                    status="pending",
+                    payload_updates=(
+                        {
+                            "resume_state": "interrupted",
+                            "resume_interrupted_at": datetime.now().isoformat(),
+                            "resume_interruption_reason": reason,
+                        }
+                        if status == "resuming"
+                        else None
+                    ),
+                    expected_statuses={status},
+                )
+                if transitioned:
+                    return checkpoint, created, list(dict.fromkeys(affected))
+                refreshed = await self._load_execution_checkpoint_by_id(
+                    checkpoint.checkpoint_id
+                )
+                if refreshed is not None:
+                    checkpoint = refreshed
+                    continue
+
+            replacement = ExecutionCheckpoint(
+                project_id=candidate.project_id,
+                session_id=candidate.session_id,
+                checkpoint_type=candidate.checkpoint_type,
+                task_id=candidate.task_id,
+                payload=dict(candidate.payload or {}),
+            )
+            checkpoint, replacement_created = (
+                await self.store.get_or_create_active_execution_checkpoint(
+                    replacement,
+                    checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+                )
+            )
+            created = created or replacement_created
+
+        raise RuntimeError(
+            "company runtime checkpoint kept changing while suspension was finalized"
+        )
+
     async def suspend_company_runtime(
         self,
         *,
@@ -5449,53 +5741,61 @@ class OPCEngine:
     ) -> dict[str, Any] | None:
         if not self.store:
             return None
-        task = await self.store.get_task(origin_task_id)
-        parent_session_id = (
-            str(session_id or "").strip()
-            or (str(task.session_id or task.parent_session_id or "").strip() if task else "")
+        project_id = str(self.project_id or "default").strip() or "default"
+        requested_session_id = str(session_id or "").strip()
+        identity_index = await load_company_runtime_identity_index(
+            self.store,
+            project_id,
         )
-        if not parent_session_id:
+        identity = identity_index.resolve(task_id=origin_task_id)
+        if identity is None and requested_session_id:
+            identity = identity_index.resolve(runtime_session_id=requested_session_id)
+        if identity is None:
             return None
-        existing = await self.get_pending_company_runtime_suspend_checkpoint(parent_session_id)
-        if existing is not None and existing.checkpoint_type == checkpoint_type:
-            payload = dict(existing.payload or {})
+        parent_session_id = identity.runtime_session_id
+        if requested_session_id and requested_session_id != parent_session_id:
+            requested_identity = identity_index.resolve(
+                runtime_session_id=requested_session_id,
+            )
+            if requested_identity is None or requested_identity != identity:
+                return None
+
+        async with self._active_task_run_registry.scope_lock(
+            project_id,
+            parent_session_id,
+        ):
+            snapshot = await self._load_company_runtime_snapshot(parent_session_id)
+            if not snapshot:
+                return None
+            plan, tasks = snapshot
+            if not tasks:
+                return None
+
+            checkpoint, created, affected_ids = (
+                await self._checkpoint_and_suspend_company_runtime_scope(
+                    checkpoint_type=checkpoint_type,
+                    reason=reason,
+                    parent_session_id=parent_session_id,
+                    origin_task_id=origin_task_id,
+                    plan=plan,
+                    tasks=tasks,
+                    stop_intent_id=stop_intent_id,
+                )
+            )
+            idempotent = not created
+
+            payload = dict(checkpoint.payload or {})
+            effective_stop_intent_id = str(
+                payload.get("stop_intent_id", "") or stop_intent_id or ""
+            )
             return {
-                "checkpoint_id": existing.checkpoint_id,
-                "checkpoint_type": existing.checkpoint_type,
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "checkpoint_type": checkpoint.checkpoint_type,
                 "session_id": parent_session_id,
-                "task_ids": list(payload.get("task_ids", []) or []),
-                "stop_intent_id": str(payload.get("stop_intent_id", "") or stop_intent_id or ""),
-                "idempotent": True,
+                "task_ids": affected_ids,
+                "stop_intent_id": effective_stop_intent_id,
+                "idempotent": idempotent,
             }
-        snapshot = await self._load_company_runtime_snapshot(parent_session_id)
-        if not snapshot:
-            return None
-        plan, tasks = snapshot
-        if not tasks:
-            return None
-        checkpoint = await self._save_company_runtime_suspend_checkpoint(
-            checkpoint_type=checkpoint_type,
-            reason=reason,
-            parent_session_id=parent_session_id,
-            origin_task_id=origin_task_id,
-            plan=plan,
-            tasks=tasks,
-            stop_intent_id=stop_intent_id,
-        )
-        affected_ids = await self._suspend_company_runtime_tasks(
-            tasks,
-            reason=reason,
-            checkpoint_type=checkpoint_type,
-            stop_intent_id=stop_intent_id,
-        )
-        return {
-            "checkpoint_id": checkpoint.checkpoint_id,
-            "checkpoint_type": checkpoint.checkpoint_type,
-            "session_id": parent_session_id,
-            "task_ids": affected_ids,
-            "stop_intent_id": stop_intent_id or "",
-            "idempotent": False,
-        }
 
     @staticmethod
     def _external_resume_token_is_provider_token(
@@ -5638,7 +5938,39 @@ class OPCEngine:
             if resume_task_ids is not None and task.id not in resume_task_ids:
                 refreshed.append(task)
                 continue
-            if task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            work_item_id = linked_work_item_id_for_task(task)
+            work_item = work_item_by_id.get(work_item_id)
+            if work_item_id and (
+                not callable(get_work_item) or not callable(update_work_item)
+            ):
+                raise RuntimeError(
+                    f"company runtime cannot durably resume work item {work_item_id}"
+                )
+            if work_item is None and work_item_id:
+                try:
+                    work_item = await get_work_item(work_item_id)
+                except Exception:
+                    logger.opt(exception=True).error(
+                        "company runtime resume: failed to load authoritative work item {}",
+                        work_item_id,
+                    )
+                    raise
+                if work_item is not None:
+                    work_item_by_id[work_item_id] = work_item
+            if work_item_id and work_item is None:
+                raise RuntimeError(
+                    f"company runtime work item {work_item_id} no longer exists"
+                )
+            task_is_terminal = task.status in {
+                TaskStatus.DONE,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }
+            work_item_is_nonterminal = bool(
+                work_item is not None
+                and getattr(work_item, "phase", None) not in DONE_PHASES
+            )
+            if task_is_terminal and not work_item_is_nonterminal:
                 refreshed.append(task)
                 continue
             task.metadata = dict(task.metadata or {})
@@ -5686,7 +6018,6 @@ class OPCEngine:
             task.execution_locked_at = None
             task.result = None
             task_snapshot = task_snapshot_by_id.get(task.id, {})
-            work_item_id = linked_work_item_id_for_task(task)
             work_item_snapshot = work_item_snapshot_by_id.get(work_item_id, {})
             task_work_item_snapshot = task_snapshot.get("work_item", {})
             phase_value = str(work_item_snapshot.get("phase", "") or "").strip()
@@ -5696,14 +6027,6 @@ class OPCEngine:
                 restored_phase = Phase(phase_value) if phase_value else None
             except ValueError:
                 restored_phase = None
-            work_item = work_item_by_id.get(work_item_id)
-            if work_item is None and work_item_id and callable(get_work_item):
-                try:
-                    work_item = await get_work_item(work_item_id)
-                except Exception:
-                    work_item = None
-                if work_item is not None:
-                    work_item_by_id[work_item_id] = work_item
             work_item_phase = getattr(work_item, "phase", None) if work_item is not None else None
             if work_item is not None and work_item_phase in DONE_PHASES:
                 task.status = task_status_for_phase(work_item_phase)
@@ -5746,12 +6069,16 @@ class OPCEngine:
             progress.append("Resumed from company runtime suspend checkpoint.")
             task.metadata["progress_log"] = progress[-20:]
 
-            if work_item_id and callable(get_work_item) and callable(update_work_item):
+            if work_item_id:
                 if work_item is None:
                     try:
                         work_item = await get_work_item(work_item_id)
                     except Exception:
-                        work_item = None
+                        logger.opt(exception=True).error(
+                            "company runtime resume: failed to reload authoritative work item {}",
+                            work_item_id,
+                        )
+                        raise
                 if work_item is not None and getattr(work_item, "phase", None) not in {Phase.APPROVED, Phase.FAILED, Phase.CANCELLED}:
                     phase_kwargs: dict[str, Any] = {}
                     if target_phase is not None and target_phase not in DONE_PHASES:
@@ -5787,7 +6114,10 @@ class OPCEngine:
                                 claimed_by_seat_id="",
                             )
                         except Exception:
-                            logger.opt(exception=True).debug("company runtime resume: fallback hold clear failed")
+                            logger.opt(exception=True).error(
+                                "company runtime resume: authoritative fallback hold clear failed"
+                            )
+                            raise
 
             role_session_id = str(task.metadata.get("delegation_role_session_id", "") or "").strip()
             if role_session_id and callable(update_role_session):
@@ -5821,27 +6151,33 @@ class OPCEngine:
         if not parent_session_id:
             return
         checkpoint_id = str(payload.get("checkpoint_id", "") or "").strip()
-        try:
-            tasks = await self.store.get_tasks(project_id=self.project_id or "default")
-        except Exception:
-            tasks = []
-        for task in tasks:
-            session_id = str(getattr(task, "session_id", "") or "").strip()
-            task_parent_session_id = str(getattr(task, "parent_session_id", "") or "").strip()
-            if session_id != parent_session_id or task_parent_session_id:
-                continue
-            metadata = dict(getattr(task, "metadata", {}) or {})
-            had_control_state = any(key in metadata for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS)
-            if not had_control_state:
-                continue
-            for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS:
-                metadata.pop(key, None)
-            metadata["company_runtime_resume_checkpoint_id"] = checkpoint_id
-            metadata["company_runtime_resume_requested_at"] = datetime.now().isoformat()
-            task.metadata = metadata
-            task.execution_lock = False
-            task.execution_locked_at = None
-            await self.store.save_task(task)
+        identity_index = await load_company_runtime_identity_index(
+            self.store,
+            self.project_id or "default",
+        )
+        identity = identity_index.resolve(
+            runtime_session_id=parent_session_id,
+            checkpoint_id=checkpoint_id,
+        )
+        if identity is None or not identity.ui_anchor_task_id:
+            return
+        task = identity_index.task(identity.ui_anchor_task_id)
+        if task is None or not is_pure_company_ui_anchor(
+            task,
+            identity.runtime_session_id,
+        ):
+            return
+        metadata = dict(getattr(task, "metadata", {}) or {})
+        if not any(key in metadata for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS):
+            return
+        for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS:
+            metadata.pop(key, None)
+        metadata["company_runtime_resume_checkpoint_id"] = checkpoint_id
+        metadata["company_runtime_resume_requested_at"] = datetime.now().isoformat()
+        task.metadata = metadata
+        task.execution_lock = False
+        task.execution_locked_at = None
+        await self.store.save_task(task)
 
     @staticmethod
     def _clear_pending_reorg_marker(task: Task) -> None:
@@ -6041,74 +6377,9 @@ class OPCEngine:
         }
         return run_adapter, resume_metadata
 
-    @staticmethod
-    def _pid_is_running(pid: int | None) -> bool:
-        if not pid or pid <= 0:
-            return False
-        if os.name == "nt":
-            try:
-                import ctypes
-                from ctypes import wintypes
-
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                open_process = kernel32.OpenProcess
-                open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-                open_process.restype = wintypes.HANDLE
-                close_handle = kernel32.CloseHandle
-                close_handle.argtypes = [wintypes.HANDLE]
-                close_handle.restype = wintypes.BOOL
-                get_exit_code = kernel32.GetExitCodeProcess
-                get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-                get_exit_code.restype = wintypes.BOOL
-
-                process_query_limited_information = 0x1000
-                still_active = 259
-                handle = open_process(process_query_limited_information, False, int(pid))
-                if not handle:
-                    error = ctypes.get_last_error()
-                    # Access denied means a process exists but cannot be queried.
-                    return error == 5
-                try:
-                    exit_code = wintypes.DWORD()
-                    if not get_exit_code(handle, ctypes.byref(exit_code)):
-                        return True
-                    return int(exit_code.value) == still_active
-                finally:
-                    close_handle(handle)
-            except Exception:
-                return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-
     async def _task_runtime_is_live(self, task: Task) -> bool:
-        if task.id in self._active_task_runs:
-            return True
-        session = await self._load_latest_external_session_for_task(task)
-        if not session:
-            return False
-        status = str(getattr(session, "status", "") or "").strip().lower()
-        if status not in {"starting", "running", "working"}:
-            return False
-        metadata = dict(getattr(session, "metadata", {}) or {})
-        try:
-            pid = int(metadata.get("pid"))
-        except (TypeError, ValueError):
-            pid = None
-        if self._pid_is_running(pid):
-            return True
-        try:
-            heartbeat_seconds = max(1, int(metadata.get("status_heartbeat_seconds", 5) or 5))
-        except (TypeError, ValueError):
-            heartbeat_seconds = 5
-        age_seconds = (datetime.now() - session.updated_at).total_seconds()
-        return age_seconds <= max(heartbeat_seconds * 3, 15)
+        project_id = str(task.project_id or self.project_id or "default").strip() or "default"
+        return self._active_task_run_registry.is_active(project_id, task.id)
 
     def _describe_interrupted_task_reason(self, task: Task, session: Any | None) -> str:
         projection_id = str(projection_id_for_task(task) or task.title or task.id).strip()
@@ -6289,117 +6560,6 @@ class OPCEngine:
             return True
         return bool(str(metadata.get("feedback_scope", "") or "").strip())
 
-    async def _resolved_human_wait_checkpoint_task_ids(self) -> set[str]:
-        """Task ids whose human-wait checkpoint was already answered.
-
-        Covers ``task_user_input`` / ``company_work_item_gate`` checkpoints in
-        ``resolved`` status: the human replied, so a task still parked in
-        ``awaiting_human`` for one of these ids is waiting on input that was
-        already given (the resume was interrupted before the state machine
-        advanced) and can be safely reopened.
-        """
-        if not self.store:
-            return set()
-        try:
-            checkpoints = await self.store.get_execution_checkpoints(
-                project_id=self.project_id or "default",
-                checkpoint_types=["task_user_input", "company_work_item_gate"],
-                statuses=["resolved"],
-            )
-        except Exception:
-            logger.opt(exception=True).debug(
-                "resolved_human_wait_checkpoint_task_ids: checkpoint load failed"
-            )
-            return set()
-        task_ids: set[str] = set()
-        for checkpoint in checkpoints or []:
-            payload = dict(getattr(checkpoint, "payload", {}) or {})
-            task_id = str(
-                checkpoint.task_id
-                or payload.get("waiting_task_id", "")
-                or payload.get("task_id", "")
-                or ""
-            ).strip()
-            if task_id:
-                task_ids.add(task_id)
-        return task_ids
-
-    async def _reopen_answered_human_waits(self, tasks: list[Task]) -> int:
-        """Reverse self-heal for company tasks stuck on an answered human wait.
-
-        A task parked in ``awaiting_human`` whose park checkpoint was already
-        RESOLVED means the human answered but the resume was cut off before the
-        work item advanced (process death between checkpoint resolution and
-        phase write). Reopen it for dispatch instead of preserving a wait
-        nobody can end. Mirror direction of the stale-checkpoint self-heal.
-        """
-        if not self.store or not tasks:
-            return 0
-        candidates = [
-            task
-            for task in tasks
-            if task.status == TaskStatus.AWAITING_HUMAN
-            and str((task.metadata or {}).get("dispatch_hold", "") or "").strip() != "company_runtime_suspended"
-            and str((task.metadata or {}).get("company_runtime_stop_state", "") or "").strip()
-            not in {"suspending", "suspended"}
-            and not self._is_company_feedback_waiting_task(task)
-        ]
-        if not candidates:
-            return 0
-        try:
-            pending_checkpoints = await self.store.get_pending_checkpoints(
-                project_id=self.project_id or "default"
-            )
-        except Exception:
-            logger.opt(exception=True).debug(
-                "reopen_answered_human_waits: pending checkpoint load failed"
-            )
-            return 0
-        pending_task_ids = {
-            str(
-                checkpoint.task_id
-                or checkpoint.payload.get("waiting_task_id")
-                or checkpoint.payload.get("task_id")
-                or ""
-            ).strip()
-            for checkpoint in pending_checkpoints or []
-        }
-        candidates = [task for task in candidates if task.id not in pending_task_ids]
-        if not candidates:
-            return 0
-        resolved_task_ids = await self._resolved_human_wait_checkpoint_task_ids()
-        updated = 0
-        for task in candidates:
-            if task.id not in resolved_task_ids:
-                continue
-            if await self._reopen_answered_human_wait_after_restart(task):
-                updated += 1
-        return updated
-
-    async def _reopen_answered_human_wait_after_restart(self, task: Task) -> bool:
-        """Reopen an ``awaiting_human`` task whose checkpoint was already resolved."""
-        if not self.store:
-            return False
-        released = await self._release_work_item_human_wait(
-            task, reason="startup_resolved_checkpoint"
-        )
-        task.metadata = dict(task.metadata or {})
-        task.metadata["startup_reconcile_reopened_answered_wait"] = {
-            "detected_at": datetime.now().isoformat(),
-            "previous_status": getattr(task.status, "value", str(task.status)),
-            "work_item_phase_released": released,
-        }
-        task.status = TaskStatus.PENDING
-        task.result = None
-        await self.store.save_task(task)
-        logger.info(
-            "Startup recovery reopened task {} left in awaiting_human with an already-resolved "
-            "human-wait checkpoint (work_item_released={})",
-            task.id,
-            released,
-        )
-        return True
-
     async def _preserve_stable_waiting_task_after_restart(
         self,
         task: Task,
@@ -6417,12 +6577,22 @@ class OPCEngine:
         if not self.store:
             return False
         task.metadata = dict(task.metadata or {})
-        task.metadata["startup_reconcile_preserved_waiting_state"] = {
-            "detected_at": datetime.now().isoformat(),
-            "status": getattr(task.status, "value", str(task.status)),
-            "reason": reason,
-        }
-        await self.store.save_task(task)
+        status_value = getattr(task.status, "value", str(task.status))
+        existing_preserved = dict(
+            task.metadata.get("startup_reconcile_preserved_waiting_state", {})
+            or {}
+        )
+        marker_changed = (
+            str(existing_preserved.get("status", "") or "") != status_value
+            or str(existing_preserved.get("reason", "") or "") != reason
+        )
+        if marker_changed:
+            task.metadata["startup_reconcile_preserved_waiting_state"] = {
+                "detected_at": datetime.now().isoformat(),
+                "status": status_value,
+                "reason": reason,
+            }
+            await self.store.save_task(task)
         restored_checkpoint = False
         if self._is_company_feedback_waiting_task(task):
             try:
@@ -6436,11 +6606,141 @@ class OPCEngine:
         if restored_checkpoint:
             task.metadata = dict(task.metadata or {})
             preserved = dict(task.metadata.get("startup_reconcile_preserved_waiting_state", {}) or {})
-            preserved["restored_checkpoint_type"] = "company_delivery_feedback"
-            preserved["restored_checkpoint_at"] = datetime.now().isoformat()
-            task.metadata["startup_reconcile_preserved_waiting_state"] = preserved
+            if not str(preserved.get("restored_checkpoint_type", "") or "").strip():
+                preserved["restored_checkpoint_type"] = "company_delivery_feedback"
+                preserved["restored_checkpoint_at"] = datetime.now().isoformat()
+                task.metadata["startup_reconcile_preserved_waiting_state"] = preserved
+                await self.store.save_task(task)
+                marker_changed = True
+        return marker_changed or restored_checkpoint
+
+    def _company_runtime_plan_for_tasks(
+        self,
+        tasks: list[Task],
+    ) -> CompanyWorkItemRuntimePlan:
+        for task in sorted(tasks, key=lambda item: (item.created_at, item.id), reverse=True):
+            candidate = serialized_company_plan_from_metadata(task.metadata)
+            if candidate:
+                return deserialize_company_work_item_runtime_plan(candidate)
+        sample = tasks[0]
+        return CompanyWorkItemRuntimePlan(
+            profile=str(
+                (sample.metadata or {}).get("company_profile", "")
+                or getattr(self.config.org, "company_profile", "corporate")
+            ).strip()
+            or "corporate",
+            metadata={
+                "execution_model": str(
+                    (sample.metadata or {}).get("execution_model", "") or "multi_team_org"
+                ).strip()
+                or "multi_team_org",
+                "work_item_driven": True,
+            },
+        )
+
+    async def _normalize_legacy_company_interruption(
+        self,
+        task: Task,
+    ) -> dict[str, Any] | None:
+        """Convert the old FAILED+marker patch into checkpoint-ready state.
+
+        A work item whose authoritative phase is genuinely terminal is never
+        revived.  The old recovery marker, interrupted result artifact, or a
+        PAUSED work-item phase is accepted only as evidence that FAILED was a
+        crash projection rather than a business outcome.
+        """
+        if not self.store or task.status != TaskStatus.FAILED:
+            return None
+        metadata = dict(task.metadata or {})
+        marker = metadata.get("interrupted_recovery")
+        marker = dict(marker) if isinstance(marker, dict) else {}
+        result = dict(task.result or {})
+        artifacts = dict(result.get("artifacts", {}) or {})
+        work_item_id = linked_work_item_id_for_task(task)
+        work_item = None
+        if work_item_id:
+            getter = getattr(self.store, "get_delegation_work_item", None)
+            if callable(getter):
+                try:
+                    work_item = await getter(work_item_id)
+                except Exception:
+                    work_item = None
+        phase = getattr(work_item, "phase", None)
+        if phase in {Phase.APPROVED, Phase.FAILED, Phase.CANCELLED}:
+            return None
+        previous_status_value = str(
+            marker.get("previous_status")
+            or artifacts.get("interrupted_previous_status")
+            or ""
+        ).strip()
+        interrupted_artifact = bool(artifacts.get("interrupted", False))
+        paused_work_item = phase == Phase.PAUSED
+        if not previous_status_value and not interrupted_artifact and not paused_work_item:
+            return None
+
+        previous_status = None
+        if previous_status_value:
+            try:
+                candidate = TaskStatus(previous_status_value)
+            except ValueError:
+                candidate = None
+            if candidate not in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                previous_status = candidate
+        if paused_work_item:
+            target_status = task_status_for_phase(Phase.PAUSED)
+        else:
+            target_status = previous_status or TaskStatus.PENDING
+
+        provenance = {
+            "task_id": task.id,
+            "work_item_id": work_item_id or "",
+            "legacy_failed_status": TaskStatus.FAILED.value,
+            "restored_status": target_status.value,
+            "work_item_phase": phase.value if isinstance(phase, Phase) else str(phase or ""),
+            "interrupted_recovery": marker,
+            "interrupted_artifacts": {
+                key: artifacts.get(key)
+                for key in (
+                    "interrupted",
+                    "interrupted_detected_at",
+                    "interrupted_previous_status",
+                    "latest_external_session_status",
+                    "latest_external_session_updated_at",
+                )
+                if key in artifacts
+            },
+        }
+        task.status = target_status
+        task.execution_lock = False
+        task.execution_locked_at = None
+        return provenance
+
+    async def _clear_migrated_company_interruption_markers(
+        self,
+        tasks: list[Task],
+        migrated_task_ids: set[str],
+    ) -> None:
+        if not self.store or not migrated_task_ids:
+            return
+        artifact_keys = {
+            "interrupted",
+            "interrupted_detected_at",
+            "interrupted_previous_status",
+            "latest_external_session_status",
+            "latest_external_session_updated_at",
+        }
+        for task in tasks:
+            if task.id not in migrated_task_ids:
+                continue
+            task.metadata = dict(task.metadata or {})
+            task.metadata.pop("interrupted_recovery", None)
+            if task.result:
+                task.result = dict(task.result)
+                artifacts = dict(task.result.get("artifacts", {}) or {})
+                for key in artifact_keys:
+                    artifacts.pop(key, None)
+                task.result["artifacts"] = artifacts
             await self.store.save_task(task)
-        return True
 
     async def _reconcile_company_runtime_state(
         self,
@@ -6452,19 +6752,53 @@ class OPCEngine:
             return 0
         project_id = self.project_id or "default"
         pending_checkpoints = await self.store.get_pending_checkpoints(project_id=project_id)
-        pending_suspend_checkpoint = await self.get_active_company_runtime_suspend_checkpoint(parent_session_id)
+        legacy_provenance: list[dict[str, Any]] = []
+        for task in tasks:
+            provenance = await self._normalize_legacy_company_interruption(task)
+            if provenance is not None:
+                legacy_provenance.append(provenance)
+        migrated_task_ids = {
+            str(item.get("task_id", "") or "").strip()
+            for item in legacy_provenance
+            if str(item.get("task_id", "") or "").strip()
+        }
+        normalize_active = getattr(
+            self.store,
+            "normalize_active_execution_checkpoints",
+            None,
+        )
+        if callable(normalize_active):
+            pending_suspend_checkpoint = await normalize_active(
+                project_id=project_id,
+                session_id=parent_session_id,
+                checkpoint_types=_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES,
+            )
+        else:
+            pending_suspend_checkpoint = await self.get_active_company_runtime_suspend_checkpoint(
+                parent_session_id
+            )
         if pending_suspend_checkpoint is not None:
             payload = dict(pending_suspend_checkpoint.payload or {})
-            if str(getattr(pending_suspend_checkpoint, "status", "") or "").strip() == "resuming":
-                await self._mark_company_runtime_checkpoint_status(
-                    pending_suspend_checkpoint,
-                    status="pending",
-                    payload_updates={
-                        **payload,
+            checkpoint_status = str(getattr(pending_suspend_checkpoint, "status", "") or "").strip()
+            if checkpoint_status == "resuming" or legacy_provenance:
+                payload_updates: dict[str, Any] = {}
+                if checkpoint_status == "resuming":
+                    payload_updates.update({
                         "resume_state": "interrupted",
                         "resume_interrupted_at": datetime.now().isoformat(),
-                    },
+                    })
+                if legacy_provenance:
+                    payload_updates["legacy_interrupted_recovery"] = legacy_provenance
+                transitioned = await self._mark_company_runtime_checkpoint_status(
+                    pending_suspend_checkpoint,
+                    status="pending",
+                    payload_updates=payload_updates,
+                    expected_statuses={checkpoint_status},
                 )
+                if not transitioned:
+                    return 0
+                payload = dict(pending_suspend_checkpoint.payload or {})
+            await self._clear_migrated_company_interruption_markers(tasks, migrated_task_ids)
             affected = await self._suspend_company_runtime_tasks(
                 tasks,
                 reason=str(payload.get("reason", "") or "startup_recovery"),
@@ -6480,6 +6814,7 @@ class OPCEngine:
                 if str(getattr(task, "session_id", "") or "").strip()
             },
         }
+        group_task_ids = {str(task.id or "").strip() for task in tasks}
         checkpoint_task_ids = {
             str(
                 checkpoint.task_id
@@ -6495,59 +6830,133 @@ class OPCEngine:
                     or checkpoint.payload.get("waiting_task_id")
                     or checkpoint.payload.get("task_id")
                     or ""
-                ).strip()
+                ).strip() in group_task_ids
             )
         }
         updated = 0
-        stale_running_tasks: list[Task] = []
+        interrupted_tasks: list[Task] = []
+        get_work_item = getattr(
+            self.store,
+            "get_delegation_work_item",
+            None,
+        )
         for task in tasks:
             task_metadata = dict(getattr(task, "metadata", {}) or {})
             if (
                 str(task_metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended"
                 or str(task_metadata.get("company_runtime_stop_state", "") or "").strip() in {"suspending", "suspended"}
             ):
+                interrupted_tasks.append(task)
+                continue
+            work_item_id = linked_work_item_id_for_task(task)
+            work_item = (
+                await get_work_item(work_item_id)
+                if work_item_id and callable(get_work_item)
+                else None
+            )
+            work_item_phase = getattr(work_item, "phase", None)
+            # A linked WorkItem is the company workflow state.  Task.status is
+            # only its UI/execution projection and may lag on either side of a
+            # crash.  Fall back to Task status only for legacy envelopes that
+            # have no durable WorkItem.
+            stable_review_wait = (
+                work_item_phase in IN_REVIEW_PHASES
+                if work_item is not None
+                else task.status in _REVIEW_WAITING_STATUSES
+            )
+            if stable_review_wait:
+                if task.id not in checkpoint_task_ids:
+                    waiting_label = (
+                        work_item_phase.value
+                        if isinstance(work_item_phase, Phase)
+                        else task.status.value
+                    )
+                    reason = (
+                        f"Work item `{projection_id_for_task(task) or task.title}` was left in "
+                        f"`{waiting_label}` but no pending checkpoint could be found after restart. "
+                        "Preserving stable waiting state."
+                    )
+                    if await self._preserve_stable_waiting_task_after_restart(
+                        task,
+                        reason=reason,
+                        plan=plan,
+                        tasks=tasks,
+                    ):
+                        updated += 1
+                continue
+            if task.id in checkpoint_task_ids and (
+                task.status in _WAITING_TASK_STATUSES
+                or work_item_phase == Phase.WAITING_FOR_PEER
+            ):
+                # A durable peer/specialized wait already owns this Task.
+                # Startup must not layer a company-runtime interruption over
+                # that independent waiting checkpoint.
+                continue
+            if work_item is not None and work_item_phase not in DONE_PHASES:
+                # A controller coroutine is required to dispatch READY work,
+                # revisit dependency waits, and finalize RUNNING work.  After
+                # process start the registry is empty, so every such WorkItem
+                # is interrupted even when its Task projection is still
+                # PENDING/BLOCKED or was prematurely terminalized.
+                interrupted_tasks.append(task)
                 continue
             if task.status == TaskStatus.RUNNING and not await self._task_runtime_is_live(task):
-                stale_running_tasks.append(task)
-                continue
-            if task.status in _REVIEW_WAITING_STATUSES and task.id not in checkpoint_task_ids:
-                reason = (
-                    f"Work item `{projection_id_for_task(task) or task.title}` was left in "
-                    f"`{task.status.value}` but no pending checkpoint could be found after restart. "
-                    "Preserving stable waiting state."
-                )
-                if await self._preserve_stable_waiting_task_after_restart(
-                    task,
-                    reason=reason,
-                    plan=plan,
-                    tasks=tasks,
-                ):
-                    updated += 1
+                interrupted_tasks.append(task)
                 continue
             if task.status in _WAITING_TASK_STATUSES and task.id not in checkpoint_task_ids:
-                reason = (
-                    f"Work item `{projection_id_for_task(task) or task.title}` was left in "
-                    f"`{task.status.value}` but no pending checkpoint could be found after restart. "
-                    "Use `continue` to reopen this work item."
-                )
-                if await self._mark_task_interrupted(task, reason=reason):
-                    updated += 1
-        if stale_running_tasks:
-            origin_task_id = str(getattr(stale_running_tasks[0], "id", "") or "").strip()
-            await self._save_company_runtime_suspend_checkpoint(
+                interrupted_tasks.append(task)
+        if legacy_provenance:
+            interrupted_tasks.extend(
+                task for task in tasks if task.id in migrated_task_ids
+            )
+        if interrupted_tasks:
+            interrupted_task_ids = list(dict.fromkeys(task.id for task in interrupted_tasks))
+            task_by_id = {task.id: task for task in tasks}
+            interrupted_task_objects = [task_by_id[task_id] for task_id in interrupted_task_ids]
+            origin_task_id = str(getattr(interrupted_task_objects[0], "id", "") or "").strip()
+            checkpoint, _created = await self._save_company_runtime_suspend_checkpoint(
                 checkpoint_type="company_runtime_interrupted",
                 reason="startup_recovery",
                 parent_session_id=parent_session_id,
                 origin_task_id=origin_task_id or None,
                 plan=plan,
                 tasks=tasks,
+                payload_updates=(
+                    {"legacy_interrupted_recovery": legacy_provenance}
+                    if legacy_provenance
+                    else None
+                ),
             )
+            if (
+                legacy_provenance
+                and "legacy_interrupted_recovery"
+                not in dict(checkpoint.payload or {})
+            ):
+                transitioned = await self._mark_company_runtime_checkpoint_status(
+                    checkpoint,
+                    status="pending",
+                    payload_updates={
+                        "legacy_interrupted_recovery": legacy_provenance,
+                        "resume_state": "interrupted",
+                        "resume_interrupted_at": datetime.now().isoformat(),
+                    },
+                    expected_statuses={"pending", "resuming"},
+                )
+                if not transitioned:
+                    return updated
+            await self._clear_migrated_company_interruption_markers(tasks, migrated_task_ids)
+            checkpoint_payload = dict(checkpoint.payload or {})
             affected = await self._suspend_company_runtime_tasks(
                 tasks,
-                reason="startup_recovery",
-                checkpoint_type="company_runtime_interrupted",
+                reason=str(checkpoint_payload.get("reason", "") or "startup_recovery"),
+                checkpoint_type=str(
+                    checkpoint.checkpoint_type or "company_runtime_interrupted"
+                ),
+                stop_intent_id=str(
+                    checkpoint_payload.get("stop_intent_id", "") or ""
+                ),
             )
-            updated += len(affected) or len(stale_running_tasks)
+            updated += len(affected) or len(interrupted_task_objects)
         return updated
 
     async def _reconcile_interrupted_project_tasks(self) -> int:
@@ -6558,13 +6967,47 @@ class OPCEngine:
         if not tasks:
             return 0
 
-        updated = 0
+        checkpoint_getter = getattr(self.store, "get_execution_checkpoints", None)
+        active_company_checkpoints = (
+            await checkpoint_getter(
+                project_id=project_id,
+                checkpoint_types=list(_COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES),
+                statuses=["pending", "resuming"],
+            )
+            if callable(checkpoint_getter)
+            else []
+        )
+        identity_index = build_company_runtime_identity_index(
+            tasks,
+            active_company_checkpoints,
+        )
+        task_by_id = {task.id: task for task in tasks}
         runtime_groups: dict[str, list[Task]] = {}
+        runtime_task_ids: set[str] = set()
+        ui_anchor_task_ids: set[str] = set()
+        for identity in identity_index.identities:
+            if identity.ui_anchor_task_id:
+                ui_anchor_task_ids.add(identity.ui_anchor_task_id)
+            group = [
+                task_by_id[task_id]
+                for task_id in identity.runtime_task_ids
+                if task_id != identity.ui_anchor_task_id
+                and task_id in task_by_id
+                and is_company_runtime_task(task_by_id[task_id])
+            ]
+            if group:
+                runtime_groups[identity.runtime_session_id] = group
+                runtime_task_ids.update(task.id for task in group)
+
+        updated = 0
+        for anchor_task_id in ui_anchor_task_ids:
+            anchor = task_by_id.get(anchor_task_id)
+            if anchor is not None and anchor.status == TaskStatus.RUNNING:
+                if await self._clear_stale_company_session_anchor(anchor):
+                    updated += 1
+
         for task in tasks:
-            projection_id = projection_id_for_task(task)
-            parent_session_id = str(getattr(task, "parent_session_id", "") or "").strip()
-            if projection_id and parent_session_id:
-                runtime_groups.setdefault(parent_session_id, []).append(task)
+            if task.id in runtime_task_ids or task.id in ui_anchor_task_ids:
                 continue
             task_metadata = dict(getattr(task, "metadata", {}) or {})
             if (
@@ -6572,65 +7015,114 @@ class OPCEngine:
                 or str(task_metadata.get("company_runtime_stop_state", "") or "").strip() in {"suspending", "suspended"}
             ):
                 continue
-            if task.status == TaskStatus.RUNNING and not await self._task_runtime_is_live(task):
-                if self._is_company_primary_session_anchor_task(task):
+            if is_company_runtime_task(task):
+                continue
+            if self._is_company_primary_session_anchor_task(task):
+                if task.status == TaskStatus.RUNNING:
                     if await self._clear_stale_company_session_anchor(task):
                         updated += 1
-                    continue
+                continue
+            if task.status == TaskStatus.RUNNING and not await self._task_runtime_is_live(task):
                 session = await self._load_latest_external_session_for_task(task)
                 reason = self._describe_interrupted_task_reason(task, session)
                 if await self._mark_task_interrupted(task, reason=reason, session=session):
                     updated += 1
 
-        if runtime_groups:
-            # Reverse self-heal runs before the plan-gated reconcile below:
-            # modern runs keep the runtime plan in checkpoint payloads /
-            # snapshots rather than task metadata, so groups without a
-            # metadata plan would otherwise skip recovery entirely.
-            updated += await self._reopen_answered_human_waits(
-                [task for group in runtime_groups.values() for task in group]
-            )
-
         for parent_session_id, group in runtime_groups.items():
-            plan_data = None
-            for task in sorted(group, key=lambda item: (item.created_at, item.id), reverse=True):
-                candidate = serialized_company_plan_from_metadata(task.metadata)
-                if candidate:
-                    plan_data = candidate
-                    break
-            if not plan_data:
-                stale_group = [
-                    task
-                    for task in group
-                    if task.status == TaskStatus.RUNNING and not await self._task_runtime_is_live(task)
-                ]
-                if stale_group:
-                    sample = stale_group[0]
-                    fallback_plan = CompanyWorkItemRuntimePlan(
-                        profile=str((sample.metadata or {}).get("company_profile", "") or getattr(self.config.org, "company_profile", "corporate")).strip() or "corporate",
-                        metadata={"execution_model": "multi_team_org", "work_item_driven": True},
-                    )
-                    await self._save_company_runtime_suspend_checkpoint(
-                        checkpoint_type="company_runtime_interrupted",
-                        reason="startup_recovery",
-                        parent_session_id=parent_session_id,
-                        origin_task_id=sample.id,
-                        plan=fallback_plan,
-                        tasks=group,
-                    )
-                    affected = await self._suspend_company_runtime_tasks(
-                        group,
-                        reason="startup_recovery",
-                        checkpoint_type="company_runtime_interrupted",
-                    )
-                    updated += len(affected) or len(stale_group)
-                continue
-            updated += await self._reconcile_company_runtime_state(
+            async with self._active_task_run_registry.scope_lock(
+                project_id,
                 parent_session_id,
-                deserialize_company_work_item_runtime_plan(plan_data),
-                group,
-            )
+            ):
+                updated += await self._reconcile_company_runtime_state(
+                    parent_session_id,
+                    self._company_runtime_plan_for_tasks(group),
+                    group,
+                )
         return updated
+
+    async def prepare_active_company_runtimes_for_shutdown(
+        self,
+        *,
+        _controller_shutdown: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Persist checkpoints for company attempts owned by this controller.
+
+        Callers invoke this before cancelling in-flight session coroutines.  It
+        is safe to call repeatedly: an existing suspended/interrupted
+        checkpoint is reused and never replaced.
+        """
+        self._shutting_down = True
+        if not self._owns_active_task_run_registry and not _controller_shutdown:
+            # Project delegates and CustomRuntimeRunner engines borrow the
+            # controller registry.  Their local teardown must not close
+            # controller-wide admission or checkpoint unrelated attempts.
+            return []
+        if self._owns_active_task_run_registry:
+            self._active_task_run_registry.close_admission()
+        project_id = str(self.project_id or "default").strip() or "default"
+        active_task_ids = self._active_task_run_registry.active_task_ids(project_id)
+        delegate_prepared: list[dict[str, Any]] = []
+        for delegate in list(self._project_engine_delegates.values()):
+            delegate_prepared.extend(
+                await delegate.prepare_active_company_runtimes_for_shutdown(
+                    _controller_shutdown=True,
+                )
+            )
+        if not self.store or not bool(getattr(self.store, "is_ready", True)):
+            return delegate_prepared
+        if not active_task_ids:
+            return delegate_prepared
+        identity_index = await load_company_runtime_identity_index(
+            self.store,
+            project_id,
+        )
+        active_by_scope: dict[str, list[Task]] = {}
+        for task_id in active_task_ids:
+            identity = identity_index.resolve(task_id=task_id)
+            task = identity_index.task(task_id)
+            if (
+                identity is None
+                or task is None
+                or task_id == identity.ui_anchor_task_id
+                or not is_company_runtime_task(task)
+            ):
+                continue
+            active_by_scope.setdefault(identity.runtime_session_id, []).append(task)
+
+        prepared: list[dict[str, Any]] = delegate_prepared
+        for parent_session_id, active_scope_tasks in active_by_scope.items():
+            async with self._active_task_run_registry.scope_lock(
+                project_id,
+                parent_session_id,
+            ):
+                snapshot = await self._load_company_runtime_snapshot(parent_session_id)
+                if snapshot is None:
+                    tasks = active_scope_tasks
+                    plan = self._company_runtime_plan_for_tasks(tasks)
+                else:
+                    plan, tasks = snapshot
+                origin_task_id = str(active_scope_tasks[0].id or "").strip() or None
+                checkpoint, created, affected_task_ids = (
+                    await self._checkpoint_and_suspend_company_runtime_scope(
+                        checkpoint_type="company_runtime_interrupted",
+                        reason="service_shutdown",
+                        parent_session_id=parent_session_id,
+                        origin_task_id=origin_task_id,
+                        plan=plan,
+                        tasks=tasks,
+                    )
+                )
+                idempotent = not created
+                prepared.append(
+                    {
+                        "session_id": parent_session_id,
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "checkpoint_type": checkpoint.checkpoint_type,
+                        "task_ids": affected_task_ids,
+                        "idempotent": idempotent,
+                    }
+                )
+        return prepared
 
     @staticmethod
     def _is_company_primary_session_anchor_task(task: Task) -> bool:
@@ -7999,50 +8491,66 @@ class OPCEngine:
         return native_result
 
     async def _execute_task(self, task: Task) -> TaskResult:
-        self._active_task_runs.add(task.id)
+        project_id = str(task.project_id or self.project_id or "default").strip() or "default"
         try:
-            try:
-                result = await self._run_task_once(task)
-            except asyncio.CancelledError:
-                store = self.store
-                if not store or not bool(getattr(store, "is_ready", True)):
-                    raise
-                try:
-                    fresh = await store.get_task(task.id)
-                except AssertionError:
-                    logger.debug(
-                        "Task cancellation cleanup skipped because store is already closed for task {}",
-                        task.id,
-                    )
-                    raise
-                target = fresh or task
-                if is_work_item_runtime_metadata(getattr(target, "metadata", {}) or {}):
-                    target.metadata = dict(target.metadata or {})
-                    target.metadata["company_runtime_suspended_at"] = datetime.now().isoformat()
-                    target.metadata.setdefault("last_stop_reason", "runtime_cancelled")
-                    target.execution_lock = False
-                    target.execution_locked_at = None
-                    if target.status not in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
-                        if str(target.metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended":
-                            suspended_status = str(target.metadata.get("suspended_task_status", "") or "").strip()
-                            try:
-                                target.status = TaskStatus(suspended_status) if suspended_status else target.status
-                            except ValueError:
-                                pass
-                        else:
-                            target.status = TaskStatus.PENDING
-                    await store.save_task(target)
-                elif target.status != TaskStatus.CANCELLED:
-                    target.status = TaskStatus.CANCELLED
-                    await store.save_task(target)
-                raise
+            attempt_token = self._active_task_run_registry.register(project_id, task.id)
+        except ActiveTaskRunAdmissionClosed as exc:
+            raise asyncio.CancelledError(str(exc)) from exc
+        try:
+            return await self._execute_registered_task_attempt(task)
         finally:
-            self._active_task_runs.discard(task.id)
+            self._active_task_run_registry.unregister(project_id, task.id, attempt_token)
+
+    @staticmethod
+    def _company_runtime_task_has_durable_hold(task: Task | None) -> bool:
+        if task is None or not is_company_runtime_task(task):
+            return False
+        metadata = dict(task.metadata or {})
+        return (
+            str(metadata.get("dispatch_hold", "") or "").strip()
+            == "company_runtime_suspended"
+            or str(metadata.get("company_runtime_stop_state", "") or "").strip()
+            in {"suspending", "suspended"}
+        )
+
+    async def _execute_registered_task_attempt(self, task: Task) -> TaskResult:
+        try:
+            result = await self._run_task_once(task)
+        except asyncio.CancelledError:
+            if self._shutting_down or is_company_runtime_task(task):
+                raise
+            store = self.store
+            if not store or not bool(getattr(store, "is_ready", True)):
+                raise
+            try:
+                fresh = await store.get_task(task.id)
+            except AssertionError:
+                logger.debug(
+                    "Task cancellation cleanup skipped because store is already closed for task {}",
+                    task.id,
+                )
+                raise
+            target = fresh or task
+            if is_company_runtime_task(target):
+                raise
+            if target.status != TaskStatus.CANCELLED:
+                target.status = TaskStatus.CANCELLED
+                await store.save_task(target)
+            raise
         # Re-read task to check if user cancelled during execution
         fresh = await self.store.get_task(task.id)
         if fresh and fresh.status == TaskStatus.CANCELLED:
             logger.info(f"Task {task.id} was cancelled during execution, preserving CANCELLED status")
             return result
+        if self._company_runtime_task_has_durable_hold(fresh):
+            logger.info(
+                "Discarding completed result for task {} because a durable company "
+                "runtime hold won the completion race",
+                task.id,
+            )
+            raise asyncio.CancelledError(
+                "company runtime was suspended before result commit"
+            )
         self._apply_runtime_state_to_task(task, result)
         task.status = result.status
         task.result = {"content": result.content, "artifacts": result.artifacts}
@@ -8116,6 +8624,15 @@ class OPCEngine:
             if fresh and fresh.status == TaskStatus.CANCELLED:
                 logger.info(f"Task {task.id} was cancelled during retry, preserving CANCELLED status")
                 return result
+            if self._company_runtime_task_has_durable_hold(fresh):
+                logger.info(
+                    "Discarding retry result for task {} because a durable company "
+                    "runtime hold won the completion race",
+                    task.id,
+                )
+                raise asyncio.CancelledError(
+                    "company runtime was suspended before retry result commit"
+                )
             self._apply_runtime_state_to_task(task, result)
             task.status = result.status
             task.result = {"content": result.content, "artifacts": result.artifacts}
@@ -9506,13 +10023,7 @@ class OPCEngine:
         return await self._ensure_checkpoint_runtime_v2_payload(selected_suspend_checkpoint) if selected_suspend_checkpoint else None
 
     async def _company_runtime_parent_session_for_session_id(self, session_id: str | None) -> str:
-        """Return the company runtime parent session for a child work-item session.
-
-        Stop/resume checkpoints are stored on the primary company session. If the
-        UI sends a follow-up from a child work-item chat, the engine must still
-        resume the suspended parent runtime instead of treating the text as a new
-        company-mode request.
-        """
+        """Resolve any durable task session to its company runtime session."""
         if not self.store:
             return ""
         sid = str(session_id or "").strip()
@@ -9521,29 +10032,23 @@ class OPCEngine:
         try:
             get_by_session = getattr(self.store, "get_tasks_by_session_id", None)
             if callable(get_by_session):
-                # Targeted lookup: this runs on every UI sync tick, and loading
-                # every task in the project rescans the whole tasks table.
-                tasks = await get_by_session(sid, project_id=self.project_id or "default")
+                tasks = await get_by_session(
+                    sid,
+                    project_id=self.project_id or "default",
+                )
+                identity_index = build_company_runtime_identity_index(tasks)
             else:
-                tasks = await self.store.get_tasks(project_id=self.project_id or "default")
+                identity_index = await load_company_runtime_identity_index(
+                    self.store,
+                    self.project_id or "default",
+                )
+            identity = identity_index.resolve(task_session_id=sid)
         except Exception:
-            logger.opt(exception=True).debug("failed to load tasks while resolving company parent session")
+            logger.opt(exception=True).debug(
+                "failed to resolve company runtime session identity"
+            )
             return ""
-        for task in tasks:
-            task_session_id = str(getattr(task, "session_id", "") or "").strip()
-            if task_session_id != sid:
-                continue
-            parent_session_id = str(getattr(task, "parent_session_id", "") or "").strip()
-            if parent_session_id and parent_session_id != sid:
-                metadata = dict(getattr(task, "metadata", {}) or {})
-                if (
-                    work_item_projection_id_from_metadata(metadata)
-                    or is_work_item_runtime_metadata(metadata)
-                    or str(metadata.get("delegation_work_item_id", "") or "").strip()
-                    or str(metadata.get("linked_work_item_id", "") or "").strip()
-                ):
-                    return parent_session_id
-        return ""
+        return str(getattr(identity, "runtime_session_id", "") or "").strip()
 
     @staticmethod
     def _checkpoint_is_user_visible(checkpoint: ExecutionCheckpoint) -> bool:
@@ -10011,18 +10516,44 @@ class OPCEngine:
         *,
         status: str,
         payload_updates: dict[str, Any] | None = None,
-    ) -> None:
+        expected_statuses: set[str] | None = None,
+    ) -> bool:
         if not self.store:
-            return
+            return False
         payload = {**dict(checkpoint.payload or {}), **dict(payload_updates or {})}
+        updated_at = datetime.now()
+        expected = {
+            str(item).strip()
+            for item in set(expected_statuses or set())
+            if str(item).strip()
+        }
+        compare_and_set = getattr(
+            self.store,
+            "compare_and_set_execution_checkpoint",
+            None,
+        )
+        if expected and callable(compare_and_set):
+            transitioned = await compare_and_set(
+                checkpoint.checkpoint_id,
+                expected_statuses=expected,
+                status=status,
+                payload=payload,
+                updated_at=updated_at,
+            )
+            if not transitioned:
+                return False
         checkpoint.payload = payload
         checkpoint.status = status
-        checkpoint.updated_at = datetime.now()
+        checkpoint.updated_at = updated_at
         save_checkpoint = getattr(self.store, "save_execution_checkpoint", None)
-        if callable(save_checkpoint):
+        if callable(save_checkpoint) and not (expected and callable(compare_and_set)):
             await save_checkpoint(checkpoint)
-            return
-        await self.store.resolve_execution_checkpoint(checkpoint.checkpoint_id, status=status)
+        elif not (expected and callable(compare_and_set)):
+            await self.store.resolve_execution_checkpoint(
+                checkpoint.checkpoint_id,
+                status=status,
+            )
+        return True
 
     async def _reset_company_executor_runtime_for_resume(
         self,
@@ -10070,6 +10601,158 @@ class OPCEngine:
         payload["checkpoint_type"] = checkpoint.checkpoint_type
         return payload, parent_session_id, plan, tasks
 
+    async def _resolve_company_runtime_ui_anchor_task_id(
+        self,
+        *,
+        parent_session_id: str,
+        checkpoint_id: str,
+    ) -> str:
+        if not self.store:
+            return ""
+        identity_index = await load_company_runtime_identity_index(
+            self.store,
+            self.project_id or "default",
+        )
+        identity = identity_index.resolve(
+            runtime_session_id=parent_session_id,
+            checkpoint_id=checkpoint_id,
+        )
+        return str(getattr(identity, "ui_anchor_task_id", "") or "").strip()
+
+    async def _restore_company_suspend_checkpoint_pending(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        parent_session_id: str,
+        tasks: list[Task],
+        resume_state: str,
+        error: BaseException | str,
+    ) -> None:
+        """Fail a resume closed: restore the durable hold before publishing pending."""
+
+        if not self.store:
+            return
+        project_id = str(self.project_id or "default").strip() or "default"
+        async with self._active_task_run_registry.scope_lock(
+            project_id,
+            parent_session_id,
+        ):
+            current = await self._load_execution_checkpoint_by_id(
+                checkpoint.checkpoint_id
+            )
+            if current is None or str(current.status or "").strip() == "resolved":
+                return
+            payload = dict(current.payload or checkpoint.payload or {})
+            await self._suspend_company_runtime_tasks(
+                tasks,
+                reason="resume_failed",
+                checkpoint_type=str(
+                    current.checkpoint_type
+                    or checkpoint.checkpoint_type
+                    or "company_runtime_interrupted"
+                ),
+                stop_intent_id=str(payload.get("stop_intent_id", "") or ""),
+            )
+            error_text = str(error).strip() or type(error).__name__
+            transitioned = await self._mark_company_runtime_checkpoint_status(
+                current,
+                status="pending",
+                payload_updates={
+                    "resume_state": resume_state,
+                    "resume_failed_at": datetime.now().isoformat(),
+                    "resume_error": error_text,
+                },
+                expected_statuses={"resuming"},
+            )
+            if not transitioned:
+                refreshed = await self._load_execution_checkpoint_by_id(
+                    checkpoint.checkpoint_id
+                )
+                if refreshed is None:
+                    return
+                current = refreshed
+            checkpoint.status = current.status
+            checkpoint.payload = dict(current.payload or {})
+            checkpoint.updated_at = current.updated_at
+
+    async def _restore_company_suspend_checkpoint_pending_after_cancellation(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        parent_session_id: str,
+        tasks: list[Task],
+        resume_state: str,
+        error: BaseException,
+    ) -> None:
+        recovery = asyncio.create_task(
+            self._restore_company_suspend_checkpoint_pending(
+                checkpoint,
+                parent_session_id=parent_session_id,
+                tasks=tasks,
+                resume_state=resume_state,
+                error=error,
+            )
+        )
+        try:
+            await asyncio.shield(recovery)
+        except asyncio.CancelledError:
+            await recovery
+
+    async def _complete_company_suspend_checkpoint_resume(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        parent_session_id: str,
+    ) -> None:
+        """Publish one successful resume and its UI projection as one boundary."""
+
+        if not self.store:
+            return
+        project_id = str(self.project_id or "default").strip() or "default"
+        async with self._active_task_run_registry.scope_lock(
+            project_id,
+            parent_session_id,
+        ):
+            current = await self._load_execution_checkpoint_by_id(
+                checkpoint.checkpoint_id
+            )
+            if current is None or str(current.status or "").strip() != "resuming":
+                raise RuntimeError(
+                    "company runtime resume was interrupted before completion"
+                )
+            payload = dict(current.payload or {})
+            resolved_at = datetime.now()
+            resolved_payload = {
+                **payload,
+                "resume_state": "handoff_complete",
+                "resume_handoff_at": resolved_at.isoformat(),
+                "resume_resolved_at": resolved_at.isoformat(),
+            }
+            transitioned = (
+                await self.store.complete_execution_checkpoint_and_reopen_ui_anchor(
+                    current.checkpoint_id,
+                    project_id=project_id,
+                    session_id=parent_session_id,
+                    expected_status="resuming",
+                    status="resolved",
+                    payload=resolved_payload,
+                    ui_anchor_task_id=str(
+                        payload.get("ui_anchor_task_id", "") or ""
+                    ).strip(),
+                    updated_at=resolved_at,
+                )
+            )
+            if not transitioned:
+                raise RuntimeError(
+                    "company runtime checkpoint changed during resume completion"
+                )
+            current.status = "resolved"
+            current.payload = resolved_payload
+            current.updated_at = resolved_at
+            checkpoint.status = current.status
+            checkpoint.payload = dict(current.payload or {})
+            checkpoint.updated_at = current.updated_at
+
     async def _handoff_company_suspend_checkpoint(
         self,
         checkpoint: ExecutionCheckpoint,
@@ -10078,50 +10761,121 @@ class OPCEngine:
         parent_session_id: str,
         tasks: list[Task],
         resume_task_ids: set[str] | None = None,
-    ) -> list[Task]:
+    ) -> tuple[list[Task], CompanyExecutorDriverOwnership | None] | None:
         assert self.company_executor
-        await self._mark_company_runtime_checkpoint_status(
-            checkpoint,
-            status="resuming",
-            payload_updates={
-                **payload,
-                "resume_state": "resuming",
-                "resume_started_at": datetime.now().isoformat(),
-            },
-        )
+        if not self.store:
+            return None
+        project_id = str(self.project_id or "default").strip() or "default"
+        claimed = False
+        driver_ownership: CompanyExecutorDriverOwnership | None = None
         try:
-            tasks = await self._prepare_company_runtime_tasks_for_resume(
-                tasks,
-                payload,
-                resume_task_ids=resume_task_ids,
-            )
-            await self._reset_company_executor_runtime_for_resume(tasks, payload)
-            await self._clear_company_runtime_parent_stop_state(parent_session_id, payload)
-            if parent_session_id:
-                self._reregister_company_runtime_children(tasks, checkpoint_session_id=parent_session_id)
-        except Exception as exc:
-            await self._mark_company_runtime_checkpoint_status(
-                checkpoint,
-                status="pending",
-                payload_updates={
-                    **dict(checkpoint.payload or {}),
-                    "resume_state": "failed_before_handoff",
-                    "resume_failed_at": datetime.now().isoformat(),
-                    "resume_error": str(exc),
-                },
-            )
+            async with self._active_task_run_registry.scope_lock(
+                project_id,
+                parent_session_id,
+            ):
+                current = await self._load_execution_checkpoint_by_id(
+                    checkpoint.checkpoint_id
+                )
+                if current is None or str(current.status or "").strip() != "pending":
+                    return None
+                checkpoint.status = current.status
+                checkpoint.payload = dict(current.payload or {})
+                checkpoint.updated_at = current.updated_at
+                ui_anchor_task_id = await self._resolve_company_runtime_ui_anchor_task_id(
+                    parent_session_id=parent_session_id,
+                    checkpoint_id=checkpoint.checkpoint_id,
+                )
+                transitioned = await self._mark_company_runtime_checkpoint_status(
+                    checkpoint,
+                    status="resuming",
+                    payload_updates={
+                        **payload,
+                        "resume_state": "resuming",
+                        "resume_started_at": datetime.now().isoformat(),
+                        "ui_anchor_task_id": ui_anchor_task_id,
+                    },
+                    expected_statuses={"pending"},
+                )
+                if transitioned is False:
+                    return None
+                claimed = True
+                driver_ownership = self._acquire_company_executor_driver_ownership(
+                    tasks,
+                    preferred_task_ids=resume_task_ids,
+                )
+                tasks = await self._prepare_company_runtime_tasks_for_resume(
+                    tasks,
+                    payload,
+                    resume_task_ids=resume_task_ids,
+                )
+                await self._reset_company_executor_runtime_for_resume(tasks, payload)
+                await self._clear_company_runtime_parent_stop_state(
+                    parent_session_id,
+                    payload,
+                )
+                if parent_session_id:
+                    self._reregister_company_runtime_children(
+                        tasks,
+                        checkpoint_session_id=parent_session_id,
+                    )
+        except asyncio.CancelledError as exc:
+            if driver_ownership is not None:
+                driver_ownership.release()
+            if claimed:
+                await self._restore_company_suspend_checkpoint_pending_after_cancellation(
+                    checkpoint,
+                    parent_session_id=parent_session_id,
+                    tasks=tasks,
+                    resume_state="failed_before_handoff",
+                    error=exc,
+                )
             raise
-        await self._mark_company_runtime_checkpoint_status(
-            checkpoint,
-            status="resolved",
-            payload_updates={
-                **dict(checkpoint.payload or {}),
-                "resume_state": "handoff_complete",
-                "resume_handoff_at": datetime.now().isoformat(),
-                "resume_resolved_at": datetime.now().isoformat(),
-            },
+        except Exception as exc:
+            if driver_ownership is not None:
+                driver_ownership.release()
+            if claimed:
+                await self._restore_company_suspend_checkpoint_pending(
+                    checkpoint,
+                    parent_session_id=parent_session_id,
+                    tasks=tasks,
+                    resume_state="failed_before_handoff",
+                    error=exc,
+                )
+            raise
+        return tasks, driver_ownership
+
+    def _acquire_company_executor_driver_ownership(
+        self,
+        tasks: list[Task],
+        *,
+        preferred_task_ids: set[str] | None = None,
+    ) -> CompanyExecutorDriverOwnership | None:
+        task = CompanyWorkItemExecutor._driver_ownership_task(
+            tasks,
+            preferred_task_ids=preferred_task_ids,
         )
-        return tasks
+        if task is None:
+            return None
+        project_id = str(task.project_id or self.project_id or "default").strip() or "default"
+        try:
+            attempt_token = self._active_task_run_registry.register(
+                project_id,
+                task.id,
+            )
+        except ActiveTaskRunAdmissionClosed as exc:
+            raise asyncio.CancelledError(str(exc)) from exc
+        return CompanyExecutorDriverOwnership(
+            registry=self._active_task_run_registry,
+            project_id=project_id,
+            task_id=task.id,
+            attempt_token=attempt_token,
+        )
+
+    @staticmethod
+    def _company_executor_driver_context(
+        ownership: CompanyExecutorDriverOwnership | None,
+    ):
+        return ownership.bind() if ownership is not None else nullcontext()
 
     async def _company_suspend_resume_candidate_task_ids(
         self,
@@ -10138,12 +10892,11 @@ class OPCEngine:
             task_id = str(getattr(task, "id", "") or "").strip()
             if not task_id or task_id in excluded:
                 continue
-            if task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
-                continue
             metadata = dict(getattr(task, "metadata", {}) or {})
             task_is_held = any(str(metadata.get(key, "") or "").strip() for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS)
             work_item_id = linked_work_item_id_for_task(task)
             work_item_is_held = False
+            work_item = None
             if work_item_id and callable(get_work_item):
                 try:
                     work_item = await get_work_item(work_item_id)
@@ -10154,6 +10907,14 @@ class OPCEngine:
                         continue
                     work_item_metadata = dict(getattr(work_item, "metadata", {}) or {})
                     work_item_is_held = str(work_item_metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended"
+            if (
+                task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+                and (
+                    work_item is None
+                    or getattr(work_item, "phase", None) in DONE_PHASES
+                )
+            ):
+                continue
             if task_is_held or work_item_is_held:
                 candidate_ids.add(task_id)
         return candidate_ids
@@ -10161,38 +10922,108 @@ class OPCEngine:
     async def _resume_remaining_company_runtime_after_final_decider(
         self,
         *,
+        checkpoint: ExecutionCheckpoint,
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
         payload: dict[str, Any],
         parent_session_id: str,
         final_decider_task_id: str,
-    ) -> str | None:
+    ) -> tuple[bool, str | None]:
         assert self.company_executor
-        if not await self._company_followup_target_progressed(final_decider_task_id):
+        target_progressed = await self._company_followup_target_progressed(
+            final_decider_task_id
+        )
+        project_id = str(self.project_id or "default").strip() or "default"
+        driver_ownership: CompanyExecutorDriverOwnership | None = None
+        awaiting_final_decider_action = False
+        try:
+            async with self._active_task_run_registry.scope_lock(
+                project_id,
+                parent_session_id,
+            ):
+                current = await self._load_execution_checkpoint_by_id(
+                    checkpoint.checkpoint_id
+                )
+                if (
+                    current is None
+                    or str(current.status or "").strip() != "resuming"
+                    or str(current.project_id or "default").strip() != project_id
+                    or str(current.session_id or "").strip() != parent_session_id
+                    or str(current.checkpoint_type or "").strip()
+                    not in _COMPANY_RUNTIME_SUSPEND_CHECKPOINT_TYPES
+                ):
+                    logger.info(
+                        "company runtime resume: remaining handoff skipped because checkpoint {} "
+                        "is no longer the resuming owner of scope {}",
+                        checkpoint.checkpoint_id,
+                        parent_session_id,
+                    )
+                    return False, None
+                checkpoint.status = current.status
+                checkpoint.payload = dict(current.payload or {})
+                checkpoint.updated_at = current.updated_at
+                refreshed_snapshot = await self._load_company_runtime_snapshot(
+                    parent_session_id
+                )
+                if refreshed_snapshot:
+                    plan, tasks = refreshed_snapshot
+                resume_task_ids = await self._company_suspend_resume_candidate_task_ids(
+                    tasks,
+                    exclude_task_ids={final_decider_task_id},
+                )
+                if not resume_task_ids:
+                    return True, None
+                if not target_progressed:
+                    awaiting_final_decider_action = True
+                else:
+                    # Acquire the scheduler attempt while the scope lock still
+                    # owns the checkpoint.  Stop/shutdown can therefore never
+                    # observe the released WorkItems without a live coroutine.
+                    driver_ownership = self._acquire_company_executor_driver_ownership(
+                        tasks,
+                        preferred_task_ids=resume_task_ids,
+                    )
+                    tasks = await self._prepare_company_runtime_tasks_for_resume(
+                        tasks,
+                        payload,
+                        resume_task_ids=resume_task_ids,
+                    )
+                    await self._reset_company_executor_runtime_for_resume(tasks, payload)
+                    if parent_session_id:
+                        self._reregister_company_runtime_children(
+                            tasks,
+                            checkpoint_session_id=parent_session_id,
+                        )
+        except BaseException:
+            if driver_ownership is not None:
+                driver_ownership.release()
+            raise
+        if awaiting_final_decider_action:
             logger.info(
-                "company runtime resume: keeping suspended work items held because final decider has not run yet"
+                "company runtime resume: restoring checkpoint {} to pending because "
+                "remaining work is held and final decider has no durable arbitration action",
+                checkpoint.checkpoint_id,
             )
-            return None
-        refreshed_snapshot = await self._load_company_runtime_snapshot(parent_session_id)
-        if refreshed_snapshot:
-            plan, tasks = refreshed_snapshot
-        resume_task_ids = await self._company_suspend_resume_candidate_task_ids(
-            tasks,
-            exclude_task_ids={final_decider_task_id},
-        )
-        if not resume_task_ids:
-            return None
-        tasks = await self._prepare_company_runtime_tasks_for_resume(
-            tasks,
-            payload,
-            resume_task_ids=resume_task_ids,
-        )
-        await self._reset_company_executor_runtime_for_resume(tasks, payload)
-        if parent_session_id:
-            self._reregister_company_runtime_children(tasks, checkpoint_session_id=parent_session_id)
-        if self.on_company_runtime_children and parent_session_id and tasks:
-            self.on_company_runtime_children(parent_session_id, [t.id for t in tasks])
-        return await self.company_executor.execute(plan, tasks)
+            await self._restore_company_suspend_checkpoint_pending(
+                checkpoint,
+                parent_session_id=parent_session_id,
+                tasks=tasks,
+                resume_state="awaiting_final_decider_action",
+                error="final decider returned without a durable arbitration action",
+            )
+            return False, None
+        try:
+            with self._company_executor_driver_context(driver_ownership):
+                if self.on_company_runtime_children and parent_session_id and tasks:
+                    self.on_company_runtime_children(
+                        parent_session_id,
+                        [t.id for t in tasks],
+                    )
+                result = await self.company_executor.execute(plan, tasks)
+                return True, result
+        finally:
+            if driver_ownership is not None:
+                driver_ownership.release()
 
     async def _company_followup_target_progressed(self, task_id: str) -> bool:
         if not self.store:
@@ -10226,31 +11057,85 @@ class OPCEngine:
         if target_task is None:
             return "Could not route the suspended company runtime because no CEO/final-decider work item was available."
 
-        tasks = await self._handoff_company_suspend_checkpoint(
+        handoff = await self._handoff_company_suspend_checkpoint(
             checkpoint,
             payload=payload,
             parent_session_id=parent_session_id,
             tasks=tasks,
             resume_task_ids={target_task.id},
         )
-        followup_result = await self._resume_company_runtime_via_final_decider(
-            plan=plan,
-            tasks=tasks,
-            user_reply=user_reply,
-            session_id=parent_session_id,
-        )
-        if followup_result is None:
+        if handoff is None:
             return (
-                "Could not route the suspended company runtime because the CEO/final-decider "
-                "work item was unavailable after resume handoff."
+                "This company runtime is already being resumed by another request."
             )
-        continuation_result = await self._resume_remaining_company_runtime_after_final_decider(
-            plan=plan,
-            tasks=tasks,
-            payload=payload,
-            parent_session_id=parent_session_id,
-            final_decider_task_id=target_task.id,
-        )
+        tasks, driver_ownership = handoff
+        try:
+            with self._company_executor_driver_context(driver_ownership):
+                followup_result = await self._resume_company_runtime_via_final_decider(
+                    plan=plan,
+                    tasks=tasks,
+                    user_reply=user_reply,
+                    session_id=parent_session_id,
+                )
+                if followup_result is None:
+                    await self._restore_company_suspend_checkpoint_pending(
+                        checkpoint,
+                        parent_session_id=parent_session_id,
+                        tasks=tasks,
+                        resume_state="failed_during_execution",
+                        error="final-decider work item was unavailable",
+                    )
+                    return (
+                        "Could not route the suspended company runtime because the CEO/final-decider "
+                        "work item was unavailable after resume handoff."
+                    )
+                continuation_owned, continuation_result = await self._resume_remaining_company_runtime_after_final_decider(
+                    checkpoint=checkpoint,
+                    plan=plan,
+                    tasks=tasks,
+                    payload=payload,
+                    parent_session_id=parent_session_id,
+                    final_decider_task_id=target_task.id,
+                )
+                if not continuation_owned:
+                    if (
+                        str(checkpoint.payload.get("resume_state", "") or "").strip()
+                        == "awaiting_final_decider_action"
+                    ):
+                        return (
+                            f"{followup_result}\n\nThe CEO/final decider has not yet recorded "
+                            "a durable arbitration action. Remaining work items stay suspended "
+                            "and this checkpoint remains available to continue."
+                        ).strip()
+                    return (
+                        f"{followup_result}\n\nThe company runtime was suspended before "
+                        "remaining work items were released; they remain held."
+                    ).strip()
+                await self._complete_company_suspend_checkpoint_resume(
+                    checkpoint,
+                    parent_session_id=parent_session_id,
+                )
+        except asyncio.CancelledError as exc:
+            await self._restore_company_suspend_checkpoint_pending_after_cancellation(
+                checkpoint,
+                parent_session_id=parent_session_id,
+                tasks=tasks,
+                resume_state="failed_during_execution",
+                error=exc,
+            )
+            raise
+        except Exception as exc:
+            await self._restore_company_suspend_checkpoint_pending(
+                checkpoint,
+                parent_session_id=parent_session_id,
+                tasks=tasks,
+                resume_state="failed_during_execution",
+                error=exc,
+            )
+            raise
+        finally:
+            if driver_ownership is not None:
+                driver_ownership.release()
         if continuation_result:
             return f"{followup_result}\n\nResumed remaining company runtime after CEO/final-decider arbitration.\n\n{continuation_result}".strip()
         return followup_result
@@ -10265,13 +11150,43 @@ class OPCEngine:
         if loaded is None:
             return "Could not resume the suspended company runtime because its task set could not be restored."
         payload, parent_session_id, plan, tasks = loaded
-        tasks = await self._handoff_company_suspend_checkpoint(
+        handoff = await self._handoff_company_suspend_checkpoint(
             checkpoint,
             payload=payload,
             parent_session_id=parent_session_id,
             tasks=tasks,
         )
-        result = await self.company_executor.execute(plan, tasks)
+        if handoff is None:
+            return "This company runtime is already being resumed by another request."
+        tasks, driver_ownership = handoff
+        try:
+            with self._company_executor_driver_context(driver_ownership):
+                result = await self.company_executor.execute(plan, tasks)
+                await self._complete_company_suspend_checkpoint_resume(
+                    checkpoint,
+                    parent_session_id=parent_session_id,
+                )
+        except asyncio.CancelledError as exc:
+            await self._restore_company_suspend_checkpoint_pending_after_cancellation(
+                checkpoint,
+                parent_session_id=parent_session_id,
+                tasks=tasks,
+                resume_state="failed_during_execution",
+                error=exc,
+            )
+            raise
+        except Exception as exc:
+            await self._restore_company_suspend_checkpoint_pending(
+                checkpoint,
+                parent_session_id=parent_session_id,
+                tasks=tasks,
+                resume_state="failed_during_execution",
+                error=exc,
+            )
+            raise
+        finally:
+            if driver_ownership is not None:
+                driver_ownership.release()
         prefix = (
             "Resuming the suspended company runtime"
             if checkpoint.checkpoint_type == "company_runtime_suspended"
@@ -12051,6 +12966,8 @@ class OPCEngine:
                 config=delegate_config,
                 opc_home=self.opc_home,
                 project_id=normalized_project_id,
+                active_task_run_registry=self._active_task_run_registry,
+                owns_active_task_run_registry=False,
                 on_progress=self.on_progress,
                 on_runtime_event=self.on_runtime_event,
                 on_escalation=self.on_escalation,
@@ -12185,7 +13102,10 @@ class OPCEngine:
 
     async def shutdown(self) -> None:
         """Clean shutdown of all subsystems."""
+        self._shutting_down = True
         logger.info("Shutting down OPC Engine...")
+        if self._owns_active_task_run_registry:
+            await self.prepare_active_company_runtimes_for_shutdown()
         delegates = list(self._project_engine_delegates.values())
         self._project_engine_delegates.clear()
         for delegate in delegates:

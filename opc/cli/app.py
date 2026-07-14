@@ -2118,33 +2118,6 @@ def runtime_run(task_id: str = typer.Argument(...), project: Optional[str] = typ
     asyncio.run(_run_service_command(project, lambda svc: svc.runtime.run_task(project_id=project or "default", task_id=task_id), json_output=json_output))
 
 
-recovery_app = typer.Typer(help="Recover interrupted company runtimes")
-app.add_typer(recovery_app, name="recovery")
-
-
-@recovery_app.command("scan")
-def recovery_scan(project: Optional[str] = typer.Option(None, "--project", "-p"), json_output: bool = typer.Option(False, "--json")):
-    asyncio.run(_run_service_command(project, lambda svc: svc.runtime.recovery_scan(project_id=project or "default"), json_output=json_output))
-
-
-@recovery_app.command("resume")
-def recovery_resume(parent_task_id: str = typer.Argument(...), project: Optional[str] = typer.Option(None, "--project", "-p"), json_output: bool = typer.Option(False, "--json")):
-    asyncio.run(_run_service_command(project, lambda svc: svc.runtime.recovery_action(project_id=project or "default", action="resume", parent_task_id=parent_task_id), json_output=json_output))
-
-
-@recovery_app.command("cancel")
-def recovery_cancel(parent_task_id: str = typer.Argument(...), yes: bool = typer.Option(False, "--yes", "-y"), project: Optional[str] = typer.Option(None, "--project", "-p"), json_output: bool = typer.Option(False, "--json")):
-    if not yes:
-        console.print("[warning]Destructive command requires --yes.[/warning]")
-        raise typer.Exit(code=1)
-    asyncio.run(_run_service_command(project, lambda svc: svc.runtime.recovery_action(project_id=project or "default", action="cancel", parent_task_id=parent_task_id), json_output=json_output))
-
-
-@recovery_app.command("retry")
-def recovery_retry(parent_task_id: str = typer.Argument(...), project: Optional[str] = typer.Option(None, "--project", "-p"), json_output: bool = typer.Option(False, "--json")):
-    asyncio.run(_run_service_command(project, lambda svc: svc.runtime.recovery_action(project_id=project or "default", action="retry", parent_task_id=parent_task_id), json_output=json_output))
-
-
 comms_app = typer.Typer(help="Inspect company-mode comms")
 app.add_typer(comms_app, name="comms")
 
@@ -2834,6 +2807,17 @@ class ChatTurnController:
         self._closing = True
         self.queue.clear()
         await self.stop_kanban_watch(silent=True)
+        prepare = getattr(
+            self.state.engine,
+            "prepare_active_company_runtimes_for_shutdown",
+            None,
+        )
+        if callable(prepare):
+            # Persist company checkpoints and put the engine into
+            # infrastructure-shutdown mode before cancelling the active turn.
+            # Engine.shutdown() repeats this idempotently when it closes the
+            # remaining stores and subsystems.
+            await prepare()
         task = self.active_task
         if task is None or task.done():
             return
@@ -2994,8 +2978,6 @@ _SLASH_COMMANDS: tuple[_SlashCommandSpec, ...] = (
     _SlashCommandSpec("Tasks", "/task rename <task_id> <title>", "Rename a task and its session title."),
     _SlashCommandSpec("Tasks", "/task delete <task_id> --yes", "Hard-delete a task and its persisted lifecycle data."),
     _SlashCommandSpec("Runtime", "/runtime [--limit N] [--full]", "Show live runtime, active tasks, external sessions, and checkpoints."),
-    _SlashCommandSpec("Runtime", "/recover [--limit N] [--full]", "Show interrupted runtime and resumable checkpoints.", ("scan", "resume", "cancel", "retry")),
-    _SlashCommandSpec("Runtime", "/recover resume|cancel|retry <parent_task_id>", "Act on an interrupted company runtime."),
     _SlashCommandSpec("Runtime", "/logs <task_id|session_id> [--limit N] [--full]", "Show execution logs, runtime events, tools, and transcript."),
     _SlashCommandSpec("Runtime", "/comms <task_id> [--limit N] [--full]", "Show company-mode messages, handoffs, and review notes."),
     _SlashCommandSpec("Runtime", "/attachments [--limit N] [--full]", "List current session attachment references."),
@@ -3027,7 +3009,7 @@ _SLASH_COMMANDS: tuple[_SlashCommandSpec, ...] = (
     _SlashCommandSpec("Diagnostics", "/checkpoints [--limit N] [--full]", "List pending execution checkpoints."),
 )
 CommandSpec = _SlashCommandSpec
-_SLASH_ALIASES = {"p": "project", "s": "session", "t": "task", "checkpoint": "checkpoints", "recovery": "recover", "work-item": "work-items", "workitems": "work-items"}
+_SLASH_ALIASES = {"p": "project", "s": "session", "t": "task", "checkpoint": "checkpoints", "work-item": "work-items", "workitems": "work-items"}
 
 
 def _initial_company_profile(config: OPCConfig) -> str:
@@ -3862,6 +3844,8 @@ async def _resolve_session_or_task(state: _InteractiveChatState, token: str) -> 
 
 
 async def _resolve_runtime_control_target(state: _InteractiveChatState, target: str = "") -> tuple[str, str]:
+    from opc.layer2_organization.company_runtime_identity import load_company_runtime_identity_index
+
     store = _require_chat_store(state, label="Session store")
     if store is None:
         return "", ""
@@ -3869,24 +3853,38 @@ async def _resolve_runtime_control_target(state: _InteractiveChatState, target: 
     if not raw_target:
         console.print("[warning]No current session. Use /session list or /session create first.[/warning]")
         return "", ""
+    project_id = _current_project_id(state.engine)
+    identity_index = await load_company_runtime_identity_index(store, project_id)
     task = await store.get_task(raw_target) if hasattr(store, "get_task") else None
     if task is not None:
-        project_id = str(getattr(task, "project_id", "") or "default")
-        if project_id != _current_project_id(state.engine):
-            console.print(f"[warning]Target belongs to project '{project_id}'. Switch project first.[/warning]")
+        task_project_id = str(getattr(task, "project_id", "") or "default")
+        if task_project_id != project_id:
+            console.print(f"[warning]Target belongs to project '{task_project_id}'. Switch project first.[/warning]")
             return "", ""
+        runtime_identity = identity_index.resolve(task_id=raw_target)
+        if runtime_identity is not None:
+            return raw_target, runtime_identity.runtime_session_id
         return str(getattr(task, "id", "") or ""), str(getattr(task, "session_id", "") or getattr(task, "parent_session_id", "") or "")
+    runtime_identity = (
+        identity_index.resolve(runtime_session_id=raw_target)
+        or identity_index.resolve(task_session_id=raw_target)
+    )
+    if runtime_identity is not None:
+        control_task_id = (
+            runtime_identity.ui_anchor_task_id
+            or runtime_identity.config_source_task_id
+        )
+        if control_task_id:
+            return control_task_id, runtime_identity.runtime_session_id
     session = await store.get_session(raw_target) if hasattr(store, "get_session") else None
     if session is None:
         console.print(f"[warning]Task or session not found: {raw_target}[/warning]")
         return "", ""
-    project_id = str(getattr(session, "project_id", "") or "default")
-    if project_id != _current_project_id(state.engine):
-        console.print(f"[warning]Target belongs to project '{project_id}'. Switch project first.[/warning]")
+    session_project_id = str(getattr(session, "project_id", "") or "default")
+    if session_project_id != project_id:
+        console.print(f"[warning]Target belongs to project '{session_project_id}'. Switch project first.[/warning]")
         return "", ""
-    if raw_target in state.session_to_task:
-        return state.session_to_task[raw_target], raw_target
-    tasks = await store.get_tasks(project_id=project_id) if hasattr(store, "get_tasks") else []
+    tasks = list(identity_index.tasks)
     candidates = [
         item for item in tasks
         if str(getattr(item, "session_id", "") or "") == raw_target
@@ -3894,8 +3892,15 @@ async def _resolve_runtime_control_target(state: _InteractiveChatState, target: 
     if not candidates:
         console.print(f"[warning]Session is not task-backed: {raw_target}[/warning]")
         return "", raw_target
-    candidates.sort(key=lambda item: bool(str(getattr(item, "parent_session_id", "") or "")))
-    return str(getattr(candidates[0], "id", "") or ""), raw_target
+    task_mode_anchor = min(
+        candidates,
+        key=lambda item: (
+            bool(str(getattr(item, "parent_session_id", "") or "")),
+            str(getattr(item, "created_at", "") or ""),
+            str(getattr(item, "id", "") or ""),
+        ),
+    )
+    return str(getattr(task_mode_anchor, "id", "") or ""), raw_target
 
 
 def _make_cli_runtime_control_context(state: _InteractiveChatState, controller: ChatTurnController | None = None) -> Any:
@@ -3923,35 +3928,66 @@ def _make_cli_runtime_control_context(state: _InteractiveChatState, controller: 
     return context
 
 
-async def _latest_company_suspend_checkpoint(state: _InteractiveChatState) -> Any | None:
-    session_id = str(state.session_id or "").strip()
-    if not session_id:
-        return None
-    for name in ("get_active_company_runtime_suspend_checkpoint", "get_pending_company_runtime_suspend_checkpoint"):
-        getter = getattr(state.engine, name, None)
-        if callable(getter):
-            try:
-                checkpoint = await getter(session_id)
-            except Exception:
-                checkpoint = None
-            if checkpoint is not None and str(getattr(checkpoint, "status", "") or "pending") == "pending":
-                return checkpoint
+async def _company_runtime_identity_for_session(
+    state: _InteractiveChatState,
+    session_id: str | None = None,
+) -> Any | None:
+    from opc.layer2_organization.company_runtime_identity import (
+        load_company_runtime_identity_index,
+    )
+
+    runtime_session_id = str(session_id or state.session_id or "").strip()
     store = getattr(state.engine, "store", None)
-    if store is not None and hasattr(store, "get_pending_checkpoints"):
-        try:
-            checkpoints = await store.get_pending_checkpoints(
-                project_id=_current_project_id(state.engine),
-                session_id=session_id,
-                checkpoint_types=["company_runtime_suspended", "company_runtime_interrupted"],
-            )
-        except TypeError:
-            checkpoints = await store.get_pending_checkpoints(project_id=_current_project_id(state.engine), session_id=session_id)
-        except Exception:
-            checkpoints = []
-        for checkpoint in list(checkpoints or []):
-            if str(getattr(checkpoint, "checkpoint_type", "") or "") in {"company_runtime_suspended", "company_runtime_interrupted"}:
-                return checkpoint
-    return None
+    if not runtime_session_id or store is None:
+        return None
+    try:
+        identity_index = await load_company_runtime_identity_index(
+            store,
+            _current_project_id(state.engine),
+        )
+        # The interactive session may be a role/work-item session.  Resolve it
+        # as a task session after trying the canonical root session so both UI
+        # roots and child channels converge on the same company runtime.
+        identity = (
+            identity_index.resolve(runtime_session_id=runtime_session_id)
+            or identity_index.resolve(task_session_id=runtime_session_id)
+        )
+    except Exception:
+        return None
+    return identity
+
+
+async def _latest_company_suspend_checkpoint(
+    state: _InteractiveChatState,
+    session_id: str | None = None,
+) -> Any | None:
+    identity = await _company_runtime_identity_for_session(state, session_id)
+    return identity.checkpoint if identity is not None and identity.resumable else None
+
+
+async def _company_runtime_execution_identity(
+    state: _InteractiveChatState,
+    runtime_identity: Any,
+) -> Any:
+    """Read execution configuration from the durable runtime config source."""
+    from opc.plugins.office_ui.execution_identity import execution_identity_from_task
+
+    config_source_task_id = str(
+        getattr(runtime_identity, "config_source_task_id", "") or ""
+    ).strip()
+    store = getattr(state.engine, "store", None)
+    if not config_source_task_id or store is None or not hasattr(store, "get_task"):
+        raise RuntimeError("Company runtime has no durable configuration source.")
+    config_task = await store.get_task(config_source_task_id)
+    if config_task is None:
+        raise RuntimeError("Company runtime configuration source no longer exists.")
+    return execution_identity_from_task(
+        config_task,
+        default_exec_mode=state.mode,
+        default_company_profile=state.company_profile,
+        default_preferred_agent=state.preferred_agent or "native",
+        default_org_id=state.org_id,
+    )
 
 
 async def _handle_stop_slash(state: _InteractiveChatState, args: list[str], controller: ChatTurnController | None = None) -> None:
@@ -3972,22 +4008,35 @@ async def _handle_stop_slash(state: _InteractiveChatState, args: list[str], cont
         return
     payload = dict(result.payload)
     state.runtime_control_state = str(payload.get("runtime_control_state") or payload.get("status") or "stopped")
-    state.runtime_control_task_id = str(payload.get("resume_parent_task_id") or payload.get("task_id") or task_id)
+    state.runtime_control_task_id = str(payload.get("task_id") or task_id)
     state.runtime_control_session_id = str(payload.get("resume_parent_session_id") or payload.get("session_id") or session_id)
     state.runtime_control_checkpoint_id = str(payload.get("checkpoint_id") or "")
     console.print("[success]Stopped.[/success] [dim]Send a message to revise, or /continue to resume.[/dim]")
 
 
-async def _runtime_control_identity_for_task(state: _InteractiveChatState, task_id: str) -> Any:
+async def _runtime_control_execution_identity(state: _InteractiveChatState, task_id: str) -> Any:
+    from opc.layer2_organization.company_runtime_identity import load_company_runtime_identity_index
     from opc.plugins.office_ui.execution_identity import execution_identity_from_task
 
     store = getattr(state.engine, "store", None)
     task = None
-    if store is not None and hasattr(store, "get_task") and task_id:
+    if store is not None and task_id:
         try:
-            task = await store.get_task(task_id)
+            identity_index = await load_company_runtime_identity_index(
+                store,
+                _current_project_id(state.engine),
+            )
+            runtime_identity = identity_index.resolve(task_id=task_id)
+            task = identity_index.task(
+                runtime_identity.config_source_task_id if runtime_identity is not None else task_id
+            )
         except Exception:
             task = None
+        if task is None and hasattr(store, "get_task"):
+            try:
+                task = await store.get_task(task_id)
+            except Exception:
+                task = None
     return execution_identity_from_task(
         task,
         default_exec_mode=state.mode,
@@ -4014,13 +4063,24 @@ async def _handle_continue_slash(state: _InteractiveChatState, args: list[str], 
     task_id, session_id = await _resolve_runtime_control_target(state, target)
     if not task_id:
         return
-    identity = await _runtime_control_identity_for_task(state, task_id)
+    identity = await _runtime_control_execution_identity(state, task_id)
     content = " ".join(message_parts).strip() or "Resume the existing runtime."
+    checkpoint = await _latest_company_suspend_checkpoint(state, session_id)
+    if identity.exec_mode in {"company", "org", "custom"} and checkpoint is None:
+        console.print(
+            "[warning]No suspended or interrupted company runtime is available to continue.[/warning]"
+        )
+        return
     if controller is not None and controller.is_busy:
-        checkpoint = await _latest_company_suspend_checkpoint(state)
         if checkpoint is None and state.runtime_control_state not in {"suspended", "stopped"}:
             console.print("[warning]Busy: wait for the current turn or /stop it before /continue.[/warning]")
             return
+    metadata: dict[str, Any] = {"ui_force_resume": True}
+    if checkpoint is not None:
+        metadata["response_to_checkpoint_id"] = str(getattr(checkpoint, "checkpoint_id", "") or "")
+        metadata["response_to_checkpoint_type"] = str(
+            getattr(checkpoint, "checkpoint_type", "") or "company_runtime_suspended"
+        )
     item = QueuedChatInput(
         text=content,
         project_id=_current_project_id(state.engine),
@@ -4030,26 +4090,29 @@ async def _handle_continue_slash(state: _InteractiveChatState, args: list[str], 
         org_id=identity.org_id,
         preferred_agent=identity.preferred_agent,
         domains=list(state.domains),
-        message_metadata={"ui_force_resume": True},
+        message_metadata=metadata,
     )
     state.runtime_control_state = "resuming"
     state.runtime_control_task_id = task_id
     state.runtime_control_session_id = session_id or state.session_id
-    state.runtime_control_checkpoint_id = ""
+    state.runtime_control_checkpoint_id = str(getattr(checkpoint, "checkpoint_id", "") or "")
     if controller is not None:
         await controller.submit_item(item)
     else:
+        previous_session_id = state.session_id
         previous_mode = state.mode
         previous_profile = state.company_profile
         previous_org_id = state.org_id
         previous_agent = state.preferred_agent
+        state.session_id = session_id or state.session_id
         state.mode = identity.exec_mode
         state.company_profile = identity.company_profile
         state.org_id = identity.org_id
         state.preferred_agent = identity.preferred_agent
         try:
-            await _process_interactive_chat_message(state, content, message_metadata={"ui_force_resume": True})
+            await _process_interactive_chat_message(state, content, message_metadata=metadata)
         finally:
+            state.session_id = previous_session_id
             state.mode = previous_mode
             state.company_profile = previous_profile
             state.org_id = previous_org_id
@@ -5628,140 +5691,6 @@ async def _handle_runtime_slash(state: _InteractiveChatState, args: list[str]) -
 
     checkpoints = await store.get_pending_checkpoints(project_id=_current_project_id(state.engine))
     _render_checkpoint_table(checkpoints[:limit], title="Pending Checkpoints", full=full)
-
-
-class _ChatRecoveryFacade:
-    def __init__(self, state: _InteractiveChatState) -> None:
-        self._state = state
-        self.project_id = _current_project_id(state.engine)
-
-    @property
-    def store(self):  # noqa: ANN201 - preserve recovery facade shape
-        return getattr(self._state.engine, "store", None)
-
-    @property
-    def opc_home(self) -> Path:
-        return Path(getattr(self._state.engine, "opc_home", get_opc_home()))
-
-    async def ensure_ready(self):
-        return self._state.engine
-
-
-def _get_chat_recovery_manager(state: _InteractiveChatState) -> Any:
-    cached = getattr(state, "_cli_chat_recovery_manager", None)
-    engine_id = id(state.engine)
-    if cached and cached[0] == engine_id:
-        return cached[1]
-    from opc.plugins.cli_board.services.recovery import CliRecoveryManager
-
-    manager = CliRecoveryManager(_ChatRecoveryFacade(state))
-    setattr(state, "_cli_chat_recovery_manager", (engine_id, manager))
-    return manager
-
-
-def _render_recovery_status(status: Any, *, limit: int, full: bool = False) -> None:
-    workflows = list(getattr(status, "interrupted", []) or [])[:limit]
-    if workflows:
-        table = Table(title=f"Interrupted Company Runtimes ({len(workflows)})")
-        table.add_column("Parent Task")
-        table.add_column("Parent Session")
-        table.add_column("Title")
-        table.add_column("Profile")
-        table.add_column("Interrupted")
-        table.add_column("Work Items")
-        for workflow in workflows:
-            interrupted_items = [
-                item for item in list(getattr(workflow, "work_items", []) or [])
-                if bool(getattr(item, "interrupted", False))
-            ]
-            table.add_row(
-                str(getattr(workflow, "parent_task_id", "") or ""),
-                str(getattr(workflow, "parent_session_id", "") or ""),
-                _clip_text(getattr(workflow, "title", "") or "", 70, full=full),
-                str(getattr(workflow, "profile", "") or ""),
-                str(getattr(workflow, "interrupted_at", "") or ""),
-                f"{len(interrupted_items)}/{len(list(getattr(workflow, 'work_items', []) or []))}",
-            )
-        console.print(table)
-    else:
-        console.print("[info]No interrupted company runtimes found.[/info]")
-
-    active = list(getattr(status, "active_recoveries", []) or [])
-    if active:
-        console.print(f"[info]Active recoveries: {', '.join(active)}[/info]")
-
-
-async def _find_checkpoint_by_id(store: Any, project_id: str, checkpoint_id: str) -> Any | None:
-    if hasattr(store, "get_execution_checkpoints"):
-        checkpoints = await store.get_execution_checkpoints(project_id=project_id)
-    else:
-        checkpoints = await store.get_pending_checkpoints(project_id=project_id)
-    return next((item for item in checkpoints if str(getattr(item, "checkpoint_id", "") or "") == checkpoint_id), None)
-
-
-async def _handle_recover_slash(state: _InteractiveChatState, args: list[str]) -> None:
-    store = _require_chat_store(state, label="Recovery store")
-    if store is None:
-        return
-    if args and args[0].lower() == "resume":
-        if len(args) != 2:
-            console.print("[warning]Usage: /recover resume <parent_task_id>. Try /recover.[/warning]")
-            return
-        manager = _get_chat_recovery_manager(state)
-        result = await manager.resume(args[1])
-        if result.get("ok"):
-            resumed = result.get("resumed_work_item_projection_ids", []) or []
-            console.print(f"[success]Recovery started for {args[1]}: {', '.join(resumed) or 'runtime queued'}.[/success]")
-            return
-        if result.get("error") == "not_found":
-            checkpoint = await _find_checkpoint_by_id(store, _current_project_id(state.engine), args[1])
-            if checkpoint:
-                session_id = str(getattr(checkpoint, "session_id", "") or "")
-                suffix = f" Try /session resume {session_id}." if session_id else " Try /checkpoints."
-                console.print(f"[warning]Checkpoint {args[1]} is not resumed directly.{suffix}[/warning]")
-                return
-        console.print(f"[warning]Recovery could not start: {result.get('error', 'unknown_error')}[/warning]")
-        return
-    if args and args[0].lower() in {"cancel", "retry"}:
-        action = args[0].lower()
-        if len(args) < 2:
-            console.print(f"[warning]Usage: /recover {action} <parent_task_id>{' --yes' if action == 'cancel' else ''}. Try /recover.[/warning]")
-            return
-        if action == "cancel":
-            remaining, ok = _require_yes_arg(args[2:], usage="/recover cancel <parent_task_id> --yes")
-            if not ok or remaining:
-                return
-        elif len(args) > 2:
-            console.print(f"[warning]Usage: /recover {action} <parent_task_id>[/warning]")
-            return
-        payload = await _run_chat_office_service(
-            state,
-            lambda svc: svc.runtime.recovery_action(project_id=_current_project_id(state.engine), action=action, parent_task_id=args[1]),
-        )
-        if payload:
-            _emit_payload(payload)
-        return
-    try:
-        if args and args[0].lower() == "scan":
-            args = args[1:]
-        args, limit, full = _parse_view_args(args)
-    except ValueError as exc:
-        console.print(f"[warning]{exc}. Try /recover --limit 20.[/warning]")
-        return
-    if args:
-        console.print("[warning]Usage: /recover [--limit N] [--full] or /recover resume <parent_task_id>.[/warning]")
-        return
-    manager = _get_chat_recovery_manager(state)
-    status = await manager.get_status()
-    _render_recovery_status(status, limit=limit, full=full)
-    if hasattr(store, "get_execution_checkpoints"):
-        checkpoints = await store.get_execution_checkpoints(
-            project_id=_current_project_id(state.engine),
-            statuses=["pending", "resuming"],
-        )
-    else:
-        checkpoints = await store.get_pending_checkpoints(project_id=_current_project_id(state.engine))
-    _render_checkpoint_table(checkpoints[:limit], title="Recovery Checkpoints", full=full)
 
 
 async def _resolve_logs_target(
@@ -7487,10 +7416,6 @@ def _busy_slash_policy(command: str, args: list[str]) -> BusyCommandPolicy:
     }
     if command in readonly_roots:
         return BusyCommandPolicy.IMMEDIATE_READONLY
-    if command == "recover":
-        if not args or args[0].lower() in {"scan", "status", "list"}:
-            return BusyCommandPolicy.IMMEDIATE_READONLY
-        return BusyCommandPolicy.BLOCKED_WHEN_BUSY
     if command == "task":
         if args and args[0].lower() == "show":
             return BusyCommandPolicy.IMMEDIATE_READONLY
@@ -7810,8 +7735,6 @@ async def _handle_chat_slash_command(state: _InteractiveChatState, user_input: s
         await _handle_reorg_slash(state, args)
     elif command == "runtime":
         await _handle_runtime_slash(state, args)
-    elif command == "recover":
-        await _handle_recover_slash(state, args)
     elif command in {"work-items", "work-item"}:
         await _handle_work_items_slash(state, args)
     elif command == "logs":
@@ -7834,6 +7757,13 @@ async def _handle_chat_slash_command(state: _InteractiveChatState, user_input: s
 async def _sync_runtime_checkpoint_hint(state: _InteractiveChatState) -> None:
     display = state.runtime_display
     if not hasattr(display, "set_checkpoint_hint"):
+        return
+    runtime_identity = await _company_runtime_identity_for_session(state)
+    if runtime_identity is not None and runtime_identity.checkpoint is not None:
+        checkpoint = runtime_identity.checkpoint
+        checkpoint_type = str(getattr(checkpoint, "checkpoint_type", "") or "pending")
+        checkpoint_id = str(getattr(checkpoint, "checkpoint_id", "") or "")
+        display.set_checkpoint_hint(checkpoint_type or checkpoint_id)
         return
     getter = getattr(state.engine, "get_latest_pending_checkpoint_for_session", None)
     if not callable(getter) or not state.session_id:
@@ -7862,24 +7792,110 @@ async def _process_interactive_chat_message(
     try:
         state.runtime_display.begin_turn()
         effective_metadata = message_metadata
-        if effective_metadata is None:
-            suspend_checkpoint = await _latest_company_suspend_checkpoint(state)
-            if suspend_checkpoint is not None:
-                effective_metadata = {
-                    "response_to_checkpoint_id": str(getattr(suspend_checkpoint, "checkpoint_id", "") or ""),
-                    "response_to_checkpoint_type": str(getattr(suspend_checkpoint, "checkpoint_type", "") or "company_runtime_suspended"),
-                }
-            elif state.mode == "company":
+        execution_session_id = state.session_id
+        execution_origin_task_id: str | None = None
+        execution_mode = state.mode
+        execution_company_profile = state.company_profile
+        execution_org_id = state.org_id
+        execution_preferred_agent = state.preferred_agent
+        handoff_identity = None
+        runtime_identity = await _company_runtime_identity_for_session(state)
+        runtime_checkpoint = (
+            runtime_identity.checkpoint
+            if runtime_identity is not None
+            else None
+        )
+        explicit_runtime_type = str(
+            (effective_metadata or {}).get("response_to_checkpoint_type", "") or ""
+        ).strip()
+        explicit_runtime_id = str(
+            (effective_metadata or {}).get("response_to_checkpoint_id", "") or ""
+        ).strip()
+        is_explicit_runtime_handoff = explicit_runtime_type in {
+            "company_runtime_suspended",
+            "company_runtime_interrupted",
+        }
+
+        if is_explicit_runtime_handoff:
+            if runtime_identity is None or runtime_checkpoint is None:
+                raise RuntimeError(
+                    "Company runtime checkpoint does not match the current session."
+                )
+            checkpoint_id = str(
+                getattr(runtime_checkpoint, "checkpoint_id", "") or ""
+            ).strip()
+            checkpoint_type = str(
+                getattr(runtime_checkpoint, "checkpoint_type", "") or ""
+            ).strip()
+            checkpoint_status = str(
+                getattr(runtime_checkpoint, "status", "") or ""
+            ).strip().lower()
+            if (
+                not explicit_runtime_id
+                or explicit_runtime_id != checkpoint_id
+                or explicit_runtime_type != checkpoint_type
+            ):
+                raise RuntimeError(
+                    "Company runtime checkpoint identity mismatch; refresh before continuing."
+                )
+            if checkpoint_status != "pending":
+                raise RuntimeError(
+                    f"Company runtime checkpoint is {checkpoint_status or 'not pending'}."
+                )
+            execution_session_id = runtime_identity.runtime_session_id
+            execution_origin_task_id = runtime_identity.ui_anchor_task_id or None
+            handoff_identity = runtime_identity
+        elif effective_metadata is None and runtime_checkpoint is not None:
+            checkpoint_status = str(
+                getattr(runtime_checkpoint, "status", "") or ""
+            ).strip().lower()
+            if checkpoint_status != "pending":
+                raise RuntimeError(
+                    f"Company runtime checkpoint is {checkpoint_status or 'not pending'}."
+                )
+            if runtime_identity is None:
+                raise RuntimeError(
+                    "Company runtime checkpoint does not match the current session."
+                )
+            effective_metadata = {
+                "response_to_checkpoint_id": str(getattr(runtime_checkpoint, "checkpoint_id", "") or ""),
+                "response_to_checkpoint_type": str(getattr(runtime_checkpoint, "checkpoint_type", "") or "company_runtime_suspended"),
+            }
+            execution_session_id = runtime_identity.runtime_session_id
+            execution_origin_task_id = runtime_identity.ui_anchor_task_id or None
+            handoff_identity = runtime_identity
+        elif effective_metadata is None:
+            if runtime_identity is not None and runtime_identity.pending_checkpoint_id:
+                # An active checkpoint may only be pending or resuming.  Never
+                # let a malformed identity/status fall through as a new turn.
+                raise RuntimeError(
+                    "Company runtime checkpoint is not available for a new turn."
+                )
+            if state.mode == "company":
                 effective_metadata = {"company_preflight": "manual"}
+        if handoff_identity is not None:
+            runtime_execution_identity = await _company_runtime_execution_identity(
+                state,
+                handoff_identity,
+            )
+            execution_mode = runtime_execution_identity.exec_mode
+            execution_company_profile = runtime_execution_identity.company_profile
+            execution_org_id = runtime_execution_identity.org_id
+            execution_preferred_agent = runtime_execution_identity.preferred_agent
         response = await state.engine.process_message(
             user_input,
             project_id=getattr(state.engine, "project_id", None),
-            session_id=state.session_id,
-            mode=state.mode,
-            org_id=state.org_id or None,
-            company_profile=state.company_profile if state.mode == "company" else None,
-            preferred_agent=state.preferred_agent,
+            session_id=execution_session_id,
+            mode=execution_mode,
+            org_id=execution_org_id or None,
+            company_profile=(
+                execution_company_profile
+                if execution_mode == "company"
+                else None
+            ),
+            preferred_agent=execution_preferred_agent,
             domains=list(state.domains),
+            origin_task_id=execution_origin_task_id,
             message_metadata=effective_metadata,
         )
         await state.runtime_display.flush()
@@ -7910,7 +7926,15 @@ async def _process_interactive_chat_message(
                 "company_runtime_interrupted",
             }
         ):
-            state.runtime_control_state = "running"
+            remaining_checkpoint = await _latest_company_suspend_checkpoint(state)
+            if remaining_checkpoint is not None:
+                state.runtime_control_state = "suspended"
+                state.runtime_control_checkpoint_id = str(
+                    getattr(remaining_checkpoint, "checkpoint_id", "") or ""
+                )
+            else:
+                state.runtime_control_state = "idle"
+                state.runtime_control_checkpoint_id = ""
     except KeyboardInterrupt:
         console.print("\n[warning]Interrupted. Type /quit to exit.[/warning]")
     except Exception as e:

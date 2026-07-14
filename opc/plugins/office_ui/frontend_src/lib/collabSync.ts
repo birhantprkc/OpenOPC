@@ -676,7 +676,6 @@ export function mapBackendSession(raw: any): Session {
     runtimeControlState: raw.runtime_control_state ?? raw.runtimeControlState,
     canStop: raw.can_stop ?? raw.canStop,
     canResume: raw.can_resume ?? raw.canResume,
-    resumeParentTaskId: raw.resume_parent_task_id ?? raw.resumeParentTaskId,
     resumeParentSessionId: raw.resume_parent_session_id ?? raw.resumeParentSessionId,
     pendingRuntimeCheckpointId: raw.pending_runtime_checkpoint_id ?? raw.pendingRuntimeCheckpointId,
     stopIntentId: raw.stop_intent_id ?? raw.stopIntentId,

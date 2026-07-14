@@ -384,7 +384,6 @@ def test_office_ui_work_item_paths_do_not_use_legacy_projection_identity_names()
         [
             REPO_ROOT / "opc/plugins/office_ui/ws_handler.py",
             REPO_ROOT / "opc/plugins/office_ui/snapshot_builder.py",
-            REPO_ROOT / "opc/plugins/office_ui/recovery_manager.py",
         ],
     )
     assert not backend_matches, _format_matches(backend_matches)

@@ -13,7 +13,7 @@ The source of truth for this table is `_SLASH_COMMANDS` in `opc/cli/app.py`.
 - `/mode [task|company] [corporate|custom]` changes how future natural-language messages run.
 - `/agent [native|codex|claude_code|cursor|opencode|none]` sets or clears the preferred execution agent.
 - `/domains [domain ...|clear]` sets or clears domain hints.
-- Aliases: `/p` is `/project`, `/s` is `/session`, `/t` is `/task`, `/checkpoint` is `/checkpoints`, `/recovery` is `/recover`.
+- Aliases: `/p` is `/project`, `/s` is `/session`, `/t` is `/task`, and `/checkpoint` is `/checkpoints`.
 
 ## Project And Session
 
@@ -30,8 +30,6 @@ The source of truth for this table is `_SLASH_COMMANDS` in `opc/cli/app.py`.
 - `/tasks [status] [--limit N] [--full]` lists project tasks.
 - `/task show|move|done|rename|delete` inspects and updates persisted tasks.
 - `/runtime [--limit N] [--full]` shows live runtime, active tasks, external sessions, and checkpoints.
-- `/recover [--limit N] [--full]` lists interrupted runtimes and resumable checkpoints.
-- `/recover resume|cancel|retry <parent_task_id>` acts on interrupted company runtimes.
 - `/logs <task_id|session_id> [--limit N] [--full]` shows execution logs, runtime events, tools, and transcript.
 - `/comms <task_id> [--limit N] [--full]` shows company-mode messages, handoffs, review notes, and handoff context.
 - `/attachments [--limit N] [--full]` lists current-session attachment references.

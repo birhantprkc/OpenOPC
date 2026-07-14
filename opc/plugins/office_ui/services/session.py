@@ -12,6 +12,12 @@ from typing import Any
 
 from loguru import logger
 from opc.core.models import Task, TaskStatus
+from opc.layer2_organization.company_runtime_identity import (
+    ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES,
+    COMPANY_RUNTIME_CHECKPOINT_TYPES,
+    is_company_runtime_task,
+    load_company_runtime_identity_index,
+)
 from opc.plugins.office_ui.execution_identity import (
     ExecutionIdentity,
     canonicalize_execution_identity,
@@ -156,6 +162,32 @@ class SessionService:
             task_project = self.context.normalize_project_id(getattr(task, "project_id", None))
             if task_project != pid:
                 raise ServiceError("target_wrong_project", "Target belongs to a different project", {"project_id": task_project})
+
+        # Company control is resolved from durable session/checkpoint scope
+        # before any generic Task/session fallback.  This prevents a shared
+        # final-decider row from winning merely because it was loaded first.
+        identity_index = await load_company_runtime_identity_index(store, pid)
+        if task is not None:
+            identity = identity_index.resolve(task_id=raw_target)
+        else:
+            identity = (
+                identity_index.resolve(runtime_session_id=raw_target)
+                or identity_index.resolve(task_session_id=raw_target)
+            )
+        if identity is not None:
+            # A concrete Task id is the caller's UI/chat channel, never the
+            # company execution identity.  Keep that channel stable while the
+            # shared identity supplies the durable runtime session/checkpoint.
+            if task is not None:
+                return task, identity.runtime_session_id
+            resolved_task = (
+                identity_index.task(identity.ui_anchor_task_id)
+                or identity_index.task(identity.config_source_task_id)
+            )
+            if resolved_task is not None:
+                return resolved_task, identity.runtime_session_id
+
+        if task is not None:
             return task, str(getattr(task, "session_id", "") or getattr(task, "parent_session_id", "") or "")
 
         session = await store.get_session(raw_target) if hasattr(store, "get_session") else None
@@ -165,139 +197,64 @@ class SessionService:
         if session_project != pid:
             raise ServiceError("target_wrong_project", "Target belongs to a different project", {"project_id": session_project})
 
-        tasks = await store.get_tasks(project_id=pid) if hasattr(store, "get_tasks") else []
+        tasks = list(identity_index.tasks)
         session_tasks = [
             candidate for candidate in tasks
             if str(getattr(candidate, "session_id", "") or "") == raw_target
         ]
         if not session_tasks:
             raise ServiceError("session_not_task_backed", "Session is not linked to a task-backed runtime", {"session_id": raw_target})
-        session_tasks.sort(key=lambda item: bool(str(getattr(item, "parent_session_id", "") or "")))
-        return session_tasks[0], raw_target
+        task_mode_anchor = min(
+            session_tasks,
+            key=lambda item: (
+                bool(str(getattr(item, "parent_session_id", "") or "")),
+                str(getattr(item, "created_at", "") or ""),
+                str(getattr(item, "id", "") or ""),
+            ),
+        )
+        return task_mode_anchor, raw_target
 
-    async def _resolve_company_runtime_target(self, engine: Any, task: Any) -> dict[str, Any]:
-        store = getattr(engine, "store", None)
-        parent_session_id = str(
-            getattr(task, "parent_session_id", "")
-            or getattr(task, "session_id", "")
-            or ""
-        ).strip()
-        parent_task_id = str(self.context.session_to_task.get(parent_session_id) or "").strip()
-        project_id = self.context.normalize_project_id(getattr(task, "project_id", None) or getattr(engine, "project_id", None))
-        try:
-            project_tasks = await store.get_tasks(project_id=project_id) if hasattr(store, "get_tasks") else [task]
-        except Exception:
-            project_tasks = [task]
-        for candidate in project_tasks:
-            candidate_id = str(getattr(candidate, "id", "") or "").strip()
-            candidate_session_id = str(getattr(candidate, "session_id", "") or "").strip()
-            candidate_parent_session_id = str(getattr(candidate, "parent_session_id", "") or "").strip()
-            if candidate_session_id == parent_session_id and not candidate_parent_session_id:
-                parent_task_id = candidate_id
-                break
-        if not parent_task_id:
-            parent_task_id = str(
-                self.context.active_runtime_children.get(str(getattr(task, "id", "") or ""))
-                or getattr(task, "id", "")
-                or ""
-            ).strip()
-
-        affected_task_ids: list[str] = []
-        for candidate in project_tasks:
-            candidate_id = str(getattr(candidate, "id", "") or "").strip()
-            if not candidate_id:
-                continue
-            candidate_session_id = str(getattr(candidate, "session_id", "") or "").strip()
-            candidate_parent_session_id = str(getattr(candidate, "parent_session_id", "") or "").strip()
-            if (
-                candidate_id == str(getattr(task, "id", "") or "")
-                or candidate_id == parent_task_id
-                or candidate_session_id == parent_session_id
-                or candidate_parent_session_id == parent_session_id
-            ):
-                if candidate_id not in affected_task_ids:
-                    affected_task_ids.append(candidate_id)
-        for child_id, origin_id in list(self.context.active_runtime_children.items()):
-            if origin_id == parent_task_id or child_id == str(getattr(task, "id", "") or ""):
-                if child_id not in affected_task_ids:
-                    affected_task_ids.append(child_id)
-        if parent_task_id and parent_task_id not in affected_task_ids:
-            affected_task_ids.insert(0, parent_task_id)
-        return {
-            "parent_session_id": parent_session_id,
-            "parent_task_id": parent_task_id or str(getattr(task, "id", "") or ""),
-            "origin_task_id": parent_task_id or str(getattr(task, "id", "") or ""),
-            "affected_task_ids": affected_task_ids or [str(getattr(task, "id", "") or "")],
-        }
-
-    async def _mark_company_runtime_stop_state(
+    async def _resolve_company_runtime_target(
         self,
-        *,
         engine: Any,
-        task_ids: list[str],
-        state: str,
-        stop_intent_id: str,
-        checkpoint_type: str = "",
-    ) -> None:
+        task: Any,
+        *,
+        runtime_session_id: str = "",
+        checkpoint_id: str = "",
+    ) -> dict[str, Any]:
         store = getattr(engine, "store", None)
+        project_id = self.context.normalize_project_id(getattr(task, "project_id", None) or getattr(engine, "project_id", None))
         if not self.context.store_is_ready(store):
-            return
-        for task_id in task_ids:
-            try:
-                task = await store.get_task(str(task_id))
-            except Exception:
-                task = None
-            if not task or self._is_terminal_status(task):
-                continue
-            metadata = dict(getattr(task, "metadata", {}) or {})
-            metadata["company_runtime_stop_state"] = state
-            metadata["company_runtime_stop_intent_id"] = stop_intent_id
-            metadata["company_runtime_stop_marked_at"] = datetime.now().isoformat()
-            metadata["dispatch_hold"] = "company_runtime_suspended"
-            metadata["company_runtime_suspended_at"] = datetime.now().isoformat()
-            if checkpoint_type:
-                metadata["company_runtime_suspend_checkpoint_type"] = checkpoint_type
-            metadata.setdefault("suspended_task_status", self._task_status_value(task))
-            task.metadata = metadata
-            task.status = TaskStatus.BLOCKED
-            if hasattr(task, "execution_lock"):
-                task.execution_lock = False
-            if hasattr(task, "execution_locked_at"):
-                task.execution_locked_at = None
-            try:
-                await store.save_task(task)
-            except Exception:
-                logger.opt(exception=True).debug("failed to mark company runtime stop state")
-
-    async def _clear_company_runtime_stop_state(self, *, engine: Any, task_ids: list[str]) -> None:
-        store = getattr(engine, "store", None)
-        if not self.context.store_is_ready(store):
-            return
-        for task_id in task_ids:
-            try:
-                task = await store.get_task(str(task_id))
-            except Exception:
-                task = None
-            if not task:
-                continue
-            metadata = dict(getattr(task, "metadata", {}) or {})
-            for key in (
-                "dispatch_hold",
-                "company_runtime_stop_state",
-                "company_runtime_stop_intent_id",
-                "company_runtime_stop_marked_at",
-                "company_runtime_suspend_checkpoint_type",
-                "company_runtime_suspended_at",
-                "suspended_task_status",
-            ):
-                metadata.pop(key, None)
-            task.metadata = metadata
-            if self._task_status_value(task) == "blocked":
-                task.status = TaskStatus.IDLE
-            try:
-                await store.save_task(task)
-            except Exception:
-                logger.opt(exception=True).debug("failed to clear company runtime stop state")
+            raise ServiceError("store_not_ready", "store_not_ready", {"project_id": project_id})
+        index = await load_company_runtime_identity_index(store, project_id)
+        identity = index.resolve(
+            task_id=str(getattr(task, "id", "") or ""),
+            runtime_session_id=runtime_session_id,
+            checkpoint_id=checkpoint_id,
+        )
+        if identity is None:
+            raise ServiceError(
+                "company_runtime_identity_mismatch",
+                "Company runtime identity does not match the requested task/session/checkpoint",
+                {
+                    "task_id": str(getattr(task, "id", "") or ""),
+                    "runtime_session_id": str(runtime_session_id or ""),
+                    "checkpoint_id": str(checkpoint_id or ""),
+                },
+            )
+        config_task = index.task(identity.config_source_task_id) or task
+        ui_anchor_task_id = identity.ui_anchor_task_id
+        return {
+            "identity": identity,
+            "runtime_session_id": identity.runtime_session_id,
+            "ui_channel_task_id": str(getattr(task, "id", "") or ""),
+            "ui_anchor_task_id": ui_anchor_task_id,
+            "config_source_task_id": identity.config_source_task_id,
+            "config_task": config_task,
+            "origin_task_id": ui_anchor_task_id,
+            "affected_task_ids": list(identity.runtime_task_ids),
+            "checkpoint": identity.checkpoint,
+        }
 
     def _normalize_requested_config(
         self,
@@ -743,8 +700,54 @@ class SessionService:
             if getattr(engine, "memory", None):
                 await engine.memory.ensure_session(task.session_id, project_id=project_id, title=task.title, mode="primary", metadata={"source": "service"})
             await store.save_task(task)
+
+        # A Task selected by the UI/CLI is only the chat channel for company
+        # mode.  Resolve the durable runtime scope before choosing execution
+        # configuration, session, origin, or checkpoint.  In particular, a
+        # role/work-item Task must never become the parent execution identity.
+        company_target: dict[str, Any] | None = None
+        task_is_company_runtime = is_company_runtime_task(task)
+        try:
+            company_target = await self._resolve_company_runtime_target(engine, task)
+        except ServiceError as exc:
+            if exc.code != "company_runtime_identity_mismatch" or task_is_company_runtime:
+                raise
+
+        if task.status == TaskStatus.CANCELLED:
+            company_identity = (
+                company_target.get("identity")
+                if company_target is not None
+                else None
+            )
+            checkpoint = (
+                company_target.get("checkpoint")
+                if company_target is not None
+                else None
+            )
+            active_cancelled_anchor = bool(
+                company_identity is not None
+                and str(getattr(company_identity, "ui_anchor_task_id", "") or "").strip()
+                == str(getattr(task, "id", "") or "").strip()
+                and checkpoint is not None
+                and str(getattr(checkpoint, "checkpoint_type", "") or "").strip()
+                in COMPANY_RUNTIME_CHECKPOINT_TYPES
+                and str(getattr(checkpoint, "status", "") or "").strip().lower()
+                in ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES
+            )
+            if not active_cancelled_anchor:
+                raise ServiceError(
+                    "session_ended",
+                    "session_ended",
+                    {"project_id": project_id, "task_id": task.id},
+                )
+
+        config_task = (
+            company_target.get("config_task")
+            if company_target is not None
+            else task
+        ) or task
         identity = self.resolve_task_identity(
-            task,
+            config_task,
             default_exec_mode=mode,
             default_company_profile=company_profile if company_profile is not None else "corporate",
             default_preferred_agent=preferred_agent if preferred_agent is not None else "native",
@@ -752,26 +755,85 @@ class SessionService:
         )
         if identity.is_custom_org and not identity.org_id:
             raise ServiceError("org_id_required", "org_id_required", {"project_id": project_id, "task_id": task.id})
-        await self.persist_session_config(
-            task,
-            exec_mode=identity.exec_mode,
-            company_profile=identity.company_profile,
-            preferred_agent=identity.preferred_agent,
-            org_id=identity.org_id,
-            engine=engine,
-        )
+
+        # Existing company scopes read configuration from the resolver's
+        # config source.  Only persist when that source is the selected Task;
+        # this preserves normal session configuration while avoiding writes to
+        # an internal work item merely because it was used as the UI channel.
+        if (
+            company_target is None
+            or str(getattr(config_task, "id", "") or "").strip()
+            == str(getattr(task, "id", "") or "").strip()
+        ):
+            await self.persist_session_config(
+                task,
+                exec_mode=identity.exec_mode,
+                company_profile=identity.company_profile,
+                preferred_agent=identity.preferred_agent,
+                org_id=identity.org_id,
+                engine=engine,
+            )
+
+        execution_session_id = str(getattr(task, "session_id", "") or "").strip()
+        origin_task_id = str(getattr(task, "id", "") or "").strip() or None
+        message_metadata: dict[str, Any] | None = None
+        if company_target is not None:
+            execution_session_id = str(
+                company_target.get("runtime_session_id", "") or ""
+            ).strip()
+            origin_task_id = str(
+                company_target.get("ui_anchor_task_id", "") or ""
+            ).strip() or None
+            if not execution_session_id:
+                raise ServiceError(
+                    "company_runtime_identity_mismatch",
+                    "Company runtime has no canonical runtime session",
+                    {"project_id": project_id, "task_id": task.id},
+                )
+            checkpoint = company_target.get("checkpoint")
+            if checkpoint is not None:
+                checkpoint_id = str(
+                    getattr(checkpoint, "checkpoint_id", "") or ""
+                ).strip()
+                checkpoint_status = str(
+                    getattr(checkpoint, "status", "") or ""
+                ).strip().lower()
+                if checkpoint_status != "pending":
+                    raise ServiceError(
+                        "company_runtime_checkpoint_not_pending",
+                        "Company runtime checkpoint is not pending",
+                        {
+                            "project_id": project_id,
+                            "task_id": task.id,
+                            "checkpoint_id": checkpoint_id,
+                            "checkpoint_status": checkpoint_status,
+                        },
+                    )
+                message_metadata = {
+                    "response_to_checkpoint_id": checkpoint_id,
+                    "response_to_checkpoint_type": str(
+                        getattr(checkpoint, "checkpoint_type", "") or ""
+                    ).strip(),
+                }
+
         response = await engine.process_message(
             str(content or "").strip(),
             project_id=project_id,
-            session_id=task.session_id,
+            session_id=execution_session_id,
             mode=identity.exec_mode,
             org_id=identity.org_id or None,
             company_profile=identity.company_profile if identity.is_company_runtime else None,
             preferred_agent=identity.preferred_agent if identity.is_task else None,
             domains=list(domains or []),
-            origin_task_id=task.id,
+            origin_task_id=origin_task_id,
+            message_metadata=message_metadata,
         )
-        return ServiceResult({"project_id": project_id, "task_id": task.id, "session_id": task.session_id, "response": response})
+        return ServiceResult({
+            "project_id": project_id,
+            "task_id": task.id,
+            "session_id": execution_session_id,
+            "response": response,
+        })
 
     async def rename(self, *, project_id: str, task_id: str = "", session_id: str = "", title: str) -> ServiceResult:
         pid = self.context.normalize_project_id(project_id)
@@ -935,50 +997,44 @@ class SessionService:
                 default_payload=default_payload,
             )
         engine = await self.context.engine_for_project(project_id)
-        exec_mode, _company_profile = self.resolve_task_session_config(task)
-        if exec_mode in {"company", "org", "custom"}:
+        try:
             target_info = await self._resolve_company_runtime_target(engine, task)
+        except ServiceError as exc:
+            if exc.code != "company_runtime_identity_mismatch":
+                raise
+            target_info = None
+        if target_info is None and is_company_runtime_task(task):
+            raise ServiceError(
+                "company_runtime_identity_mismatch",
+                "Company runtime identity could not be resolved; refusing task-mode cancellation",
+                {"task_id": resolved_task_id, "session_id": resolved_session_id},
+            )
+        if target_info is not None:
             stop_intent_id = str(uuid.uuid4())
             affected_task_ids = list(target_info.get("affected_task_ids", []) or [resolved_task_id])
             suspended: dict[str, Any] | None = None
             suspend = getattr(engine, "suspend_company_runtime", None)
-            await self._mark_company_runtime_stop_state(
-                engine=engine,
-                task_ids=affected_task_ids,
-                state="suspending",
-                stop_intent_id=stop_intent_id,
-            )
             if callable(suspend):
                 try:
                     suspended = await suspend(
                         origin_task_id=str(target_info.get("origin_task_id", "") or resolved_task_id),
-                        session_id=(str(target_info.get("parent_session_id", "") or resolved_session_id).strip() or None),
+                        session_id=(str(target_info.get("runtime_session_id", "") or resolved_session_id).strip() or None),
                         reason="user_stop",
                         checkpoint_type="company_runtime_suspended",
                         stop_intent_id=stop_intent_id,
                     )
                 except Exception:
                     logger.opt(exception=True).warning("suspend_company_runtime failed during service stop")
-            if suspended is not None:
-                for candidate in list(suspended.get("task_ids", []) or []):
-                    candidate_id = str(candidate or "").strip()
-                    if candidate_id and candidate_id not in affected_task_ids:
-                        affected_task_ids.append(candidate_id)
-                await self._mark_company_runtime_stop_state(
-                    engine=engine,
-                    task_ids=affected_task_ids,
-                    state="suspended",
-                    stop_intent_id=stop_intent_id,
-                    checkpoint_type=str(suspended.get("checkpoint_type", "") or "company_runtime_suspended"),
+            if suspended is None:
+                raise ServiceError(
+                    "company_runtime_suspend_failed",
+                    "Company runtime could not be suspended",
+                    {"runtime_session_id": target_info.get("runtime_session_id", "")},
                 )
-            else:
-                await self._mark_company_runtime_stop_state(
-                    engine=engine,
-                    task_ids=affected_task_ids,
-                    state="suspended",
-                    stop_intent_id=stop_intent_id,
-                    checkpoint_type="company_runtime_suspended",
-                )
+            for candidate in list(suspended.get("task_ids", []) or []):
+                candidate_id = str(candidate or "").strip()
+                if candidate_id and candidate_id not in affected_task_ids:
+                    affected_task_ids.append(candidate_id)
             self.context.stop_requested_task_ids.update(affected_task_ids)
             if self.context.cancel_session_tasks is not None:
                 for tid in affected_task_ids:
@@ -1009,8 +1065,7 @@ class SessionService:
                 "stop_intent_id": stop_intent_id,
                 "checkpoint_id": str((suspended or {}).get("checkpoint_id", "") or ""),
                 "task_ids": affected_task_ids,
-                "resume_parent_task_id": str(target_info.get("parent_task_id", "") or resolved_task_id),
-                "resume_parent_session_id": str(target_info.get("parent_session_id", "") or resolved_session_id),
+                "resume_parent_session_id": str(target_info.get("runtime_session_id", "") or resolved_session_id),
             }
             return ServiceResult(payload, [ServiceEvent("session_runtime_control", payload), ServiceEvent("session_updated", payload)])
 
@@ -1039,6 +1094,8 @@ class SessionService:
         project_id: str,
         task_id: str = "",
         session_id: str = "",
+        runtime_session_id: str = "",
+        checkpoint_id: str = "",
         target: str = "",
         content: str = "",
     ) -> ServiceResult:
@@ -1066,45 +1123,111 @@ class SessionService:
                 default_payload=default_payload,
             )
         engine = await self.context.engine_for_project(project_id)
-        exec_mode, company_profile = self.resolve_task_session_config(task)
-        target_info = await self._resolve_company_runtime_target(engine, task) if exec_mode in {"company", "org", "custom"} else {
+        try:
+            company_target = await self._resolve_company_runtime_target(
+                engine,
+                task,
+                runtime_session_id=runtime_session_id,
+                checkpoint_id=checkpoint_id,
+            )
+        except ServiceError as exc:
+            if exc.code != "company_runtime_identity_mismatch" or runtime_session_id or checkpoint_id:
+                raise
+            if is_company_runtime_task(task):
+                raise
+            company_target = None
+        target_info = company_target or {
             "affected_task_ids": [resolved_task_id],
-            "parent_task_id": resolved_task_id,
-            "parent_session_id": resolved_session_id,
+            "ui_anchor_task_id": resolved_task_id,
+            "runtime_session_id": resolved_session_id,
+            "config_task": task,
+            "checkpoint": None,
         }
         affected_task_ids = list(target_info.get("affected_task_ids", []) or [resolved_task_id])
-        await self._clear_company_runtime_stop_state(engine=engine, task_ids=affected_task_ids)
         message = str(content or "").strip() or "Resume the existing runtime."
-        engine_mode = "company" if exec_mode == "company" else ("org" if exec_mode in {"org", "custom"} else "task")
-        org_id = self.resolve_task_org_id(task) if engine_mode == "org" else ""
+        config_task = target_info.get("config_task") or task
+        config_exec_mode, config_company_profile = self.resolve_task_session_config(config_task)
+        engine_mode = "company" if config_exec_mode == "company" else (
+            "org" if config_exec_mode in {"org", "custom"} else "task"
+        )
+        if engine_mode in {"company", "org"}:
+            checkpoint = target_info.get("checkpoint")
+            if checkpoint is None:
+                raise ServiceError("company_runtime_checkpoint_not_found", "No active company runtime checkpoint")
+            if str(getattr(checkpoint, "status", "") or "").strip().lower() != "pending":
+                raise ServiceError(
+                    "company_runtime_checkpoint_not_pending",
+                    "Company runtime checkpoint is not pending",
+                    {"checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or "")},
+                )
+        else:
+            checkpoint = None
+        org_id = self.resolve_task_org_id(config_task) if engine_mode == "org" else ""
+        message_metadata: dict[str, Any] = {"ui_force_resume": True}
+        if checkpoint is not None:
+            message_metadata.update({
+                "response_to_checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or ""),
+                "response_to_checkpoint_type": str(getattr(checkpoint, "checkpoint_type", "") or ""),
+            })
         response = await engine.process_message(
             message,
             project_id=self.context.normalize_project_id(project_id),
-            session_id=str(target_info.get("parent_session_id", "") or resolved_session_id),
+            session_id=str(target_info.get("runtime_session_id", "") or resolved_session_id),
             mode=engine_mode,
             org_id=org_id or None,
-            company_profile=company_profile if engine_mode == "company" else None,
-            preferred_agent=self.resolve_task_preferred_agent(task) if engine_mode == "task" else None,
-            origin_task_id=str(target_info.get("parent_task_id", "") or resolved_task_id),
-            message_metadata={"ui_force_resume": True},
+            company_profile=config_company_profile if engine_mode == "company" else None,
+            preferred_agent=self.resolve_task_preferred_agent(config_task) if engine_mode == "task" else None,
+            origin_task_id=(str(target_info.get("ui_anchor_task_id", "") or "").strip() or None),
+            message_metadata=message_metadata,
         )
+        runtime_control_state = "idle"
+        pending_runtime_checkpoint_id = ""
+        if engine_mode in {"company", "org"}:
+            refreshed_index = await load_company_runtime_identity_index(
+                engine.store,
+                self.context.normalize_project_id(project_id),
+            )
+            refreshed_identity = refreshed_index.resolve(
+                runtime_session_id=str(
+                    target_info.get("runtime_session_id", "") or resolved_session_id
+                ),
+            )
+            if refreshed_identity is not None and refreshed_identity.pending_checkpoint_id:
+                pending_runtime_checkpoint_id = refreshed_identity.pending_checkpoint_id
+                runtime_control_state = (
+                    "suspended"
+                    if refreshed_identity.pending_checkpoint_status == "pending"
+                    else "resuming"
+                )
         payload = {
             **default_payload,
-            "status": "resuming",
-            "runtime_control_state": "resuming",
-            "can_resume": False,
+            "status": runtime_control_state,
+            "runtime_control_state": runtime_control_state,
+            "can_resume": runtime_control_state == "suspended",
             "response": response,
             "task_ids": affected_task_ids,
-            "resume_parent_task_id": str(target_info.get("parent_task_id", "") or resolved_task_id),
-            "resume_parent_session_id": str(target_info.get("parent_session_id", "") or resolved_session_id),
+            "resume_parent_session_id": str(target_info.get("runtime_session_id", "") or resolved_session_id),
+            "pending_runtime_checkpoint_id": pending_runtime_checkpoint_id,
         }
         return ServiceResult(payload, [ServiceEvent("session_runtime_control", payload), ServiceEvent("session_updated", payload)])
 
-    async def resume(self, *, project_id: str, task_id: str = "", session_id: str = "", target: str = "", content: str = "") -> ServiceResult:
+    async def resume(
+        self,
+        *,
+        project_id: str,
+        task_id: str = "",
+        session_id: str = "",
+        runtime_session_id: str = "",
+        checkpoint_id: str = "",
+        target: str = "",
+        content: str = "",
+    ) -> ServiceResult:
         return await self.continue_run(
             project_id=project_id,
             task_id=task_id,
             session_id=session_id,
+            runtime_session_id=runtime_session_id,
+            checkpoint_id=checkpoint_id,
             target=target,
             content=content,
         )

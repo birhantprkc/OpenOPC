@@ -17,6 +17,10 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
+from opc.core.active_task_runs import (
+    ActiveTaskRunAdmissionClosed,
+    ActiveTaskRunRegistry,
+)
 from opc.core.config import DEFAULT_EXTERNAL_AGENT_STARTUP_TIMEOUT_SECONDS, DEFAULT_ORGANIZATION_ID
 from opc.core.models import (
     AdaptiveRoleProfile,
@@ -454,6 +458,26 @@ class WorkItemOutputBundle:
     work_item_updates: dict[str, Any] = field(default_factory=dict)
     runtime_audit_updates: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
+
+
+@dataclass(frozen=True)
+class CompanyExecutorDriverOwnership:
+    """One registry attempt covering a complete company scheduler run."""
+
+    registry: ActiveTaskRunRegistry
+    project_id: str
+    task_id: str
+    attempt_token: str
+
+    def bind(self):
+        return self.registry.bind_driver_attempt(self.attempt_token)
+
+    def release(self) -> bool:
+        return self.registry.unregister(
+            self.project_id,
+            self.task_id,
+            self.attempt_token,
+        )
 
 
 def serialize_company_runtime_spec(spec: CompanyRuntimeSpec | None) -> dict[str, Any]:
@@ -1354,6 +1378,7 @@ class CompanyWorkItemExecutor:
         store: Any | None = None,
         llm: Any | None = None,
         role_prompt_runner: Callable[[Task, str, dict[str, Any], str, bool], Awaitable[str | None]] | None = None,
+        active_task_run_registry: ActiveTaskRunRegistry | None = None,
     ) -> None:
         self.org_engine = org_engine
         self.communication = communication
@@ -1373,6 +1398,7 @@ class CompanyWorkItemExecutor:
         self.on_kanban_changed = on_kanban_changed
         self.work_item_timeout = work_item_timeout
         self.role_prompt_runner = role_prompt_runner
+        self.active_task_run_registry = active_task_run_registry
         self._default_run_state = CompanyExecutorRunState()
         self._run_state_var: ContextVar[CompanyExecutorRunState | None] = ContextVar(
             f"company-executor-run-state:{id(self)}",
@@ -3368,12 +3394,6 @@ class CompanyWorkItemExecutor:
             "cell_id": work_item.cell_id,
             "parent_work_item_id": work_item.parent_work_item_id,
         }
-        if work_item.phase == Phase.PAUSED:
-            task.metadata.setdefault("interrupted_recovery", {
-                "reason": "work_item_interrupted",
-                "detected_at": datetime.now().isoformat(),
-            })
-
         if task.metadata != before_metadata:
             changed = True
         return changed
@@ -4359,14 +4379,76 @@ class CompanyWorkItemExecutor:
             return "dispatch_required"
         return "worker_execute"
 
-    async def execute(self, plan: CompanyWorkItemRuntimePlan, tasks: list[Task]) -> str:
-        plan = _coerce_company_work_item_runtime_plan(plan) or CompanyWorkItemRuntimePlan()
-        plan.metadata = {
-            **dict(plan.metadata or {}),
-            "execution_model": "multi_team_org",
-            "runtime_model": "multi_team_org",
+    @staticmethod
+    def _driver_ownership_task(
+        tasks: list[Task],
+        *,
+        preferred_task_ids: set[str] | None = None,
+    ) -> Task | None:
+        preferred = {
+            str(task_id or "").strip()
+            for task_id in set(preferred_task_ids or set())
+            if str(task_id or "").strip()
         }
-        return await self._execute_multi_team_org(plan, tasks)
+        candidates = [
+            task
+            for task in tasks
+            if str(getattr(task, "id", "") or "").strip()
+            and (not preferred or task.id in preferred)
+        ]
+        for task in candidates:
+            if linked_work_item_id_for_task(task):
+                return task
+        for task in candidates:
+            if is_work_item_runtime_metadata(dict(task.metadata or {})):
+                return task
+        return candidates[0] if candidates else None
+
+    def acquire_driver_ownership(
+        self,
+        tasks: list[Task],
+        *,
+        preferred_task_ids: set[str] | None = None,
+    ) -> CompanyExecutorDriverOwnership | None:
+        registry = self.active_task_run_registry
+        task = self._driver_ownership_task(
+            tasks,
+            preferred_task_ids=preferred_task_ids,
+        )
+        if registry is None or task is None:
+            return None
+        project_id = str(task.project_id or "default").strip() or "default"
+        try:
+            attempt_token = registry.register(project_id, task.id)
+        except ActiveTaskRunAdmissionClosed as exc:
+            raise asyncio.CancelledError(str(exc)) from exc
+        return CompanyExecutorDriverOwnership(
+            registry=registry,
+            project_id=project_id,
+            task_id=task.id,
+            attempt_token=attempt_token,
+        )
+
+    async def execute(
+        self,
+        plan: CompanyWorkItemRuntimePlan,
+        tasks: list[Task],
+    ) -> str:
+        ownership = self.acquire_driver_ownership(tasks)
+        try:
+            plan = _coerce_company_work_item_runtime_plan(plan) or CompanyWorkItemRuntimePlan()
+            plan.metadata = {
+                **dict(plan.metadata or {}),
+                "execution_model": "multi_team_org",
+                "runtime_model": "multi_team_org",
+            }
+            if ownership is None:
+                return await self._execute_multi_team_org(plan, tasks)
+            with ownership.bind():
+                return await self._execute_multi_team_org(plan, tasks)
+        finally:
+            if ownership is not None:
+                ownership.release()
 
     async def _execute_multi_team_org(
         self,
@@ -4501,11 +4583,11 @@ class CompanyWorkItemExecutor:
                 # Claim whatever is immediately claimable and spawn each
                 # work item as an independent asyncio.Task so the loop no
                 # longer blocks on the slowest sibling.
-                claims = await self.runtime.claim_runnable_tasks(tasks, work_items=work_items)
-                for member_session, claimed_task in claims:
-                    work_item_coro = self._run_claimed_work_item(member_session, claimed_task, {})
-                    work_item_task = asyncio.create_task(work_item_coro)
-                    active_work_item_tasks[work_item_task] = (member_session, claimed_task)
+                claims = await self._claim_and_create_work_item_tasks(
+                    tasks,
+                    work_items,
+                    active_work_item_tasks,
+                )
                 # Termination: only when nothing is in-flight AND nothing
                 # else is runnable.  If work items are still running, even an
                 # "empty runnable" snapshot may become non-empty within
@@ -4608,10 +4690,6 @@ class CompanyWorkItemExecutor:
                 self._schedule_kanban_notification()
         except asyncio.CancelledError:
             claimed_pairs = list(active_work_item_tasks.values())
-            claimed_tasks = [
-                claimed_task
-                for _member_session, claimed_task in claimed_pairs
-            ]
             for work_item_task in list(active_work_item_tasks.keys()):
                 if not work_item_task.done():
                     work_item_task.cancel()
@@ -4660,63 +4738,6 @@ class CompanyWorkItemExecutor:
                         )
                 except Exception:
                     logger.opt(exception=True).debug("company runtime cancellation: failed session idle reset")
-            for claimed_task in claimed_tasks:
-                if claimed_task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
-                    continue
-                claimed_task.metadata = dict(claimed_task.metadata or {})
-                claimed_task.metadata["company_runtime_suspended_at"] = datetime.now().isoformat()
-                claimed_task.metadata.setdefault("last_stop_reason", "runtime_cancelled")
-                claimed_task.metadata["company_runtime_stop_state"] = "suspended"
-                claimed_task.metadata["company_runtime_stop_marked_at"] = (
-                    claimed_task.metadata.get("company_runtime_stop_marked_at") or datetime.now().isoformat()
-                )
-                claimed_task.metadata.setdefault(
-                    "suspended_task_status",
-                    claimed_task.status.value if isinstance(claimed_task.status, TaskStatus) else str(claimed_task.status or ""),
-                )
-                work_item_id = linked_work_item_id_for_task(claimed_task)
-                try:
-                    if work_item_id and self._store_is_ready(self.store) and hasattr(self.store, "get_delegation_work_item"):
-                        work_item = await self.store.get_delegation_work_item(work_item_id)
-                    else:
-                        work_item = None
-                    if work_item is not None and getattr(work_item, "phase", None) not in {Phase.APPROVED, Phase.FAILED, Phase.CANCELLED}:
-                        phase = getattr(work_item, "phase", Phase.RUNNING)
-                        phase_value = phase.value if isinstance(phase, Phase) else str(phase or "")
-                        original_claim = {
-                            "claimed_by_role_runtime_session_id": str(getattr(work_item, "claimed_by_role_runtime_session_id", "") or ""),
-                            "claimed_by_seat_id": str(getattr(work_item, "claimed_by_seat_id", "") or ""),
-                            "claimed_by_role_session_id": str((getattr(work_item, "metadata", {}) or {}).get("claimed_by_role_session_id", "") or ""),
-                            "claimed_task_id": str((getattr(work_item, "metadata", {}) or {}).get("claimed_task_id", "") or claimed_task.id),
-                        }
-                        await self.store.update_delegation_work_item(
-                            work_item_id,
-                            metadata_updates={
-                                "dispatch_hold": "company_runtime_suspended",
-                                "suspended_at": datetime.now().isoformat(),
-                                "suspend_reason": claimed_task.metadata.get("last_stop_reason", "runtime_cancelled"),
-                                "suspended_phase": phase_value,
-                                "suspended_task_status": claimed_task.metadata.get("suspended_task_status", ""),
-                                "suspended_claim": original_claim,
-                                "claimed_by_role_session_id": "",
-                                "claimed_task_id": "",
-                            },
-                            claimed_by_role_runtime_session_id="",
-                            claimed_by_seat_id="",
-                        )
-                        claimed_task.metadata["dispatch_hold"] = "company_runtime_suspended"
-                        claimed_task.metadata["suspended_phase"] = phase_value
-                except Exception:
-                    logger.opt(exception=True).debug(
-                        "company runtime cancellation: failed suspend hold release",
-                    )
-                if self.save_task and self._store_is_ready(self.store):
-                    try:
-                        await self.save_task(claimed_task)
-                    except Exception:
-                        logger.opt(exception=True).debug(
-                            "company runtime cancellation: failed suspended task save",
-                        )
             raise
         finally:
             # Drain any work items still running (shouldn't happen given the
@@ -4738,6 +4759,97 @@ class CompanyWorkItemExecutor:
                         )
                 active_work_item_tasks.clear()
         return self._summarize_multi_team_org_results(tasks)
+
+    @staticmethod
+    def _runtime_scope_for_tasks(tasks: list[Task]) -> tuple[str, str]:
+        project_id = "default"
+        runtime_session_id = ""
+        for task in tasks:
+            project_id = str(task.project_id or project_id).strip() or "default"
+            metadata = dict(task.metadata or {})
+            runtime_session_id = str(
+                getattr(task, "parent_session_id", "")
+                or metadata.get("company_runtime_root_session_id")
+                or metadata.get("parent_session_id")
+                or ""
+            ).strip()
+            if runtime_session_id:
+                return project_id, runtime_session_id
+        for task in tasks:
+            runtime_session_id = str(getattr(task, "session_id", "") or "").strip()
+            if runtime_session_id:
+                return project_id, runtime_session_id
+        return project_id, ""
+
+    async def _claim_and_create_work_item_tasks(
+        self,
+        tasks: list[Task],
+        work_items: list[DelegationWorkItem],
+        active_work_item_tasks: dict[
+            asyncio.Task[TaskResult | None],
+            tuple[CompanyMemberSession, Task],
+        ],
+    ) -> list[tuple[CompanyMemberSession, Task]]:
+        """Keep durable claim and coroutine ownership in one scope boundary."""
+
+        async def claim_and_create() -> list[tuple[CompanyMemberSession, Task]]:
+            claims = await self.runtime.claim_runnable_tasks(
+                tasks,
+                work_items=work_items,
+            )
+            for member_session, claimed_task in claims:
+                work_item_task = self._create_claimed_work_item_task(
+                    member_session,
+                    claimed_task,
+                    {},
+                )
+                active_work_item_tasks[work_item_task] = (
+                    member_session,
+                    claimed_task,
+                )
+            return claims
+
+        registry = self.active_task_run_registry
+        project_id, runtime_session_id = self._runtime_scope_for_tasks(tasks)
+        if registry is None or not runtime_session_id:
+            return await claim_and_create()
+        async with registry.scope_lock(project_id, runtime_session_id):
+            return await claim_and_create()
+
+    def _create_claimed_work_item_task(
+        self,
+        member_session: CompanyMemberSession,
+        task: Task,
+        task_by_projection_id: dict[str, Task],
+    ) -> asyncio.Task[TaskResult | None]:
+        """Register ownership before scheduling the full claimed-item coroutine."""
+
+        registry = self.active_task_run_registry
+        project_id = str(task.project_id or "default").strip() or "default"
+        attempt_token = ""
+        if registry is not None:
+            try:
+                attempt_token = registry.register(project_id, task.id)
+            except ActiveTaskRunAdmissionClosed as exc:
+                raise asyncio.CancelledError(str(exc)) from exc
+
+        async def run_owned() -> TaskResult | None:
+            try:
+                return await self._run_claimed_work_item(
+                    member_session,
+                    task,
+                    task_by_projection_id,
+                )
+            finally:
+                if registry is not None and attempt_token:
+                    registry.unregister(project_id, task.id, attempt_token)
+
+        try:
+            return asyncio.create_task(run_owned())
+        except BaseException:
+            if registry is not None and attempt_token:
+                registry.unregister(project_id, task.id, attempt_token)
+            raise
 
     async def _run_claimed_work_item(
         self,
@@ -5298,69 +5410,10 @@ class CompanyWorkItemExecutor:
                     timeout=self.work_item_timeout,
                 )
             except asyncio.CancelledError:
-                task.metadata = dict(task.metadata or {})
-                task.metadata["company_runtime_suspended_at"] = datetime.now().isoformat()
-                task.metadata.setdefault("last_stop_reason", "runtime_cancelled")
-                task.metadata["company_runtime_stop_state"] = "suspended"
-                task.metadata["company_runtime_stop_marked_at"] = (
-                    task.metadata.get("company_runtime_stop_marked_at") or datetime.now().isoformat()
-                )
-                task.metadata.setdefault(
-                    "suspended_task_status",
-                    task.status.value if isinstance(task.status, TaskStatus) else str(task.status or ""),
-                )
-                work_item_id = linked_work_item_id_for_task(task)
-                store_ready = self._store_is_ready(self.store)
-                if work_item_id and self.store and store_ready:
-                    task.metadata.pop("progress_log", None)
-                    await append_work_item_progress(
-                        self.store,
-                        work_item_id,
-                        "Work item suspended by runtime cancellation.",
-                    )
-                else:
-                    progress = list(task.metadata.get("progress_log", []) or [])
-                    progress.append("Work item suspended by runtime cancellation.")
-                    task.metadata["progress_log"] = progress[-20:]
-                try:
-                    work_item = (
-                        await self.store.get_delegation_work_item(work_item_id)
-                        if work_item_id and store_ready and hasattr(self.store, "get_delegation_work_item")
-                        else None
-                    )
-                    if work_item is not None and getattr(work_item, "phase", None) not in {Phase.APPROVED, Phase.FAILED, Phase.CANCELLED}:
-                        phase = getattr(work_item, "phase", Phase.RUNNING)
-                        phase_value = phase.value if isinstance(phase, Phase) else str(phase or "")
-                        original_claim = {
-                            "claimed_by_role_runtime_session_id": str(getattr(work_item, "claimed_by_role_runtime_session_id", "") or ""),
-                            "claimed_by_seat_id": str(getattr(work_item, "claimed_by_seat_id", "") or ""),
-                            "claimed_by_role_session_id": str((getattr(work_item, "metadata", {}) or {}).get("claimed_by_role_session_id", "") or ""),
-                            "claimed_task_id": str((getattr(work_item, "metadata", {}) or {}).get("claimed_task_id", "") or task.id),
-                        }
-                        await self.store.update_delegation_work_item(
-                            work_item_id,
-                            metadata_updates={
-                                "dispatch_hold": "company_runtime_suspended",
-                                "suspended_at": datetime.now().isoformat(),
-                                "suspend_reason": task.metadata.get("last_stop_reason", "runtime_cancelled"),
-                                "suspended_phase": phase_value,
-                                "suspended_task_status": task.metadata.get("suspended_task_status", ""),
-                                "suspended_claim": original_claim,
-                                "claimed_by_role_session_id": "",
-                                "claimed_task_id": "",
-                            },
-                            claimed_by_role_runtime_session_id="",
-                            claimed_by_seat_id="",
-                        )
-                        task.metadata["dispatch_hold"] = "company_runtime_suspended"
-                        task.metadata["suspended_phase"] = phase_value
-                        task.status = task_status_for_phase(phase) if isinstance(phase, Phase) else task.status
-                except Exception:
-                    logger.opt(exception=True).debug(
-                        "company runtime cancellation: failed to apply suspend hold",
-                    )
-                if self.save_task and self._store_is_ready(self.store):
-                    await self.save_task(task)
+                # Suspension is a checkpoint transition owned by OPCEngine.
+                # This task object may be stale by the time cancellation is
+                # observed, so persisting it here can erase the canonical
+                # checkpoint type, stop intent, or WorkItem hold.
                 raise
             except asyncio.TimeoutError:
                 logger.error(f"Company work item {projection_id} timed out after {self.work_item_timeout}s")

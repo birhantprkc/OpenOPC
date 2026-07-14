@@ -2862,32 +2862,6 @@ class OPCStore:
             await self._db.commit()
             return cursor.rowcount > 0
 
-    async def renew_task_lock(self, task_id: str) -> bool:
-        """Refresh ``execution_locked_at`` for a live running task.
-
-        This is the heartbeat used by the WS handler while it is actively
-        processing a session message. It only updates rows whose ``status`` is
-        still ``running`` (anything else has already ended and must not keep a
-        live timestamp), and deliberately ignores ``execution_lock``: that bit
-        is set only by delegation checkout, while the office_ui dispatch path
-        serializes through an in-memory asyncio.Lock and never flips it. The
-        refreshed ``execution_locked_at`` is what ``reset_orphan_running_tasks``
-        compares against on startup to distinguish live work from abandoned
-        ``running`` rows.
-
-        Returns ``True`` when the row was still ``status=running`` (heartbeat
-        extended), ``False`` otherwise (task ended or gone — caller should
-        stop heartbeating).
-        """
-        assert self._db
-        now_iso = datetime.now().isoformat()
-        async with self._db.execute(
-            "UPDATE tasks SET execution_locked_at = ? WHERE id = ? AND status = 'running'",
-            (now_iso, task_id),
-        ) as cursor:
-            await self._db.commit()
-            return cursor.rowcount > 0
-
     async def release_task_lock(self, task_id: str) -> None:
         assert self._db
         await self._db.execute(
@@ -2895,37 +2869,6 @@ class OPCStore:
             (task_id,),
         )
         await self._db.commit()
-
-    async def reset_orphan_running_tasks(self, *, lease_seconds: int = 300) -> dict[str, int]:
-        """Reset ``status=running`` tasks abandoned by a prior process.
-
-        Safe single-process assumption: when this runs during server startup,
-        any task that still claims ``status=running`` must be an orphan — its
-        worker coroutine died with the previous process. We revert it to
-        ``idle`` so the UI can Continue it, and clear any stale execution lock
-        regardless of status when the lease has expired.
-
-        Returns a summary dict with keys ``statuses_reset`` and
-        ``locks_cleared`` giving the affected row counts.
-        """
-        assert self._db
-        cutoff_iso = (datetime.now() - timedelta(seconds=int(lease_seconds))).isoformat()
-        async with self._db.execute(
-            "UPDATE tasks SET status = 'idle', execution_lock = 0, execution_locked_at = NULL "
-            "WHERE status = 'running' AND ("
-            "execution_locked_at IS NULL OR execution_locked_at < ?"
-            ")",
-            (cutoff_iso,),
-        ) as cursor:
-            statuses_reset = cursor.rowcount or 0
-        async with self._db.execute(
-            "UPDATE tasks SET execution_lock = 0, execution_locked_at = NULL "
-            "WHERE execution_lock = 1 AND execution_locked_at IS NOT NULL AND execution_locked_at < ?",
-            (cutoff_iso,),
-        ) as cursor:
-            locks_cleared = cursor.rowcount or 0
-        await self._db.commit()
-        return {"statuses_reset": statuses_reset, "locks_cleared": locks_cleared}
 
     def _row_to_task(self, row: Any, description: Any) -> Task:
         cols = [d[0] for d in description]
@@ -5509,6 +5452,108 @@ class OPCStore:
         await self.save_delegation_work_item(item)
         return item
 
+    async def claim_delegation_work_item_if_dispatchable(
+        self,
+        work_item_id: str,
+        *,
+        expected_phase: Phase | str,
+        role_runtime_session_id: str,
+        seat_id: str,
+        task_id: str,
+        work_item_revision: int = 0,
+    ) -> DelegationWorkItem | None:
+        """Atomically claim an unheld, unowned dispatchable WorkItem.
+
+        The dispatcher may be operating on a snapshot loaded before a Stop or
+        shutdown transition.  Keeping the phase, claim, queue, and durable
+        hold predicates in the same UPDATE prevents that stale snapshot from
+        resurrecting a suspended WorkItem.
+        """
+
+        phase = coerce_phase(expected_phase)
+        dispatchable_phases = {
+            Phase.READY,
+            Phase.READY_FOR_REWORK,
+            *IN_PROGRESS_PHASES,
+        }
+        if phase not in dispatchable_phases:
+            return None
+        if phase != Phase.RUNNING:
+            validate_transition(phase, Phase.RUNNING)
+        role_session_id = str(role_runtime_session_id or "").strip()
+        claimed_task_id = str(task_id or "").strip()
+        if not work_item_id or not role_session_id or not claimed_task_id:
+            return None
+
+        updated_at = datetime.now()
+        db = self._require_db()
+        cursor = await db.execute(
+            """UPDATE delegation_work_items
+               SET phase = ?,
+                   role_runtime_session_id = ?,
+                   claimed_by_role_runtime_session_id = ?,
+                   claimed_by_seat_id = ?,
+                   metadata = json_set(
+                       COALESCE(NULLIF(metadata, ''), '{}'),
+                       '$.claimed_by_role_session_id', ?,
+                       '$.claimed_task_id', ?,
+                       '$.claimed_work_item_revision', ?
+                   ),
+                   updated_at = ?
+               WHERE work_item_id = ?
+                 AND phase = ?
+                 AND COALESCE(claimed_by_role_runtime_session_id, '') = ''
+                 AND COALESCE(claimed_by_seat_id, '') = ''
+                 AND COALESCE(json_extract(metadata, '$.claimed_by_role_session_id'), '') = ''
+                 AND COALESCE(json_extract(metadata, '$.claimed_task_id'), '') = ''
+                 AND COALESCE(json_extract(metadata, '$.dispatch_hold'), '') = ''
+                 AND COALESCE(json_extract(metadata, '$.queued_behind_session'), '') = ''
+                 AND COALESCE(
+                       CAST(json_extract(metadata, '$.manager_mutation_revision') AS INTEGER),
+                       0
+                     ) = ?""",
+            (
+                Phase.RUNNING.value,
+                role_session_id,
+                role_session_id,
+                str(seat_id or "").strip(),
+                role_session_id,
+                claimed_task_id,
+                int(work_item_revision or 0),
+                updated_at.isoformat(),
+                str(work_item_id or "").strip(),
+                phase.value,
+                int(work_item_revision or 0),
+            ),
+        )
+        await db.commit()
+        if not (getattr(cursor, "rowcount", 0) or 0):
+            return None
+        persisted = await self.get_delegation_work_item(work_item_id)
+        if persisted is None:
+            return None
+        persisted_metadata = dict(persisted.metadata or {})
+        if (
+            persisted.phase != Phase.RUNNING
+            or str(persisted.claimed_by_role_runtime_session_id or "").strip()
+            != role_session_id
+            or str(persisted_metadata.get("claimed_by_role_session_id", "") or "").strip()
+            != role_session_id
+            or str(persisted_metadata.get("claimed_task_id", "") or "").strip()
+            != claimed_task_id
+            or str(persisted_metadata.get("dispatch_hold", "") or "").strip()
+            or str(persisted_metadata.get("queued_behind_session", "") or "").strip()
+        ):
+            # Stop/shutdown may have won immediately after the CAS commit and
+            # cleared this claim while adding a durable hold.  The committed
+            # UPDATE is not permission to spawn once that newer state exists.
+            return None
+        # Do not fire the generic phase hooks here.  The executor's first
+        # idempotent RUNNING transition performs projection.  Deferring it
+        # avoids a post-commit hook racing after Stop and projecting the Task
+        # back to RUNNING from an already-held WorkItem.
+        return persisted
+
     async def apply_delegation_review_resolution(
         self,
         work_item_id: str,
@@ -7147,6 +7192,262 @@ class OPCStore:
             ),
         )
         await self._db.commit()
+
+    async def get_or_create_active_execution_checkpoint(
+        self,
+        checkpoint: ExecutionCheckpoint,
+        *,
+        checkpoint_types: list[str] | tuple[str, ...] | set[str],
+        create_if_missing: bool = True,
+    ) -> tuple[ExecutionCheckpoint | None, bool]:
+        """Atomically reuse or create one active checkpoint for a session scope.
+
+        ``BEGIN IMMEDIATE`` serializes checkpoint creation across independent
+        controller/store connections.  It also repairs historical duplicate
+        active rows in the same transaction, so concurrent startup/shutdown
+        reconcilers can never supersede each other's newly-created checkpoint
+        and leave the scope without a durable recovery point.
+        """
+
+        assert self._db
+        clean_types = sorted(
+            {
+                str(item).strip()
+                for item in checkpoint_types
+                if str(item).strip()
+            }
+        )
+        project_id = str(checkpoint.project_id or "default").strip() or "default"
+        session_id = str(checkpoint.session_id or "").strip()
+        checkpoint_type = str(checkpoint.checkpoint_type or "").strip()
+        if not session_id:
+            raise ValueError("active execution checkpoint requires session_id")
+        if checkpoint_type not in clean_types:
+            raise ValueError(
+                "checkpoint_type must be included in the active checkpoint scope"
+            )
+
+        placeholders = ", ".join("?" for _ in clean_types)
+        try:
+            await self._db.execute("BEGIN IMMEDIATE")
+            async with self._db.execute(
+                f"""SELECT * FROM execution_checkpoints
+                WHERE project_id = ?
+                  AND session_id = ?
+                  AND checkpoint_type IN ({placeholders})
+                  AND status IN ('pending', 'resuming')
+                ORDER BY updated_at DESC, created_at DESC, checkpoint_id DESC""",
+                (project_id, session_id, *clean_types),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                cols = [description[0] for description in cursor.description]
+
+            if rows:
+                decoded = [dict(zip(cols, row)) for row in rows]
+                winner_data = decoded[0]
+                winner_id = str(winner_data["checkpoint_id"])
+                now = datetime.now().isoformat()
+                for duplicate in decoded[1:]:
+                    duplicate_id = str(duplicate.get("checkpoint_id", "") or "").strip()
+                    if not duplicate_id:
+                        continue
+                    payload = _json_loads(duplicate.get("payload"), {})
+                    payload["superseded_at"] = now
+                    payload["superseded_by_checkpoint_id"] = winner_id
+                    await self._db.execute(
+                        """UPDATE execution_checkpoints
+                        SET status = 'superseded', payload = ?, updated_at = ?
+                        WHERE checkpoint_id = ? AND status IN ('pending', 'resuming')""",
+                        (_json_dumps(payload), now, duplicate_id),
+                    )
+                await self._db.commit()
+                return (
+                    ExecutionCheckpoint(
+                        checkpoint_id=winner_id,
+                        project_id=str(winner_data["project_id"]),
+                        session_id=winner_data.get("session_id"),
+                        checkpoint_type=str(winner_data["checkpoint_type"]),
+                        status=str(winner_data["status"]),
+                        task_id=winner_data.get("task_id"),
+                        payload=_json_loads(winner_data.get("payload"), {}),
+                        created_at=datetime.fromisoformat(str(winner_data["created_at"])),
+                        updated_at=datetime.fromisoformat(str(winner_data["updated_at"])),
+                    ),
+                    False,
+                )
+
+            if not create_if_missing:
+                await self._db.commit()
+                return None, False
+
+            await self._db.execute(
+                """INSERT INTO execution_checkpoints
+                (checkpoint_id, project_id, session_id, checkpoint_type, status,
+                 task_id, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    checkpoint.checkpoint_id,
+                    project_id,
+                    session_id,
+                    checkpoint_type,
+                    checkpoint.status,
+                    checkpoint.task_id,
+                    _json_dumps(checkpoint.payload),
+                    checkpoint.created_at.isoformat(),
+                    checkpoint.updated_at.isoformat(),
+                ),
+            )
+            await self._db.commit()
+            return checkpoint, True
+        except Exception:
+            await self._db.rollback()
+            raise
+
+    async def normalize_active_execution_checkpoints(
+        self,
+        *,
+        project_id: str,
+        session_id: str,
+        checkpoint_types: list[str] | tuple[str, ...] | set[str],
+    ) -> ExecutionCheckpoint | None:
+        """Return one active scope owner while superseding duplicate rows.
+
+        Unlike creation, startup reconciliation must not manufacture a
+        checkpoint merely because none exists.  This wrapper reuses the same
+        serialized transaction and duplicate winner rule with insertion
+        explicitly disabled.
+        """
+
+        clean_types = sorted(
+            {
+                str(item).strip()
+                for item in checkpoint_types
+                if str(item).strip()
+            }
+        )
+        if not clean_types or not str(session_id or "").strip():
+            return None
+        candidate = ExecutionCheckpoint(
+            project_id=str(project_id or "default").strip() or "default",
+            session_id=str(session_id or "").strip(),
+            checkpoint_type=clean_types[0],
+        )
+        checkpoint, _created = await self.get_or_create_active_execution_checkpoint(
+            candidate,
+            checkpoint_types=clean_types,
+            create_if_missing=False,
+        )
+        return checkpoint
+
+    async def compare_and_set_execution_checkpoint(
+        self,
+        checkpoint_id: str,
+        *,
+        expected_statuses: list[str] | tuple[str, ...] | set[str],
+        status: str,
+        payload: dict[str, Any],
+        updated_at: datetime | None = None,
+    ) -> bool:
+        """Atomically transition a checkpoint only from an expected state.
+
+        The conditional UPDATE is the cross-controller guard for checkpoint
+        consumption.  In-memory scope locks serialize one Office controller;
+        this CAS prevents a standalone CLI/controller from claiming the same
+        pending runtime concurrently.
+        """
+
+        assert self._db
+        expected = [
+            str(item).strip()
+            for item in expected_statuses
+            if str(item).strip()
+        ]
+        if not checkpoint_id or not expected:
+            return False
+        placeholders = ", ".join("?" for _ in expected)
+        cursor = await self._db.execute(
+            f"""UPDATE execution_checkpoints
+            SET status = ?, payload = ?, updated_at = ?
+            WHERE checkpoint_id = ? AND status IN ({placeholders})""",
+            (
+                str(status or "").strip(),
+                _json_dumps(dict(payload or {})),
+                (updated_at or datetime.now()).isoformat(),
+                checkpoint_id,
+                *expected,
+            ),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
+    async def complete_execution_checkpoint_and_reopen_ui_anchor(
+        self,
+        checkpoint_id: str,
+        *,
+        project_id: str,
+        session_id: str,
+        expected_status: str,
+        status: str,
+        payload: dict[str, Any],
+        ui_anchor_task_id: str = "",
+        updated_at: datetime | None = None,
+    ) -> bool:
+        """Atomically complete a runtime handoff and reopen its UI anchor.
+
+        The anchor must never become chat-runnable if a concurrent Stop already
+        took checkpoint ownership back.  Keeping both writes in one SQLite
+        transaction makes the checkpoint CAS the gate for the UI projection.
+        """
+
+        assert self._db
+        checkpoint_id = str(checkpoint_id or "").strip()
+        project_id = str(project_id or "default").strip() or "default"
+        session_id = str(session_id or "").strip()
+        expected_status = str(expected_status or "").strip()
+        status = str(status or "").strip()
+        ui_anchor_task_id = str(ui_anchor_task_id or "").strip()
+        if not checkpoint_id or not session_id or not expected_status or not status:
+            return False
+        now = updated_at or datetime.now()
+        try:
+            await self._db.execute("BEGIN IMMEDIATE")
+            cursor = await self._db.execute(
+                """UPDATE execution_checkpoints
+                SET status = ?, payload = ?, updated_at = ?
+                WHERE checkpoint_id = ?
+                  AND project_id = ?
+                  AND session_id = ?
+                  AND status = ?""",
+                (
+                    status,
+                    _json_dumps(dict(payload or {})),
+                    now.isoformat(),
+                    checkpoint_id,
+                    project_id,
+                    session_id,
+                    expected_status,
+                ),
+            )
+            if cursor.rowcount != 1:
+                await self._db.rollback()
+                return False
+            if ui_anchor_task_id:
+                await self._db.execute(
+                    """UPDATE tasks
+                    SET status = ?, execution_lock = 0, execution_locked_at = NULL
+                    WHERE id = ? AND project_id = ? AND status = ?""",
+                    (
+                        TaskStatus.IDLE.value,
+                        ui_anchor_task_id,
+                        project_id,
+                        TaskStatus.CANCELLED.value,
+                    ),
+                )
+            await self._db.commit()
+            return True
+        except Exception:
+            await self._db.rollback()
+            raise
 
     async def get_execution_checkpoints(
         self,

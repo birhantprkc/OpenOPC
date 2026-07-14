@@ -32,4 +32,13 @@ class ServiceError(Exception):
         self.payload = dict(payload or {})
 
     def to_payload(self) -> dict[str, Any]:
-        return {"error": self.message, "code": self.code, **self.payload}
+        # Transport envelope fields are authoritative.  Business details may
+        # add context, but must never turn an error acknowledgement into a
+        # success or replace the exception's code/message.
+        payload = {
+            key: value
+            for key, value in self.payload.items()
+            if key not in {"ok", "error", "code"}
+        }
+        payload.update({"error": self.message, "code": self.code})
+        return payload

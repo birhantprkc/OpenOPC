@@ -27,6 +27,7 @@ from opc.database.store import _SQLiteConnectionAdapter
 from opc.layer2_organization import comms as file_comms
 from opc.plugins.office_ui.event_adapter import EventAdapter
 from opc.plugins.office_ui.chat_store import ChatStore
+from opc.plugins.office_ui.services.models import ServiceError
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1823,6 +1824,126 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ended), 1)
         self.handler._dispatch_session_message.assert_not_called()
 
+    async def _seed_cancelled_markerless_company_anchor(self) -> ExecutionCheckpoint:
+        anchor = await self.store.get_task(self.task_id)
+        assert anchor is not None
+        anchor.status = TaskStatus.CANCELLED
+        anchor.metadata = {}
+        await self.store.save_task(anchor)
+        await self.store.save_task(Task(
+            id="shared-final-decider",
+            title="Final decision",
+            project_id="test-project",
+            session_id=self.session_id,
+            parent_session_id=self.session_id,
+            linked_work_item_id="work-item-final",
+            status=TaskStatus.BLOCKED,
+            metadata={
+                "exec_mode": "company",
+                "company_profile": "corporate",
+                "work_item_runtime": True,
+                "work_item_projection_id": "final",
+                "shared_role_session": True,
+            },
+        ))
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="cp-markerless-anchor",
+            project_id="test-project",
+            session_id=self.session_id,
+            checkpoint_type="company_runtime_interrupted",
+            status="pending",
+            task_id="shared-final-decider",
+            payload={"parent_session_id": self.session_id},
+        )
+        await self.store.save_execution_checkpoint(checkpoint)
+        return checkpoint
+
+    async def test_cancelled_markerless_company_anchor_text_routes_by_checkpoint_identity(self) -> None:
+        checkpoint = await self._seed_cancelled_markerless_company_anchor()
+        self.handler._process_company_suspend_reply = AsyncMock()
+        fake_bg = object()
+
+        def _close_and_track(_task_id: str, coro: Any, **_kwargs: Any) -> object:
+            coro.close()
+            self.handler._task_bg_context[fake_bg] = {}
+            return fake_bg
+
+        self.handler._track_session = MagicMock(side_effect=_close_and_track)
+        ws = MagicMock()
+
+        await self.handler._handle_session_send(ws, {
+            "project_id": "test-project",
+            "task_id": self.task_id,
+            "content": "继续恢复这个 runtime。",
+        })
+
+        self.handler._process_company_suspend_reply.assert_called_once()
+        routed = self.handler._process_company_suspend_reply.call_args.kwargs
+        self.assertEqual(routed["ui_task_id"], self.task_id)
+        self.assertEqual(routed["runtime_session_id"], self.session_id)
+        self.assertEqual(routed["checkpoint"].checkpoint_id, checkpoint.checkpoint_id)
+        self.handler._track_session.assert_called_once()
+        anchor = await self.store.get_task(self.task_id)
+        assert anchor is not None
+        self.assertEqual(anchor.status, TaskStatus.CANCELLED)
+
+    async def test_cancelled_company_anchor_with_resuming_checkpoint_is_not_ended_early(self) -> None:
+        checkpoint = await self._seed_cancelled_markerless_company_anchor()
+        checkpoint.status = "resuming"
+        await self.store.save_execution_checkpoint(checkpoint)
+        self.handler._process_company_suspend_reply = AsyncMock()
+        self.handler._process_session_message = AsyncMock()
+        ws = MagicMock()
+
+        await self.handler._handle_session_send(ws, {
+            "project_id": "test-project",
+            "task_id": self.task_id,
+            "content": "不要重复恢复。",
+        })
+
+        ended = [
+            call for call in self.handler._send_ack.await_args_list
+            if call.kwargs.get("error") == "session_ended"
+        ]
+        self.assertEqual(ended, [])
+        self.handler._process_company_suspend_reply.assert_not_called()
+        self.handler._process_session_message.assert_not_called()
+
+    async def test_cancelled_markerless_company_anchor_button_routes_by_checkpoint_identity(self) -> None:
+        checkpoint = await self._seed_cancelled_markerless_company_anchor()
+        self.handler._process_company_suspend_reply = AsyncMock()
+        fake_bg = object()
+
+        def _close_and_track(_task_id: str, coro: Any, **_kwargs: Any) -> object:
+            coro.close()
+            self.handler._task_bg_context[fake_bg] = {}
+            return fake_bg
+
+        self.handler._track_session = MagicMock(side_effect=_close_and_track)
+        ws = MagicMock()
+
+        await self.handler._handle_session_resume(ws, {
+            "project_id": "test-project",
+            "task_id": self.task_id,
+            "runtime_session_id": self.session_id,
+            "checkpoint_id": checkpoint.checkpoint_id,
+        })
+
+        self.handler._process_company_suspend_reply.assert_called_once()
+        routed = self.handler._process_company_suspend_reply.call_args.kwargs
+        self.assertEqual(routed["ui_task_id"], self.task_id)
+        self.assertEqual(routed["runtime_session_id"], self.session_id)
+        self.assertEqual(routed["checkpoint"].checkpoint_id, checkpoint.checkpoint_id)
+        self.handler._send_ack.assert_awaited_with(
+            ws,
+            ok=True,
+            runtime_session_id=self.session_id,
+            checkpoint_id=checkpoint.checkpoint_id,
+        )
+        anchor = await self.store.get_task(self.task_id)
+        assert anchor is not None
+        self.assertEqual(anchor.status, TaskStatus.CANCELLED)
+
     async def test_done_company_session_send_is_reopened_for_followup(self) -> None:
         """Completed company chats can continue in the same CEO/company context."""
         ws = MagicMock()
@@ -1980,23 +2101,23 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
         }
         await self.store.save_task(task)
 
-        self.engine.get_active_company_runtime_suspend_checkpoint = AsyncMock(
-            return_value=SimpleNamespace(
-                checkpoint_id="cp-suspended",
-                checkpoint_type="company_runtime_suspended",
-                status="pending",
-                payload={},
-            )
-        )
+        await self.store.save_execution_checkpoint(ExecutionCheckpoint(
+            checkpoint_id="cp-suspended",
+            project_id="test-project",
+            session_id=self.session_id,
+            checkpoint_type="company_runtime_suspended",
+            status="pending",
+            payload={"parent_session_id": self.session_id},
+        ))
         self.handler._process_company_suspend_reply = AsyncMock()
         fake_bg = object()
 
-        def _close_and_track(coro: Any) -> object:
+        def _close_and_track(_task_id: str, coro: Any, **_kwargs: Any) -> object:
             coro.close()
+            self.handler._task_bg_context[fake_bg] = {}
             return fake_bg
 
-        self.handler._track = MagicMock(side_effect=_close_and_track)
-        self.handler._track_session = MagicMock()
+        self.handler._track_session = MagicMock(side_effect=_close_and_track)
 
         await self.handler._handle_session_send(ws, {
             "project_id": "test-project",
@@ -2004,12 +2125,38 @@ class TestWSHandlerSessionSend(unittest.IsolatedAsyncioTestCase):
             "content": "改成 Sapphire Tide Runner，并让 CEO 自己修改/删除/新增 work item。",
         })
 
-        self.handler._track_session.assert_not_called()
+        self.handler._track_session.assert_called_once()
         self.handler._process_company_suspend_reply.assert_called_once()
         call = self.handler._process_company_suspend_reply.call_args.kwargs
-        self.assertEqual(call["parent_task_id"], self.task_id)
-        self.assertEqual(call["parent_session_id"], self.session_id)
+        self.assertEqual(call["ui_task_id"], self.task_id)
+        self.assertEqual(call["runtime_session_id"], self.session_id)
+        self.assertEqual(call["checkpoint"].checkpoint_id, "cp-suspended")
         self.assertEqual(call["content"], "改成 Sapphire Tide Runner，并让 CEO 自己修改/删除/新增 work item。")
+
+    async def test_rejected_company_resume_refreshes_optimistic_runtime_control(self) -> None:
+        task = await self.store.get_task(self.task_id)
+        assert task is not None
+        task.metadata = {"exec_mode": "company", "company_profile": "corporate"}
+        await self.store.save_task(task)
+        self.handler._refresh_runtime_control_for_client = AsyncMock()
+        ws = MagicMock()
+
+        await self.handler._handle_session_resume(ws, {
+            "project_id": "test-project",
+            "task_id": self.task_id,
+            "runtime_session_id": self.session_id,
+        })
+
+        self.handler._send_ack.assert_awaited_once_with(
+            ws,
+            ok=False,
+            error="missing_checkpoint_id",
+        )
+        self.handler._refresh_runtime_control_for_client.assert_awaited_once_with(
+            ws,
+            engine=self.engine,
+            project_id="test-project",
+        )
 
     async def test_session_send_persists_attachment_refs_and_dispatches_them(self) -> None:
         """Uploaded session attachments should be stored and forwarded into engine execution."""
@@ -3264,6 +3411,37 @@ class TestWSHandlerSessionStop(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(msg["payload"]["task_id"] == "stop-parent" and msg["payload"]["status"] == "idle" for msg in status_updates))
         self.assertTrue(any(msg["payload"]["task_id"] == "stop-child" and msg["payload"]["status"] == "cancelled" for msg in status_updates))
 
+    async def test_company_identity_failure_is_rejected_without_task_tree_cancel(self) -> None:
+        ws = MagicMock()
+        task = Task(
+            id="company-stop-mismatch",
+            title="Company runtime",
+            session_id="company-stop-session",
+            project_id="test-project",
+            status=TaskStatus.RUNNING,
+            metadata={"exec_mode": "company", "company_profile": "corporate"},
+        )
+        await self.store.save_task(task)
+        self.handler._resolve_company_runtime_target = AsyncMock(return_value=None)
+        self.handler._cancel_task_tree = AsyncMock()
+
+        await self.handler._handle_session_stop(
+            ws,
+            {"project_id": "test-project", "task_id": task.id},
+        )
+
+        self.handler._cancel_task_tree.assert_not_awaited()
+        self.handler._send_ack.assert_awaited_once_with(
+            ws,
+            ok=False,
+            error="company_runtime_identity_mismatch",
+            project_id="test-project",
+            task_id=task.id,
+        )
+        persisted = await self.store.get_task(task.id)
+        assert persisted is not None
+        self.assertEqual(persisted.status, TaskStatus.RUNNING)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test 6: WSHandler — on_opc_event child_session_created
@@ -3711,7 +3889,7 @@ class TestWSHandlerSessionDetail(unittest.IsolatedAsyncioTestCase):
             "execution_checkpoint_lifecycle",
         )
 
-    async def test_session_detail_includes_runtime_control_state(self) -> None:
+    async def test_session_detail_uses_controller_registry_for_runtime_control_state(self) -> None:
         ws = MagicMock()
         ws.send_json = AsyncMock()
         task = Task(
@@ -3735,8 +3913,17 @@ class TestWSHandlerSessionDetail(unittest.IsolatedAsyncioTestCase):
 
         payload = ws.send_json.await_args.args[0]["payload"]
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["session_state"].get("runtime_control_state"), "running")
-        self.assertTrue(payload["session_state"].get("can_stop"))
+        self.assertEqual(payload["session_state"].get("runtime_control_state"), "idle")
+        self.assertFalse(payload["session_state"].get("can_stop"))
+
+        self.engine._task_runtime_is_live = AsyncMock(return_value=True)
+        await self.handler._handle_session_detail(
+            ws,
+            {"project_id": "test-project", "task_id": "custom-running-task"},
+        )
+        live_payload = ws.send_json.await_args.args[0]["payload"]
+        self.assertEqual(live_payload["session_state"].get("runtime_control_state"), "running")
+        self.assertTrue(live_payload["session_state"].get("can_stop"))
 
     async def test_session_detail_prefers_task_description_for_role_prompt_context(self) -> None:
         ws = MagicMock()
@@ -4582,10 +4769,13 @@ class TestWSHandlerShutdown(unittest.IsolatedAsyncioTestCase):
 
         ws.send_json.assert_awaited_once()
 
-    async def test_shutdown_closes_clients_and_waits_for_active_messages(self) -> None:
+    async def test_shutdown_closes_clients_and_cancels_non_handoff_messages(self) -> None:
         ws = MagicMock()
         ws.closed = False
         ws.closing = False
+        self.handler._root_engine.prepare_active_company_runtimes_for_shutdown = AsyncMock(
+            return_value=[]
+        )
 
         async def _close(*_args: Any, **_kwargs: Any) -> None:
             ws.closed = True
@@ -4593,23 +4783,16 @@ class TestWSHandlerShutdown(unittest.IsolatedAsyncioTestCase):
         ws.close = AsyncMock(side_effect=_close)
         self.handler._clients.add(ws)
 
-        blocker = asyncio.Event()
-
         async def _active_message() -> None:
-            await blocker.wait()
+            await asyncio.Event().wait()
 
         active_task = asyncio.create_task(_active_message())
         self.handler._active_message_tasks.add(active_task)
 
-        shutdown_task = asyncio.create_task(self.handler.shutdown(timeout=0.5))
-        await asyncio.sleep(0.05)
-        self.assertFalse(shutdown_task.done())
-
-        blocker.set()
-        await shutdown_task
-        await active_task
+        await self.handler.shutdown(timeout=0.5)
 
         ws.close.assert_awaited_once()
+        self.assertTrue(active_task.cancelled())
         self.assertTrue(self.handler._shutting_down)
 
 
@@ -4966,6 +5149,312 @@ class TestOfficeServiceExecutionIdentity(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await self.chat_store._db.close()
+
+    async def test_continue_uses_scope_config_for_markerless_cancelled_ui_anchor(self) -> None:
+        anchor = Task(
+            id="service-ui-anchor",
+            title="Company chat",
+            session_id="service-runtime-session",
+            project_id="test-project",
+            status=TaskStatus.CANCELLED,
+            metadata={},
+        )
+        final_decider = Task(
+            id="service-final-decider",
+            title="Final decision",
+            session_id="service-runtime-session",
+            parent_session_id="service-runtime-session",
+            project_id="test-project",
+            status=TaskStatus.BLOCKED,
+            linked_work_item_id="service-work-item",
+            metadata={
+                "exec_mode": "company",
+                "company_profile": "corporate",
+                "work_item_runtime": True,
+                "work_item_projection_id": "final",
+                "shared_role_session": True,
+            },
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="service-runtime-checkpoint",
+            project_id="test-project",
+            session_id="service-runtime-session",
+            checkpoint_type="company_runtime_interrupted",
+            status="pending",
+            task_id=final_decider.id,
+            payload={"parent_session_id": "service-runtime-session"},
+        )
+        await self.store.save_task(anchor)
+        await self.store.save_task(final_decider)
+        await self.store.save_execution_checkpoint(checkpoint)
+
+        await self.session_service.continue_run(
+            project_id="test-project",
+            task_id=anchor.id,
+            runtime_session_id="service-runtime-session",
+            checkpoint_id=checkpoint.checkpoint_id,
+            content="continue",
+        )
+
+        call = self.engine.process_message.await_args
+        self.assertEqual(call.kwargs["mode"], "company")
+        self.assertEqual(call.kwargs["session_id"], "service-runtime-session")
+        self.assertEqual(call.kwargs["origin_task_id"], anchor.id)
+        self.assertEqual(
+            call.kwargs["message_metadata"]["response_to_checkpoint_id"],
+            checkpoint.checkpoint_id,
+        )
+        persisted_anchor = await self.store.get_task(anchor.id)
+        assert persisted_anchor is not None
+        self.assertEqual(persisted_anchor.status, TaskStatus.CANCELLED)
+
+    async def test_company_continue_preserves_requested_work_item_as_ui_channel(self) -> None:
+        anchor = Task(
+            id="service-channel-anchor",
+            title="Company chat",
+            session_id="service-channel-runtime",
+            project_id="test-project",
+            status=TaskStatus.CANCELLED,
+            metadata={"exec_mode": "company", "company_profile": "corporate"},
+        )
+        work_item = Task(
+            id="service-channel-work-item",
+            title="Shared final decision",
+            session_id="service-channel-runtime",
+            parent_session_id="service-channel-runtime",
+            project_id="test-project",
+            status=TaskStatus.BLOCKED,
+            linked_work_item_id="service-channel-wi",
+            metadata={
+                "exec_mode": "company",
+                "company_profile": "corporate",
+                "work_item_runtime": True,
+                "work_item_projection_id": "final",
+                "shared_role_session": True,
+            },
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="service-channel-checkpoint",
+            project_id="test-project",
+            session_id="service-channel-runtime",
+            checkpoint_type="company_runtime_interrupted",
+            status="pending",
+            task_id=work_item.id,
+            payload={"parent_session_id": "service-channel-runtime"},
+        )
+        await self.store.save_task(anchor)
+        await self.store.save_task(work_item)
+        await self.store.save_execution_checkpoint(checkpoint)
+
+        result = await self.session_service.continue_run(
+            project_id="test-project",
+            task_id=work_item.id,
+            runtime_session_id="service-channel-runtime",
+            checkpoint_id=checkpoint.checkpoint_id,
+            content="continue",
+        )
+
+        call = self.engine.process_message.await_args
+        self.assertEqual(result.payload["task_id"], work_item.id)
+        self.assertEqual(call.kwargs["session_id"], "service-channel-runtime")
+        self.assertEqual(call.kwargs["origin_task_id"], anchor.id)
+
+    async def test_company_identity_failure_never_falls_back_to_task_mode_control(self) -> None:
+        from opc.plugins.office_ui.services.models import ServiceError
+
+        task = Task(
+            id="service-company-control",
+            title="Company control",
+            session_id="service-company-session",
+            project_id="test-project",
+            status=TaskStatus.RUNNING,
+            metadata={"exec_mode": "company", "company_profile": "corporate"},
+        )
+        await self.store.save_task(task)
+        mismatch = ServiceError(
+            "company_runtime_identity_mismatch",
+            "identity mismatch",
+        )
+        self.session_service._resolve_company_runtime_target = AsyncMock(
+            side_effect=mismatch,
+        )
+
+        with self.assertRaises(ServiceError) as stop_error:
+            await self.session_service.stop(
+                project_id="test-project",
+                task_id=task.id,
+            )
+        self.assertEqual(stop_error.exception.code, "company_runtime_identity_mismatch")
+
+        with self.assertRaises(ServiceError) as continue_error:
+            await self.session_service.continue_run(
+                project_id="test-project",
+                task_id=task.id,
+            )
+        self.assertEqual(continue_error.exception.code, "company_runtime_identity_mismatch")
+        persisted = await self.store.get_task(task.id)
+        assert persisted is not None
+        self.assertEqual(persisted.status, TaskStatus.RUNNING)
+
+    async def test_session_send_from_work_item_uses_runtime_checkpoint_identity(self) -> None:
+        anchor = Task(
+            id="service-send-anchor",
+            title="Company chat",
+            session_id="service-send-runtime",
+            project_id="test-project",
+            status=TaskStatus.CANCELLED,
+            metadata={},
+        )
+        final_decider = Task(
+            id="service-send-final",
+            title="Final decider",
+            session_id="service-send-runtime",
+            parent_session_id="service-send-runtime",
+            project_id="test-project",
+            linked_work_item_id="service-send-final-wi",
+            metadata={
+                "exec_mode": "company",
+                "company_profile": "corporate",
+                "work_item_runtime": True,
+                "work_item_projection_id": "final",
+                "shared_role_session": True,
+            },
+        )
+        worker = Task(
+            id="service-send-worker",
+            title="Worker",
+            session_id="service-send-runtime:role:worker",
+            parent_session_id="service-send-runtime",
+            project_id="test-project",
+            linked_work_item_id="service-send-worker-wi",
+            metadata={
+                "exec_mode": "company",
+                "company_profile": "corporate",
+                "work_item_runtime": True,
+                "work_item_projection_id": "worker",
+            },
+        )
+        original_worker_metadata = dict(worker.metadata)
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="service-send-checkpoint",
+            project_id="test-project",
+            session_id="service-send-runtime",
+            checkpoint_type="company_runtime_interrupted",
+            status="pending",
+            task_id=final_decider.id,
+            payload={"parent_session_id": "service-send-runtime"},
+        )
+        for task in (anchor, final_decider, worker):
+            await self.store.save_task(task)
+        await self.store.save_execution_checkpoint(checkpoint)
+
+        result = await self.session_service.send(
+            project_id="test-project",
+            task_id=worker.id,
+            content="revise and continue",
+        )
+
+        call = self.engine.process_message.await_args
+        self.assertEqual(result.payload["task_id"], worker.id)
+        self.assertEqual(result.payload["session_id"], "service-send-runtime")
+        self.assertEqual(call.kwargs["session_id"], "service-send-runtime")
+        self.assertEqual(call.kwargs["origin_task_id"], anchor.id)
+        self.assertEqual(call.kwargs["mode"], "company")
+        self.assertEqual(call.kwargs["message_metadata"], {
+            "response_to_checkpoint_id": checkpoint.checkpoint_id,
+            "response_to_checkpoint_type": checkpoint.checkpoint_type,
+        })
+        persisted_worker = await self.store.get_task(worker.id)
+        assert persisted_worker is not None
+        self.assertEqual(persisted_worker.metadata, original_worker_metadata)
+
+    async def test_session_send_rejects_resuming_checkpoint_without_engine_fallback(self) -> None:
+        anchor = Task(
+            id="service-resuming-anchor",
+            title="Company chat",
+            session_id="service-resuming-runtime",
+            project_id="test-project",
+            status=TaskStatus.CANCELLED,
+            metadata={"exec_mode": "company", "company_profile": "corporate"},
+        )
+        checkpoint = ExecutionCheckpoint(
+            checkpoint_id="service-resuming-checkpoint",
+            project_id="test-project",
+            session_id="service-resuming-runtime",
+            checkpoint_type="company_runtime_suspended",
+            status="resuming",
+            task_id=anchor.id,
+            payload={"parent_session_id": "service-resuming-runtime"},
+        )
+        await self.store.save_task(anchor)
+        await self.store.save_execution_checkpoint(checkpoint)
+
+        with self.assertRaises(ServiceError) as raised:
+            await self.session_service.send(
+                project_id="test-project",
+                task_id=anchor.id,
+                content="continue twice",
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "company_runtime_checkpoint_not_pending",
+        )
+        self.engine.process_message.assert_not_called()
+
+    async def test_session_send_rejects_cancelled_task_mode_session(self) -> None:
+        task = Task(
+            id="service-cancelled-task-mode",
+            title="Cancelled task chat",
+            session_id="service-cancelled-task-session",
+            project_id="test-project",
+            status=TaskStatus.CANCELLED,
+            metadata={
+                "mode": "task",
+                "execution_mode": "task_mode",
+                "origin_task_id": "service-cancelled-task-mode",
+            },
+        )
+        await self.store.save_task(task)
+
+        with self.assertRaises(ServiceError) as raised:
+            await self.session_service.send(
+                project_id="test-project",
+                task_id=task.id,
+                content="must stay cancelled",
+            )
+
+        self.assertEqual(raised.exception.code, "session_ended")
+        self.engine.process_message.assert_not_called()
+
+    async def test_session_send_company_identity_mismatch_fails_closed(self) -> None:
+        task = Task(
+            id="service-send-mismatch",
+            title="Company chat",
+            session_id="service-send-mismatch-runtime",
+            project_id="test-project",
+            metadata={"exec_mode": "company", "company_profile": "corporate"},
+        )
+        await self.store.save_task(task)
+        self.session_service._resolve_company_runtime_target = AsyncMock(
+            side_effect=ServiceError(
+                "company_runtime_identity_mismatch",
+                "identity mismatch",
+            ),
+        )
+
+        with self.assertRaises(ServiceError) as raised:
+            await self.session_service.send(
+                project_id="test-project",
+                task_id=task.id,
+                content="do not fall back",
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "company_runtime_identity_mismatch",
+        )
+        self.engine.process_message.assert_not_called()
 
     async def test_session_send_prefers_persisted_org_identity_over_call_defaults(self) -> None:
         task = Task(

@@ -49,7 +49,7 @@ class HelpScreen(ModalScreen[None]):
             "  s: reply in session     m: move between columns\n"
             "  a / d: approve / deny checkpoint\n"
             "  e: checkpoint feedback (approve/deny with message)\n"
-            "  c: done  x: cancel  t: retry  w: runtime recovery\n"
+            "  c: done  x: cancel  t: retry\n"
             "\n"
             "Session Management\n"
             "  R: rename session       D: delete session\n"

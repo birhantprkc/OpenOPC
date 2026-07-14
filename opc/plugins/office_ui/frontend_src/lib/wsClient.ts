@@ -41,8 +41,6 @@ interface SocketHandlers {
   onProjectSwitched?: (payload: { project_id: string; switch_seq?: string }) => void
   onProjectDeleted?: (payload: { project_id: string }) => void
   onOrgInfo?: (payload: OrgInfoPayload) => void
-  onRecoveryStatus?: (payload: any) => void
-  onRecoveryResult?: (payload: any) => void
   onTalentList?: (payload: TalentListPayload) => void
   onTalentScanLocal?: (payload: { templates: Array<{ template_id: string; name: string; description: string; category: string; domains: string[]; tags: string[] }> }) => void
   onEmployeeDetail?: (payload: EmployeeDetailPayload) => void
@@ -169,7 +167,6 @@ const PROJECT_SCOPED_MESSAGE_TYPES = new Set([
   'session_update_title',
   'secretary_send',
   'project_index',
-  'recovery_action',
   'comms_state',
   'comms_read_message',
 ])
@@ -420,9 +417,22 @@ export class VisualSocketClient {
     this.send({ type: 'session_stop', project_id: pid, task_id: taskId })
   }
 
-  sessionResume(projectId: string, taskId: string, content?: string): void {
+  sessionResume(
+    projectId: string,
+    taskId: string,
+    runtimeSessionId?: string,
+    checkpointId?: string,
+    content?: string,
+  ): void {
     const pid = this.requireProjectId(projectId, 'session_resume')
-    this.send({ type: 'session_resume', project_id: pid, task_id: taskId, content })
+    this.send({
+      type: 'session_resume',
+      project_id: pid,
+      task_id: taskId,
+      runtime_session_id: runtimeSessionId,
+      checkpoint_id: checkpointId,
+      content,
+    })
   }
 
   sessionComplete(projectId: string, taskId: string): void {
@@ -646,11 +656,6 @@ export class VisualSocketClient {
     this.send({ type: 'org_saved_delete', name })
   }
 
-  recoveryAction(projectId: string, action: 'resume' | 'cancel' | 'scan', parentTaskId?: string): void {
-    const pid = this.requireProjectId(projectId, 'recovery_action')
-    this.send({ type: 'recovery_action', project_id: pid, action, parent_task_id: parentTaskId })
-  }
-
   commsState(projectId: string, opts?: { task_id?: string; session_id?: string }): void {
     const pid = this.requireProjectId(projectId, 'comms_state')
     this.send({ type: 'comms_state', project_id: pid, ...(opts || {}) })
@@ -800,12 +805,6 @@ export class VisualSocketClient {
           const projectId = typeof parsed.payload?.project_id === 'string' ? parsed.payload.project_id : ''
           if (projectId) this.commsState(projectId)
         } catch { /* ignore */ }
-        break
-      case 'recovery_status':
-        this.handlers.onRecoveryStatus?.(parsed.payload)
-        break
-      case 'recovery_result':
-        this.handlers.onRecoveryResult?.(parsed.payload)
         break
       case 'talent_list':
         this.handlers.onTalentList?.(parsed.payload)

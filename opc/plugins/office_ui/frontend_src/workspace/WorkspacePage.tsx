@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { AgentInfo, OrgInfoPayload, SavedOrgSummary } from '../types/visual'
-import { WorkItemRecoveryPanel } from './WorkItemRecoveryPanel'
 import type { ChatMessage, CheckpointReplyMetadata, OutgoingAttachmentPayload } from '../types/chat'
 import type { KanbanTask, Session, TaskPreferredAgent } from '../types/kanban'
 import type { BoardStoreState } from '../kanban/BoardStore'
@@ -253,7 +252,7 @@ interface WorkspacePageProps {
    */
   onContinueInNewChat?: (mode: 'task' | 'company' | 'org' | 'custom', companyProfile?: 'corporate' | 'custom', orgId?: string) => void
   onSessionStop?: (taskId: string) => void
-  onSessionResume?: (taskId: string) => void
+  onSessionResume?: (taskId: string, runtimeSessionId?: string, checkpointId?: string) => void
   onSessionComplete?: (taskId: string) => void
   onLoadSessionDetail?: (
     taskId: string,
@@ -263,9 +262,6 @@ interface WorkspacePageProps {
   onCollabSync?: () => void
   orgInfoData?: OrgInfoPayload | null
   onNavigateToOrg?: () => void
-  recoveryStatus?: any
-  onRecoveryResume?: (parentTaskId: string) => void
-  onRecoveryCancel?: (parentTaskId: string) => void
   commsState?: import('../lib/wsClient').CommsStatePayload | null
   commsMessage?: import('../lib/wsClient').CommsMessagePayload | null
   onCommsRefresh?: (opts?: { task_id?: string; session_id?: string; project_id?: string }) => void
@@ -305,9 +301,6 @@ export function WorkspacePage({
   onCollabSync,
   orgInfoData,
   onNavigateToOrg,
-  recoveryStatus,
-  onRecoveryResume,
-  onRecoveryCancel,
   commsState,
   commsMessage,
   onCommsRefresh,
@@ -988,13 +981,21 @@ export function WorkspacePage({
 
   const handleResume = useCallback(() => {
     const targetSession = activeConversation.runtimeSession ?? activeConversation.displaySession ?? activeSession
-    const targetTaskId = targetSession?.resumeParentTaskId ?? targetSession?.taskId ?? activeSessionId
-    if (targetTaskId) onSessionResume?.(targetTaskId)
+    const uiTaskId = activeSessionId ?? targetSession?.taskId
+    const runtimeSessionId = targetSession?.resumeParentSessionId
+      ?? targetSession?.parentSessionId
+      ?? targetSession?.sessionId
+    if (uiTaskId) {
+      onSessionResume?.(uiTaskId, runtimeSessionId, targetSession?.pendingRuntimeCheckpointId)
+    }
   }, [activeConversation.runtimeSession, activeConversation.displaySession, activeSession, activeSessionId, onSessionResume])
 
   const handleResumeTask = useCallback((taskId: string) => {
     const session = sessions.find(s => s.taskId === taskId)
-    onSessionResume?.(session?.resumeParentTaskId ?? taskId)
+    const runtimeSessionId = session?.resumeParentSessionId
+      ?? session?.parentSessionId
+      ?? session?.sessionId
+    onSessionResume?.(taskId, runtimeSessionId, session?.pendingRuntimeCheckpointId)
   }, [sessions, onSessionResume])
 
   const handleCompleteTask = useCallback((taskId: string) => {
@@ -1034,8 +1035,11 @@ export function WorkspacePage({
       }
       const targetTaskId = activeSessionId
       if (!targetTaskId) return
-      const checkpointReplyId = String(latestPendingCheckpointReply?.response_to_checkpoint_id ?? '').trim()
+      const runtimeSession = activeConversation.runtimeSession ?? activeConversation.displaySession ?? activeSession
+      const runtimeCheckpointId = String(runtimeSession?.pendingRuntimeCheckpointId ?? '').trim()
       let outgoingMetadata = latestPendingCheckpointReply
+        ?? (runtimeCheckpointId ? { response_to_checkpoint_id: runtimeCheckpointId } : undefined)
+      const checkpointReplyId = String(outgoingMetadata?.response_to_checkpoint_id ?? '').trim()
       if (!checkpointReplyId) {
         const uiMessageId = makeOptimisticUserMessageId()
         outgoingMetadata = { ...(latestPendingCheckpointReply ?? {}), ui_message_id: uiMessageId }
@@ -1050,7 +1054,7 @@ export function WorkspacePage({
       }
       dispatchSessionSend(targetTaskId, content, attachments, outgoingMetadata)
     },
-    [effectiveView.kind, activeSessionId, activeConversation.displaySession, activeSession, latestPendingCheckpointReply, chatStore, dispatchSessionSend, onSecretarySend],
+    [effectiveView.kind, activeSessionId, activeConversation.runtimeSession, activeConversation.displaySession, activeSession, latestPendingCheckpointReply, chatStore, dispatchSessionSend, onSecretarySend],
   )
 
   // ── MessageList send (checkpoint replies) ──
@@ -1114,13 +1118,6 @@ export function WorkspacePage({
       {/* Middle column: Kanban Board (hidden when panel maximized) */}
       {panelState !== 'maximized' && (
         <div className="workspace-board">
-          {recoveryStatus && onRecoveryResume && onRecoveryCancel && (
-            <WorkItemRecoveryPanel
-              data={recoveryStatus}
-              onResume={onRecoveryResume}
-              onCancel={onRecoveryCancel}
-            />
-          )}
           {agents.length > 0 && <AgentStatusBar agents={agents} tasks={boardStore.tasks} />}
           {isCompanyMode ? (
             boardStore.activeBoard && activeSession && (
@@ -1206,7 +1203,6 @@ export function WorkspacePage({
         onCommsRefresh={onCommsRefresh ? () => onCommsRefresh({ session_id: activeSession?.sessionId || undefined, project_id: projectId || undefined }) : undefined}
         onCommsReadMessage={onCommsReadMessage}
         orgInfoData={orgInfoData ?? null}
-        recoveryStatus={recoveryStatus ?? null}
         canShowTeamTab={canShowTeamTab}
         onTeamStopRun={activeSessionId ? () => onSessionStop?.(activeSessionId) : undefined}
         onTitleChange={onTitleChange}

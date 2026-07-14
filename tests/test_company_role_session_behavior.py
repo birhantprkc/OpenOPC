@@ -80,7 +80,6 @@ class SharedRoleSessionExecutionTests(unittest.IsolatedAsyncioTestCase):
             record_child_session_result=AsyncMock(),
             record_task_completion_async=AsyncMock(),
         )
-        engine._active_task_runs = set()
         engine._run_task_once = AsyncMock(
             return_value=TaskResult(status=TaskStatus.DONE, content="done", artifacts={})
         )
@@ -106,4 +105,3 @@ class SharedRoleSessionExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         engine.memory.record_assistant_turn.assert_awaited_once()
         engine.memory.record_child_session_result.assert_not_awaited()
-

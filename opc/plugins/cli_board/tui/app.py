@@ -15,7 +15,6 @@ from opc.plugins.cli_board.state.store import BoardStateStore
 from opc.plugins.cli_board.tui.screens.help import HelpScreen
 from opc.plugins.cli_board.tui.screens.palette import CommandPaletteScreen, PaletteCommand
 from opc.plugins.cli_board.tui.screens.prompt import PromptField, PromptScreen
-from opc.plugins.cli_board.tui.screens.recovery import RecoveryAction, RecoveryScreen
 from opc.plugins.cli_board.widgets.activity_pane import ActivityPaneWidget
 from opc.plugins.cli_board.widgets.context_tabs import ContextTabsWidget
 from opc.plugins.cli_board.widgets.detail_pane import DetailPaneWidget
@@ -36,7 +35,6 @@ if TYPE_CHECKING:
     from opc.plugins.cli_board.services.engine_facade import EngineFacade
     from opc.plugins.cli_board.services.event_bridge import CliBoardEventBridge
     from opc.plugins.cli_board.services.reconcile import ReconcileLoop
-    from opc.plugins.cli_board.services.recovery import CliRecoveryManager
 
 
 class CliBoardApp(App[None]):
@@ -74,7 +72,6 @@ class CliBoardApp(App[None]):
         Binding("x", "cancel_task", "Cancel"),
         Binding("t", "retry_selected", "Retry"),
         Binding("e", "checkpoint_feedback", "Feedback"),
-        Binding("w", "recovery_scan", "Recovery"),
         Binding("R", "rename_session", "Rename", show=False),
         Binding("D", "delete_session", "Delete", show=False),
         Binding("E", "switch_mode", "Mode", show=False),
@@ -115,7 +112,6 @@ class CliBoardApp(App[None]):
         self.repository: BoardRepository | None = None
         self.actions: BoardActions | None = None
         self.event_bridge: CliBoardEventBridge | None = None
-        self.recovery_manager: CliRecoveryManager | None = None
         self.reconcile_loop: ReconcileLoop | None = None
         self.exec_mode = "task"
         self.company_profile = "corporate"
@@ -143,13 +139,10 @@ class CliBoardApp(App[None]):
         from opc.plugins.cli_board.services.engine_facade import EngineFacade
         from opc.plugins.cli_board.services.event_bridge import CliBoardEventBridge
 
-        from opc.plugins.cli_board.services.recovery import CliRecoveryManager
-
         self.facade = EngineFacade(project_id=self.project_id)
         self.repository = BoardRepository(self.facade, project_id=self.project_id)
         self.actions = BoardActions(self.facade, project_id=self.project_id)
         self.event_bridge = CliBoardEventBridge(self._handle_board_event)
-        self.recovery_manager = CliRecoveryManager(self.facade)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -649,36 +642,6 @@ class CliBoardApp(App[None]):
             actions.approve_checkpoint(task.task_id, reply=reply),
             success_message=f"{label} checkpoint for {task.title}{suffix}.",
         )
-
-    def action_recovery_scan(self) -> None:
-        if self._readonly_guard():
-            return
-        self._action_recovery_scan()
-
-    @work(group="modal", exclusive=True)
-    async def _action_recovery_scan(self) -> None:
-        if self.recovery_manager is None:
-            self.status_widget.set_message("Recovery unavailable.")
-            return
-        status = await self.recovery_manager.get_status()
-        result = await self.push_screen_wait(RecoveryScreen(status))
-        if result is None:
-            return
-        if result.action == "resume":
-            self.status_widget.set_message(f"Resuming {result.parent_task_id}...")
-            outcome = await self.recovery_manager.resume(result.parent_task_id)
-            if outcome.get("ok"):
-                ids = outcome.get("resumed_work_item_projection_ids", [])
-                self.status_widget.set_message(f"Resumed {len(ids)} work item(s).")
-            else:
-                self.status_widget.set_message(f"Resume failed: {outcome.get('error', '?')}.")
-        elif result.action == "cancel":
-            outcome = await self.recovery_manager.cancel(result.parent_task_id)
-            if outcome.get("ok"):
-                self.status_widget.set_message(f"Cancelled {outcome.get('cancelled_count', 0)} task(s).")
-            else:
-                self.status_widget.set_message(f"Cancel failed: {outcome.get('error', '?')}.")
-        await self._refresh_snapshot(reason="recovery", silent=True)
 
     def action_rename_session(self) -> None:
         if self._readonly_guard():
@@ -1354,7 +1317,6 @@ class CliBoardApp(App[None]):
             PaletteCommand("view_focus", "Switch to Focus", "Zoom into the selected task.", "3"),
             PaletteCommand("view_pipeline", "Switch to Projection", "Show the read-only work-item projection for the selected company run.", "4"),
             PaletteCommand("view_org", "Switch to Organisation", "Show read-only org structure.", "5"),
-            PaletteCommand("recovery_scan", "Runtime Recovery", "Scan and resume interrupted company runtimes.", "w"),
             PaletteCommand("rename_session", "Rename Session", "Change the title of the selected task.", "R"),
             PaletteCommand("delete_session", "Delete Session", "Cancel and remove the selected task.", "D"),
             PaletteCommand("purge_cancelled", "Purge Cancelled Tasks", "Permanently delete all cancelled/failed tasks.", ""),
@@ -1382,7 +1344,6 @@ class CliBoardApp(App[None]):
             "project_delete",
             "session_config",
             "org_add_role",
-            "recovery_scan",
             "rename_session",
             "delete_session",
             "purge_cancelled",

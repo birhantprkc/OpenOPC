@@ -77,7 +77,6 @@ interface ContextPanelProps {
   onCommsRefresh?: () => void
   onCommsReadMessage?: (path: string) => void
   orgInfoData?: OrgInfoPayload | null
-  recoveryStatus?: Record<string, unknown> | null
   canShowTeamTab?: boolean
   onTeamStopRun?: () => void
 
@@ -497,7 +496,6 @@ export function ContextPanel({
   onCommsRefresh,
   onCommsReadMessage,
   orgInfoData,
-  recoveryStatus,
   canShowTeamTab = false,
   onTeamStopRun,
   onTitleChange,
@@ -1306,7 +1304,6 @@ export function ContextPanel({
                 <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
                   <ProjectCockpit
                     orgInfoData={orgInfoData ?? null}
-                    recoveryStatus={recoveryStatus ?? null}
                     commsState={commsState ?? null}
                     onStopRun={onTeamStopRun}
                     embedded

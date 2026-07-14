@@ -1116,6 +1116,34 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertEqual(calls, ["first", "second"])
         self.assertIn("Queued #1", console.export_text())
 
+    def test_chat_turn_controller_prepares_checkpoint_before_cancelling_active_turn(self) -> None:
+        state, _engine = self._make_state()
+
+        async def _run() -> list[str]:
+            order: list[str] = []
+            started = asyncio.Event()
+
+            async def active_turn() -> None:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    order.append("cancelled")
+
+            async def prepare() -> list[dict[str, Any]]:
+                order.append("prepared")
+                return []
+
+            state.engine.prepare_active_company_runtimes_for_shutdown = prepare
+            controller = ChatTurnController(state)
+            controller.active_task = asyncio.create_task(active_turn())
+            await started.wait()
+
+            await controller.shutdown()
+            return order
+
+        self.assertEqual(asyncio.run(_run()), ["prepared", "cancelled"])
+
     def test_busy_slash_policy_allows_readonly_and_blocks_mutating_commands(self) -> None:
         self.assertEqual(_busy_slash_policy("kanban", []), BusyCommandPolicy.IMMEDIATE_READONLY)
         self.assertEqual(_busy_slash_policy("logs", ["task-1"]), BusyCommandPolicy.IMMEDIATE_READONLY)
@@ -1168,6 +1196,17 @@ class CliSlashCommandTests(unittest.TestCase):
             "org_id": "quantum_harbor",
             "preferred_agent": "codex",
         })
+        store.checkpoints = [
+            SimpleNamespace(
+                checkpoint_id="cp-org-interrupted",
+                checkpoint_type="company_runtime_interrupted",
+                status="pending",
+                task_id="task-1",
+                session_id="sess-1",
+                updated_at=datetime(2026, 5, 17, 12, 0),
+                payload={},
+            )
+        ]
         state, engine = self._make_state(store=store)
         state.mode = "company"
         state.company_profile = "corporate"
@@ -1183,7 +1222,59 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertEqual(engine.calls[-1]["org_id"], "quantum_harbor")
         self.assertIsNone(engine.calls[-1]["company_profile"])
         self.assertEqual(engine.calls[-1]["preferred_agent"], "codex")
-        self.assertEqual(engine.calls[-1]["message_metadata"], {"ui_force_resume": True})
+        self.assertEqual(engine.calls[-1]["message_metadata"], {
+            "ui_force_resume": True,
+            "response_to_checkpoint_id": "cp-org-interrupted",
+            "response_to_checkpoint_type": "company_runtime_interrupted",
+        })
+
+    def test_company_continue_requires_a_durable_runtime_checkpoint(self) -> None:
+        console = Console(record=True, force_terminal=False, width=120)
+        store = self._Store()
+        store.tasks[0].metadata.update({
+            "exec_mode": "company",
+            "company_profile": "corporate",
+        })
+        state, engine = self._make_state(store=store)
+
+        async def _run() -> None:
+            await _handle_chat_slash_command(state, "/continue")
+
+        with patch("opc.cli.app.console", console):
+            asyncio.run(_run())
+
+        self.assertEqual(engine.calls, [])
+        self.assertIn("No suspended or interrupted company runtime", console.export_text())
+
+    def test_continue_slash_routes_to_durable_runtime_checkpoint(self) -> None:
+        store = self._Store()
+        store.checkpoints = [
+            SimpleNamespace(
+                checkpoint_id="cp-interrupted",
+                checkpoint_type="company_runtime_interrupted",
+                status="pending",
+                task_id="task-1",
+                session_id="sess-1",
+                updated_at=datetime(2026, 5, 17, 12, 0),
+                payload={},
+            )
+        ]
+        state, engine = self._make_state(store=store)
+        state.mode = "company"
+        state.runtime_control_state = "suspended"
+
+        async def _run() -> None:
+            await _handle_chat_slash_command(state, "/continue")
+
+        asyncio.run(_run())
+
+        self.assertEqual(engine.calls[-1]["session_id"], "sess-1")
+        self.assertEqual(engine.calls[-1]["message_metadata"], {
+            "ui_force_resume": True,
+            "response_to_checkpoint_id": "cp-interrupted",
+            "response_to_checkpoint_type": "company_runtime_interrupted",
+        })
+        self.assertEqual(state.runtime_control_checkpoint_id, "cp-interrupted")
 
     def test_plain_message_after_stop_routes_to_suspend_checkpoint(self) -> None:
         store = self._Store()
@@ -1209,7 +1300,127 @@ class CliSlashCommandTests(unittest.TestCase):
 
         self.assertEqual(engine.calls[-1]["message_metadata"]["response_to_checkpoint_id"], "cp-suspend")
         self.assertEqual(engine.calls[-1]["message_metadata"]["response_to_checkpoint_type"], "company_runtime_suspended")
-        self.assertEqual(state.runtime_control_state, "running")
+        self.assertEqual(state.runtime_control_state, "suspended")
+
+    def test_plain_message_from_company_child_uses_root_runtime_checkpoint(self) -> None:
+        store = self._Store()
+        now = datetime(2026, 5, 17, 12, 0)
+        store.tasks[0].metadata.update({
+            "exec_mode": "company",
+            "mode": "company",
+            "company_profile": "corporate",
+        })
+        store.tasks[0].parent_session_id = ""
+        store.tasks.append(SimpleNamespace(
+            id="worker-child",
+            title="Worker",
+            description="Worker turn",
+            status=TaskStatus.BLOCKED,
+            priority=3,
+            assigned_to="worker",
+            session_id="sess-1:role:worker",
+            parent_session_id="sess-1",
+            project_id="demo",
+            created_at=now,
+            tags=[],
+            result={},
+            linked_work_item_id="worker-item",
+            metadata={
+                "exec_mode": "company",
+                "work_item_runtime": True,
+                "work_item_projection_id": "worker",
+                "company_runtime_root_session_id": "sess-1",
+            },
+            context_snapshot={},
+        ))
+        store.checkpoints = [SimpleNamespace(
+            checkpoint_id="cp-child-interrupted",
+            checkpoint_type="company_runtime_interrupted",
+            status="pending",
+            task_id="task-1",
+            session_id="sess-1",
+            project_id="demo",
+            updated_at=now,
+            payload={"parent_session_id": "sess-1"},
+        )]
+        state, engine = self._make_state(store=store)
+        state.session_id = "sess-1:role:worker"
+        # The selected child channel may have left the CLI's ambient mode in
+        # task mode.  Runtime config, not ambient state, owns resumed execution.
+        state.mode = "task"
+
+        asyncio.run(_process_interactive_chat_message(state, "revise and continue"))
+
+        call = engine.calls[-1]
+        self.assertEqual(call["session_id"], "sess-1")
+        self.assertEqual(call["origin_task_id"], "task-1")
+        self.assertEqual(call["mode"], "company")
+        self.assertEqual(call["company_profile"], "corporate")
+        self.assertEqual(call["message_metadata"], {
+            "response_to_checkpoint_id": "cp-child-interrupted",
+            "response_to_checkpoint_type": "company_runtime_interrupted",
+        })
+
+    def test_plain_message_during_resuming_checkpoint_fails_closed(self) -> None:
+        console = Console(record=True, force_terminal=False, width=140)
+        store = self._Store()
+        store.tasks[0].metadata.update({
+            "exec_mode": "company",
+            "mode": "company",
+            "company_profile": "corporate",
+        })
+        store.checkpoints = [SimpleNamespace(
+            checkpoint_id="cp-resuming",
+            checkpoint_type="company_runtime_suspended",
+            status="resuming",
+            task_id="task-1",
+            session_id="sess-1",
+            project_id="demo",
+            updated_at=datetime(2026, 5, 17, 12, 0),
+            payload={"parent_session_id": "sess-1"},
+        )]
+        state, engine = self._make_state(store=store)
+        state.mode = "company"
+
+        with patch("opc.cli.app.console", console):
+            asyncio.run(_process_interactive_chat_message(state, "continue again"))
+
+        self.assertEqual(engine.calls, [])
+        self.assertIn("checkpoint is resuming", console.export_text())
+
+    def test_explicit_cli_runtime_checkpoint_mismatch_fails_closed(self) -> None:
+        console = Console(record=True, force_terminal=False, width=140)
+        store = self._Store()
+        store.tasks[0].metadata.update({
+            "exec_mode": "company",
+            "mode": "company",
+            "company_profile": "corporate",
+        })
+        store.checkpoints = [SimpleNamespace(
+            checkpoint_id="cp-current",
+            checkpoint_type="company_runtime_interrupted",
+            status="pending",
+            task_id="task-1",
+            session_id="sess-1",
+            project_id="demo",
+            updated_at=datetime(2026, 5, 17, 12, 0),
+            payload={"parent_session_id": "sess-1"},
+        )]
+        state, engine = self._make_state(store=store)
+        state.mode = "company"
+
+        with patch("opc.cli.app.console", console):
+            asyncio.run(_process_interactive_chat_message(
+                state,
+                "continue stale",
+                message_metadata={
+                    "response_to_checkpoint_id": "cp-stale",
+                    "response_to_checkpoint_type": "company_runtime_interrupted",
+                },
+            ))
+
+        self.assertEqual(engine.calls, [])
+        self.assertIn("checkpoint identity mismatch", console.export_text())
 
     def test_session_resume_still_switches_session(self) -> None:
         state, engine = self._make_state(store=self._Store())
@@ -1287,8 +1498,6 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertEqual(output["payload"]["checkpoint_id"], "cp-stop")
         self.assertEqual(output["cancelled"], ["task-company"])
         self.assertEqual(output["suspend_calls"][0]["session_id"], "sess-company")
-        self.assertEqual(output["task"].metadata["dispatch_hold"], "company_runtime_suspended")
-        self.assertEqual(output["task"].metadata["company_runtime_stop_state"], "suspended")
 
     def test_session_service_continue_uses_force_resume_metadata(self) -> None:
         class Store:
@@ -1305,9 +1514,16 @@ class CliSlashCommandTests(unittest.TestCase):
                     metadata={
                         "exec_mode": "company",
                         "company_profile": "corporate",
-                        "dispatch_hold": "company_runtime_suspended",
-                        "company_runtime_stop_state": "suspended",
                     },
+                )
+                self.checkpoint = SimpleNamespace(
+                    checkpoint_id="cp-company",
+                    checkpoint_type="company_runtime_suspended",
+                    status="pending",
+                    project_id="demo",
+                    session_id="sess-company",
+                    task_id="task-company",
+                    payload={},
                 )
 
             async def get_task(self, task_id: str):
@@ -1318,6 +1534,9 @@ class CliSlashCommandTests(unittest.TestCase):
 
             async def get_session(self, session_id: str):
                 return SimpleNamespace(session_id=session_id, project_id="demo")
+
+            async def get_execution_checkpoints(self, **_kwargs):
+                return [self.checkpoint]
 
             async def save_task(self, task):
                 self.task = task
@@ -1331,7 +1550,12 @@ class CliSlashCommandTests(unittest.TestCase):
 
             engine = SimpleNamespace(project_id="demo", store=Store(), process_message=process_message)
             context = OfficeServiceContext(engine=engine, agent_store=None, chat_store=None, event_adapter=None)
-            result = await SessionService(context).continue_run(project_id="demo", target="sess-company")
+            result = await SessionService(context).continue_run(
+                project_id="demo",
+                target="sess-company",
+                runtime_session_id="sess-company",
+                checkpoint_id="cp-company",
+            )
             self.assertEqual(result.payload["response"], "resumed")
             return calls
 
@@ -1340,7 +1564,11 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertEqual(calls[-1]["content"], "Resume the existing runtime.")
         self.assertEqual(calls[-1]["session_id"], "sess-company")
         self.assertEqual(calls[-1]["mode"], "company")
-        self.assertEqual(calls[-1]["message_metadata"], {"ui_force_resume": True})
+        self.assertEqual(calls[-1]["message_metadata"], {
+            "ui_force_resume": True,
+            "response_to_checkpoint_id": "cp-company",
+            "response_to_checkpoint_type": "company_runtime_suspended",
+        })
 
     def test_session_service_continue_preserves_custom_org_id(self) -> None:
         class Store:
@@ -1359,9 +1587,16 @@ class CliSlashCommandTests(unittest.TestCase):
                         "company_profile": "custom",
                         "org_id": "quantum_harbor",
                         "preferred_agent": "codex",
-                        "dispatch_hold": "company_runtime_suspended",
-                        "company_runtime_stop_state": "suspended",
                     },
+                )
+                self.checkpoint = SimpleNamespace(
+                    checkpoint_id="cp-org",
+                    checkpoint_type="company_runtime_interrupted",
+                    status="pending",
+                    project_id="demo",
+                    session_id="sess-org",
+                    task_id="task-org",
+                    payload={},
                 )
 
             async def get_task(self, task_id: str):
@@ -1372,6 +1607,9 @@ class CliSlashCommandTests(unittest.TestCase):
 
             async def get_session(self, session_id: str):
                 return SimpleNamespace(session_id=session_id, project_id="demo")
+
+            async def get_execution_checkpoints(self, **_kwargs):
+                return [self.checkpoint]
 
             async def save_task(self, task):
                 self.task = task
@@ -1385,7 +1623,12 @@ class CliSlashCommandTests(unittest.TestCase):
 
             engine = SimpleNamespace(project_id="demo", store=Store(), process_message=process_message)
             context = OfficeServiceContext(engine=engine, agent_store=None, chat_store=None, event_adapter=None)
-            result = await SessionService(context).continue_run(project_id="demo", target="sess-org")
+            result = await SessionService(context).continue_run(
+                project_id="demo",
+                target="sess-org",
+                runtime_session_id="sess-org",
+                checkpoint_id="cp-org",
+            )
             self.assertEqual(result.payload["response"], "resumed")
             return calls
 
@@ -1394,7 +1637,11 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertEqual(calls[-1]["mode"], "org")
         self.assertEqual(calls[-1]["org_id"], "quantum_harbor")
         self.assertIsNone(calls[-1]["company_profile"])
-        self.assertEqual(calls[-1]["message_metadata"], {"ui_force_resume": True})
+        self.assertEqual(calls[-1]["message_metadata"], {
+            "ui_force_resume": True,
+            "response_to_checkpoint_id": "cp-org",
+            "response_to_checkpoint_type": "company_runtime_interrupted",
+        })
 
     def test_queue_slash_lists_and_drops_queued_prompts(self) -> None:
         console = Console(record=True, force_terminal=False, width=160)
@@ -2648,49 +2895,16 @@ class CliSlashCommandTests(unittest.TestCase):
         self.assertIn("Pending Checkpoints", rendered)
         self.assertIn("cp-1", rendered)
 
-    def test_recover_slash_lists_and_resumes_interrupted_runtime(self) -> None:
+    def test_legacy_recover_slash_is_not_registered(self) -> None:
         console = Console(record=True, force_terminal=False, width=200)
         state, _engine = self._make_state(store=self._Store())
-        resume_calls: list[str] = []
 
-        class _FakeRecoveryManager:
-            async def get_status(self):
-                return SimpleNamespace(
-                    interrupted=[
-                        SimpleNamespace(
-                            parent_task_id="parent-task",
-                            parent_session_id="parent-session",
-                            title="Interrupted Runtime",
-                            profile="corporate",
-                            interrupted_at="2026-05-03T12:00:00",
-                            work_items=[
-                                SimpleNamespace(projection_id="wi-1", interrupted=True),
-                                SimpleNamespace(projection_id="wi-2", interrupted=False),
-                            ],
-                        )
-                    ],
-                    active_recoveries=[],
-                )
-
-            async def resume(self, parent_task_id: str):
-                resume_calls.append(parent_task_id)
-                if parent_task_id == "parent-task":
-                    return {"ok": True, "resumed_work_item_projection_ids": ["wi-1"]}
-                return {"ok": False, "error": "not_found"}
-
-        async def _run() -> None:
-            await _handle_chat_slash_command(state, "/recover")
-            await _handle_chat_slash_command(state, "/recover resume parent-task")
-            await _handle_chat_slash_command(state, "/recover resume cp-1")
-
-        with patch("opc.cli.app.console", console), patch("opc.cli.app._get_chat_recovery_manager", return_value=_FakeRecoveryManager()):
-            asyncio.run(_run())
+        with patch("opc.cli.app.console", console):
+            asyncio.run(_handle_chat_slash_command(state, "/recover"))
 
         rendered = console.export_text()
-        self.assertIn("Interrupted Runtime", rendered)
-        self.assertIn("Recovery started for parent-task", rendered)
-        self.assertIn("Checkpoint cp-1 is not resumed directly", rendered)
-        self.assertEqual(resume_calls, ["parent-task", "cp-1"])
+        self.assertIn("Unknown command: /recover", rendered)
+        self.assertNotIn("Interrupted Company Runtimes", rendered)
 
     def test_logs_slash_renders_task_and_session_runtime_details(self) -> None:
         console = Console(record=True, force_terminal=False, width=220)

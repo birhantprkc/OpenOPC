@@ -144,8 +144,10 @@ class EngineSeatExecutor:
         member_session: CompanyMemberSession | None = None,
     ) -> None:
         _ = member_session
-        if hasattr(self.host, "_active_task_runs"):
-            self.host._active_task_runs.discard(task.id)
+        # The task coroutine owns its registry attempt token and removes it in
+        # ``finally``.  Interrupt requests must not make a still-running
+        # coroutine appear inactive.
+        return None
 
     async def shutdown(
         self,

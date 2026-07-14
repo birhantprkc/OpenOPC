@@ -75,6 +75,8 @@ class CustomRuntimeRunner:
             store=shared_store,
             owns_store=shared_store is None,
             run_startup_reconcile=shared_store is None,
+            active_task_run_registry=getattr(self.parent, "_active_task_run_registry", None),
+            owns_active_task_run_registry=False,
             on_progress=self.parent.on_progress,
             on_runtime_event=self.parent.on_runtime_event,
             on_escalation=self.parent.on_escalation,

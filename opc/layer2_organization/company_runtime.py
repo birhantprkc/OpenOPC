@@ -1373,7 +1373,6 @@ class CompanyRuntime:
                             _skip("no task materialized for work_item this tick",
                                   session=session_label, work_item_id=work_item_id)
                             continue
-                    self._claimed_work_item_ids.add(work_item_id)
                 else:
                     task_id = queued_item_id
                     self._queued_task_ids.discard(task_id)
@@ -1392,6 +1391,30 @@ class CompanyRuntime:
                               status=getattr(task, "status", None))
                         continue
                     self._claimed_task_ids.add(task_id)
+                if work_item is not None:
+                    claimed = await self._claim_role_session_work_item(
+                        session,
+                        work_item,
+                        task,
+                    )
+                    if not claimed:
+                        fresh_work_item = None
+                        get_work_item = getattr(
+                            self.store,
+                            "get_delegation_work_item",
+                            None,
+                        )
+                        if callable(get_work_item):
+                            fresh_work_item = await get_work_item(work_item_id)
+                        if fresh_work_item is not None:
+                            work_item_map[work_item_id] = fresh_work_item
+                        _skip(
+                            "atomic WorkItem claim lost to a phase/hold/owner update",
+                            session=session_label,
+                            work_item_id=work_item_id,
+                        )
+                        continue
+                    self._claimed_work_item_ids.add(work_item_id)
                 if can_soft_wake and (
                     bool((task.metadata or {}).get("review_task", False))
                     or bool((task.metadata or {}).get("review_execution_work_item", False))
@@ -1412,7 +1435,6 @@ class CompanyRuntime:
                 self.prepare_task_for_session(session, task)
                 await self._sync_current_turn_mode_to_work_item(task, session.current_turn_mode)
                 if work_item is not None:
-                    await self._claim_role_session_work_item(session, work_item, task)
                     # #7: mirror the claim onto the in-memory work_item so
                     # subsequent iterations in the same claim pass see it
                     # and is_dispatchable returns False (race safety after
@@ -1908,21 +1930,65 @@ class CompanyRuntime:
         self.role_sessions[role_session_id] = role_session
         return role_session
 
-    async def _claim_role_session_work_item(self, session: CompanyMemberSession, work_item: Any, task: Task) -> None:
+    async def _claim_role_session_work_item(
+        self,
+        session: CompanyMemberSession,
+        work_item: Any,
+        task: Task,
+    ) -> bool:
         """Atomically claim ``work_item`` for the role-instance behind
         ``session``.
 
         In the role-instance model the claim identity is
         ``role_runtime_session_id``. Seat / manager-seat columns are
         still written for org-chart lookups but they are NOT part of
-        the claim key — only the role session is.
+        the claim key — only the role session is. Pure in-memory runtimes have
+        no durable race to arbitrate and keep the same local claim semantics.
         """
         work_item_id = str(getattr(work_item, "work_item_id", "") or "").strip()
         if not work_item_id:
-            return
+            return False
         role_session = self._ensure_role_session(task)
         if role_session is None:
-            return
+            return False
+        work_item_revision = 0
+        try:
+            work_item_revision = int((getattr(work_item, "metadata", {}) or {}).get("manager_mutation_revision") or 0)
+        except (TypeError, ValueError):
+            work_item_revision = 0
+        store_ready = self.store is not None and bool(
+            getattr(self.store, "is_ready", False)
+        )
+        claim = (
+            getattr(self.store, "claim_delegation_work_item_if_dispatchable", None)
+            if store_ready
+            else None
+        )
+        if store_ready:
+            # A durable runtime must win the store CAS before it mutates any
+            # in-memory scheduling state.  This is the Stop/shutdown race
+            # boundary: a missing CAS API is a failed claim, not permission to
+            # fall back to the former best-effort update path.
+            if not callable(claim):
+                return False
+            persisted = await claim(
+                work_item_id,
+                expected_phase=getattr(work_item, "phase", Phase.READY),
+                role_runtime_session_id=role_session.role_session_id,
+                seat_id=str(getattr(session, "seat_id", "") or "").strip(),
+                task_id=task.id,
+                work_item_revision=work_item_revision,
+            )
+            if persisted is None:
+                return False
+
+            work_item.phase = persisted.phase
+            work_item.role_runtime_session_id = persisted.role_runtime_session_id
+            work_item.claimed_by_role_runtime_session_id = (
+                persisted.claimed_by_role_runtime_session_id
+            )
+            work_item.claimed_by_seat_id = persisted.claimed_by_seat_id
+            work_item.metadata = dict(persisted.metadata or {})
         ready_background_ids = [
             item_id
             for item_id in list(role_session.background_work_item_ids or [])
@@ -1937,39 +2003,11 @@ class CompanyRuntime:
         session.background_work_item_ids = list(role_session.background_work_item_ids)
         task.metadata = dict(task.metadata)
         task.metadata["delegation_role_session_id"] = role_session.role_session_id
-        work_item_revision = 0
-        try:
-            work_item_revision = int((getattr(work_item, "metadata", {}) or {}).get("manager_mutation_revision") or 0)
-        except (TypeError, ValueError):
-            work_item_revision = 0
         task.metadata["started_work_item_revision"] = work_item_revision
         task.metadata["claimed_work_item_revision"] = work_item_revision
-        if self.store and bool(getattr(self.store, "is_ready", False)) and hasattr(self.store, "update_delegation_work_item"):
-            # Do not regress a work item that is already in a review
-            # phase (AWAITING_MANAGER_REVIEW / AWAITING_HUMAN) back to
-            # RUNNING: the DB phase validator rejects that transition
-            # and the error bubbles up to the session loop. This
-            # happens when the reactivation sweeper wakes a task whose
-            # work item has already been promoted to review — treat
-            # the claim as "refresh the task/role-session bindings
-            # only" and leave the phase alone.
-            current_phase = getattr(work_item, "phase", None)
-            phase_to_write: Phase | None = Phase.RUNNING
-            if current_phase in IN_REVIEW_PHASES:
-                phase_to_write = None
-            await self.store.update_delegation_work_item(
-                work_item_id,
-                phase=phase_to_write,
-                role_runtime_session_id=role_session.role_session_id,
-                claimed_by_role_runtime_session_id=role_session.role_session_id,
-                metadata_updates={
-                    "claimed_by_role_session_id": role_session.role_session_id,
-                    "claimed_task_id": task.id,
-                    "claimed_work_item_revision": work_item_revision,
-                },
-            )
         if self.store and bool(getattr(self.store, "is_ready", False)) and hasattr(self.store, "save_delegation_role_session"):
             await self.store.save_delegation_role_session(role_session)
+        return True
 
     def ensure_role_instance_session(
         self, task: Task

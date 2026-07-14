@@ -385,7 +385,7 @@ Company Mode turns one brief into a runtime session plus role-owned work items.
 | `Agents` | Role rollup: active/waiting/pending/done roles, current tool, role work items, filters, search, and links to detailed execution progress. |
 | `Info` | Status, assignees, role identity, employee assignment, selected execution agent, timing, and developer details. |
 | `Comms` | Role inboxes, unread/read/sent messages, meetings, decisions, and recent communication failures. |
-| `Team` | Runtime cockpit: teams, seats, approvals, unread communication, recovery state, and stop controls for the current run. |
+| `Team` | Runtime cockpit: teams, seats, approvals, unread communication, run state, and stop controls for the current run. |
 
 To inspect the detailed workflow for a role, open a company-mode session and click a role/work item in the `Chat` progress card or `Agents` tab. The Execution Progress panel shows each work item, its status, activity sections, tool progress, handoffs, review targets, and execution turn metadata.
 
@@ -522,7 +522,6 @@ See [`docs/cli-chat-slash.md`](docs/cli-chat-slash.md) for the full command tabl
 | `opc talent` | `list`, `employees`, `import`, `hire`, `scan`, `import-selected`, `employee-detail`, `import-agent` |
 | `opc market` | `presets`, `browse`, `preview`, `apply-preset`, `export`, `install`, `list`, `uninstall --yes` |
 | `opc runtime` | `status`, `checkpoints`, `logs`, `run` |
-| `opc recovery` | `scan`, `resume`, `cancel --yes`, `retry` |
 | `opc channels` | `status`, `login`, `start`, `stop` |
 
 Most service-style commands accept `--project/-p` and `--json`.

@@ -144,17 +144,6 @@ async def create_app(
 
     engine.event_bus.subscribe_all(_root_engine_event)
 
-    # ── Runtime crash recovery (pluggable, no engine modifications) ──
-    from opc.plugins.office_ui.recovery_manager import RuntimeRecoveryManager
-    recovery_manager = RuntimeRecoveryManager(engine, ws_handler.broadcast)
-    ws_handler.recovery_manager = recovery_manager
-
-    # ── Startup self-heal for tasks abandoned by a prior process ─────
-    # Must run before restoring persisted mode and before any WS client can
-    # connect, so orphaned running/locked rows do not block new Continue /
-    # session_send acquisitions.
-    await ws_handler.heal_orphan_tasks_on_boot()
-
     # ── Restore persisted mode and load matching agents on startup ───
     await ws_handler.restore_persisted_mode()
     startup_preset = ws_handler._resolve_preset_name()

@@ -74,6 +74,19 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         external_provider_session_id: str = "provider-session-1",
     ) -> tuple[CompanyWorkItemRuntimePlan, Task]:
         plan = self._plan(profile)
+        await store.save_task(
+            Task(
+                id=f"ui-anchor-{parent_session_id}",
+                title="Company chat",
+                session_id=parent_session_id,
+                project_id="proj1",
+                status=TaskStatus.IDLE,
+                metadata={
+                    "exec_mode": "company",
+                    "company_profile": profile,
+                },
+            )
+        )
         await store.save_delegation_work_item(
             DelegationWorkItem(
                 work_item_id=work_item_id,
@@ -1445,7 +1458,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("external_resume_session_id", resumed_task.metadata)
         self.assertEqual(resumed_task.metadata["external_resume_fallback"], "context_replay")
 
-    async def test_company_runtime_checkpoint_resolves_before_long_execute(self) -> None:
+    async def test_company_runtime_checkpoint_stays_resuming_during_long_execute(self) -> None:
         store = await self._store()
         _, task = await self._seed_runtime(store)
         engine = self._engine(store)
@@ -1472,7 +1485,7 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
                 )
                 captured["resuming_count_during_execute"] = len(resuming)
                 captured["resolved_count_during_execute"] = len(resolved)
-                captured["resume_state_during_execute"] = resolved[0].payload.get("resume_state") if resolved else ""
+                captured["resume_state_during_execute"] = resuming[0].payload.get("resume_state") if resuming else ""
                 return "runtime resumed"
 
         engine.company_executor = DummyCompanyExecutor()
@@ -1489,9 +1502,9 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
             statuses=["resolved"],
         )
 
-        self.assertEqual(captured["resuming_count_during_execute"], 0)
-        self.assertEqual(captured["resolved_count_during_execute"], 1)
-        self.assertEqual(captured["resume_state_during_execute"], "handoff_complete")
+        self.assertEqual(captured["resuming_count_during_execute"], 1)
+        self.assertEqual(captured["resolved_count_during_execute"], 0)
+        self.assertEqual(captured["resume_state_during_execute"], "resuming")
         self.assertEqual(len(resolved), 1)
         self.assertEqual(resolved[0].payload.get("resume_state"), "handoff_complete")
 
@@ -1537,10 +1550,24 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
             checkpoint_types=["company_runtime_suspended"],
             statuses=["resuming"],
         )
+        refreshed_task = await store.get_task(task.id)
+        refreshed_item = await store.get_delegation_work_item("work-item-1")
 
         self.assertEqual(len(pending), 1)
         self.assertEqual(resuming, [])
         self.assertEqual(pending[0].payload.get("resume_state"), "failed_before_handoff")
+        assert refreshed_task is not None
+        assert refreshed_item is not None
+        self.assertEqual(
+            refreshed_task.metadata.get("dispatch_hold"),
+            "company_runtime_suspended",
+        )
+        self.assertEqual(
+            refreshed_item.metadata.get("dispatch_hold"),
+            "company_runtime_suspended",
+        )
+        self.assertEqual(refreshed_item.claimed_by_role_runtime_session_id, "")
+        self.assertEqual(refreshed_item.claimed_by_seat_id, "")
 
     async def test_suspend_is_parent_session_idempotent(self) -> None:
         store = await self._store()
@@ -1831,22 +1858,16 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
     async def test_continue_clears_parent_runtime_stop_marker(self) -> None:
         store = await self._store()
         _, task = await self._seed_runtime(store)
-        parent = Task(
-            id="parent-task",
-            title="Parent company runtime",
-            session_id="sess-parent",
-            parent_session_id="",
-            status=TaskStatus.RUNNING,
-            project_id="proj1",
-            metadata={
-                "exec_mode": "company",
-                "company_profile": "corporate",
-                "company_runtime_stop_state": "suspended",
-                "company_runtime_stop_intent_id": "intent-1",
-                "company_runtime_stop_marked_at": "2026-04-29T11:02:40",
-                "company_runtime_suspended_at": "2026-04-29T11:02:40",
-            },
-        )
+        parent = await store.get_task("ui-anchor-sess-parent")
+        assert parent is not None
+        parent.status = TaskStatus.RUNNING
+        parent.metadata = {
+            **dict(parent.metadata or {}),
+            "company_runtime_stop_state": "suspended",
+            "company_runtime_stop_intent_id": "intent-1",
+            "company_runtime_stop_marked_at": "2026-04-29T11:02:40",
+            "company_runtime_suspended_at": "2026-04-29T11:02:40",
+        }
         await store.save_task(parent)
         engine = self._engine(store)
         await engine.suspend_company_runtime(

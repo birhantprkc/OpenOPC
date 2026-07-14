@@ -100,8 +100,6 @@ export type SocketEnvelope =
   | { type: 'work_item_batch_updated'; payload: { run_id?: string; work_items: RuntimeWorkItemInfo[]; frontier?: RuntimeFrontierSummary } }
   | { type: 'project_recovery_updated'; payload: Record<string, unknown> }
   | { type: 'project_revision_created'; payload: { run_id?: string; revision_links: SessionLinkInfo[] } }
-  | { type: 'recovery_status'; payload: Record<string, unknown> }
-  | { type: 'recovery_result'; payload: Record<string, unknown> }
   | { type: 'talent_list'; payload: TalentListPayload }
   | { type: 'talent_scan_local'; payload: { templates: Array<{ template_id: string; name: string; description: string; category: string; domains: string[]; tags: string[] }> } }
   | { type: 'employee_detail'; payload: EmployeeDetailPayload }

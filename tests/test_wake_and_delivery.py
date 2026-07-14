@@ -352,7 +352,6 @@ class DeliveryCardPhaseSyncTests(unittest.IsolatedAsyncioTestCase):
         executor._kanban_broadcast_task = None
         executor._kanban_debounce_sec = 0.2
         executor.runtime = MagicMock()
-        executor._active_task_runs = set()
         executor._runtime_invariant_issue_keys = set()
         return executor
 

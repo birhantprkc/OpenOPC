@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from opc.core.active_task_runs import ActiveTaskRunRegistry
 from opc.core.config import OPCConfig, RoleConfig
 from opc.core.org_config import (
     build_org_config_payload_from_config,
@@ -137,6 +138,10 @@ def test_custom_runtime_initializes_with_parent_store(monkeypatch, tmp_path) -> 
             self.store = kwargs.get("store") or object()
             self.owns_store = kwargs.get("owns_store")
             self.run_startup_reconcile = kwargs.get("run_startup_reconcile")
+            self.active_task_run_registry = kwargs.get("active_task_run_registry")
+            self.owns_active_task_run_registry = kwargs.get(
+                "owns_active_task_run_registry"
+            )
             self.bound_stores = []
             self.message_bus = FakeMessageBus(self)
             self.company_executor = SimpleNamespace(_signal_dispatcher_wake=lambda: None)
@@ -164,6 +169,7 @@ def test_custom_runtime_initializes_with_parent_store(monkeypatch, tmp_path) -> 
     parent.config = OPCConfig()
     parent.project_id = None
     parent.store = parent_store
+    parent._active_task_run_registry = ActiveTaskRunRegistry()
     parent.on_progress = None
     parent.on_runtime_event = None
     parent.on_escalation = None
@@ -198,6 +204,8 @@ def test_custom_runtime_initializes_with_parent_store(monkeypatch, tmp_path) -> 
     assert runtime.store is parent_store
     assert runtime.owns_store is False
     assert runtime.run_startup_reconcile is False
+    assert runtime.active_task_run_registry is parent._active_task_run_registry
+    assert runtime.owns_active_task_run_registry is False
     assert runtime.bound_stores == []
     assert captured["kanban_callback_runtime"] is runtime
     assert callable(runtime.company_executor.on_kanban_changed)

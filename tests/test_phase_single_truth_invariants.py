@@ -188,10 +188,8 @@ class DirectStatusWriteLintTest(unittest.TestCase):
     PATTERN = re.compile(r"\.status\s*=\s*TaskStatus\.(CANCELLED|FAILED)")
     MIGRATED_COMPANY_AWARE_FILES = (
         "opc/plugins/office_ui/dispatcher.py",
-        "opc/plugins/office_ui/recovery_manager.py",
         "opc/plugins/office_ui/ws_handler.py",
         "opc/plugins/cli_board/services/actions.py",
-        "opc/plugins/cli_board/services/recovery.py",
     )
     MIGRATED_FIVE_STATUS_PATTERN = re.compile(
         r"\.status\s*=\s*TaskStatus\.(PENDING|RUNNING|DONE|FAILED|CANCELLED)"

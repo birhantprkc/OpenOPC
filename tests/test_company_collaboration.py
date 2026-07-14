@@ -527,12 +527,86 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
 
         await runtime.bootstrap([task])
         runtime.enqueue_runnable_work_items([work_item], task_by_work_item_id={"work-item-1": task})
+
+        async def claim_work_item(*_args: object, **kwargs: object) -> DelegationWorkItem:
+            role_session_id = str(kwargs["role_runtime_session_id"])
+            work_item.phase = Phase.RUNNING
+            work_item.role_runtime_session_id = role_session_id
+            work_item.claimed_by_role_runtime_session_id = role_session_id
+            work_item.claimed_by_seat_id = str(kwargs.get("seat_id", ""))
+            work_item.metadata = {
+                **dict(work_item.metadata or {}),
+                "claimed_by_role_session_id": role_session_id,
+                "claimed_task_id": str(kwargs["task_id"]),
+            }
+            return work_item
+
+        runtime.store = SimpleNamespace(
+            is_ready=True,
+            claim_delegation_work_item_if_dispatchable=claim_work_item,
+            save_delegation_role_session=AsyncMock(),
+        )
         claims = await runtime.claim_runnable_tasks([task], work_items=[work_item])
 
         self.assertEqual(len(claims), 1)
         claimed_session, claimed_task = claims[0]
         self.assertEqual(claimed_task.id, task.id)
         self.assertEqual(claimed_session.member_session_id, "role-session::proj1::root-a::executor::backend-architect")
+
+    async def test_company_runtime_does_not_spawn_after_atomic_claim_loses_to_hold(self) -> None:
+        runtime = CompanyRuntime(
+            org_engine=DummyOrgEngine(),
+            communication=DummyRuntimeCommunication(),
+        )
+        task = Task(
+            id="held-work-item-task",
+            title="Held Work Item",
+            session_id="root-a",
+            parent_session_id="root-a",
+            assigned_to="executor",
+            status=TaskStatus.PENDING,
+            project_id="proj1",
+            metadata={
+                "work_item_projection_id": "held_execution",
+                "work_item_role_id": "executor",
+                "employee_assignment": {
+                    "employee_id": "backend-architect",
+                    "role_id": "executor",
+                },
+            },
+        )
+        set_linked_work_item_id(task, "held-work-item")
+        work_item = DelegationWorkItem(
+            work_item_id="held-work-item",
+            run_id="run-1",
+            cell_id="cell-1",
+            role_id="executor",
+            projection_id="held_execution",
+            phase=Phase.READY,
+        )
+        held_after_race = DelegationWorkItem(
+            **{
+                **work_item.__dict__,
+                "metadata": {"dispatch_hold": "company_runtime_suspended"},
+            }
+        )
+        claim = AsyncMock(return_value=None)
+        runtime.store = SimpleNamespace(
+            is_ready=True,
+            claim_delegation_work_item_if_dispatchable=claim,
+            get_delegation_work_item=AsyncMock(return_value=held_after_race),
+        )
+        await runtime.bootstrap([task])
+        runtime.enqueue_runnable_work_items(
+            [work_item],
+            task_by_work_item_id={work_item.work_item_id: task},
+        )
+
+        claims = await runtime.claim_runnable_tasks([task], work_items=[work_item])
+
+        self.assertEqual(claims, [])
+        self.assertNotIn(work_item.work_item_id, runtime._claimed_work_item_ids)
+        claim.assert_awaited_once()
 
     async def test_company_runtime_does_not_double_claim_same_work_item(self) -> None:
         runtime = CompanyRuntime(
@@ -2722,9 +2796,11 @@ class CompanyCollaborationTests(unittest.IsolatedAsyncioTestCase):
             engine.project_id = "proj1"
             engine.store = store
             engine.company_executor = DummyExecutor()
+            attempt_token = engine._active_task_run_registry.register("proj1", running_task.id)
 
             response = await engine._maybe_resume_existing_company_runtime("缁х画", "sess-parent-live")
             refreshed = await store.get_task(running_task.id)
+            engine._active_task_run_registry.unregister("proj1", running_task.id, attempt_token)
 
             self.assertIn("already in progress", response)
             self.assertEqual(refreshed.status, TaskStatus.RUNNING)

@@ -522,7 +522,6 @@ opc talent hire <template_id> <role_id> -p demo
 | `opc talent` | `list`、`employees`、`import`、`hire`、`scan`、`import-selected`、`employee-detail`、`import-agent` |
 | `opc market` | `presets`、`browse`、`preview`、`apply-preset`、`export`、`install`、`list`、`uninstall --yes` |
 | `opc runtime` | `status`、`checkpoints`、`logs`、`run` |
-| `opc recovery` | `scan`、`resume`、`cancel --yes`、`retry` |
 | `opc channels` | `status`、`login`、`start`、`stop` |
 
 大多数服务类命令都支持 `--project/-p` 与 `--json`。

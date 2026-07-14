@@ -48,7 +48,6 @@ interface TeamCardInfo {
 
 interface ProjectCockpitProps {
   orgInfoData?: OrgInfoPayload | null
-  recoveryStatus?: Record<string, unknown> | null
   commsState?: CommsStatePayload | null
   onStopRun?: () => void
   embedded?: boolean
@@ -56,7 +55,6 @@ interface ProjectCockpitProps {
 
 export function ProjectCockpit({
   orgInfoData,
-  recoveryStatus,
   commsState,
   onStopRun,
   embedded = false,
@@ -78,7 +76,6 @@ export function ProjectCockpit({
     count + asRecordList(asRecord(digest.manager_digest).notification_backlog).length
   ), 0)
   const unreadCount = actionableCount + protocolCount + notificationCount
-  const interrupted = Array.isArray(recoveryStatus?.interrupted) ? recoveryStatus.interrupted.length : 0
 
   const communicationItems = [
     { label: 'Actionable', value: actionableCount },
@@ -198,7 +195,7 @@ export function ProjectCockpit({
           <span>Seats {runtimeView.runtimeSeats.length}</span>
           <span>Approvals {pendingDecisionCount}</span>
           <span>Unread {unreadCount}</span>
-          <span>Recovery {interrupted > 0 ? `${interrupted} interrupted` : summarizeText(asRecord(projectRun?.recovery_pointer).status, 'clean')}</span>
+          <span>Run state {summarizeText(asRecord(projectRun?.recovery_pointer).status, 'clean')}</span>
         </div>
       </div>
 

@@ -51,8 +51,11 @@ class CompanyKanbanProjectionTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         store = MagicMock()
-        store.get_pending_checkpoints = AsyncMock(return_value=[])
-        engine = SimpleNamespace(store=store)
+        store.get_execution_checkpoints = AsyncMock(return_value=[])
+        engine = SimpleNamespace(
+            store=store,
+            _task_runtime_is_live=AsyncMock(return_value=True),
+        )
 
         control = await _build_company_runtime_control_by_task(
             engine,
@@ -95,8 +98,11 @@ class CompanyKanbanProjectionTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         store = MagicMock()
-        store.get_pending_checkpoints = AsyncMock(return_value=[])
-        engine = SimpleNamespace(store=store)
+        store.get_execution_checkpoints = AsyncMock(return_value=[])
+        engine = SimpleNamespace(
+            store=store,
+            _task_runtime_is_live=AsyncMock(return_value=True),
+        )
 
         control = await _build_company_runtime_control_by_task(
             engine,
@@ -106,8 +112,9 @@ class CompanyKanbanProjectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(control["child-task"]["runtime_control_state"], "running")
         self.assertTrue(control["child-task"]["can_stop"])
+        engine._task_runtime_is_live.assert_awaited()
 
-    async def test_runtime_control_running_status_does_not_require_live_heartbeat(self) -> None:
+    async def test_runtime_control_running_status_requires_controller_registry_ownership(self) -> None:
         created_at = datetime.now(timezone.utc)
         parent_task = SimpleNamespace(
             id="parent-task",
@@ -122,7 +129,7 @@ class CompanyKanbanProjectionTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         store = MagicMock()
-        store.get_pending_checkpoints = AsyncMock(return_value=[])
+        store.get_execution_checkpoints = AsyncMock(return_value=[])
         engine = SimpleNamespace(
             store=store,
             _task_runtime_is_live=AsyncMock(return_value=False),
@@ -134,9 +141,9 @@ class CompanyKanbanProjectionTests(unittest.IsolatedAsyncioTestCase):
             "proj1",
         )
 
-        self.assertEqual(control["parent-task"]["runtime_control_state"], "running")
-        self.assertTrue(control["parent-task"]["can_stop"])
-        engine._task_runtime_is_live.assert_not_awaited()
+        self.assertEqual(control["parent-task"]["runtime_control_state"], "idle")
+        self.assertFalse(control["parent-task"]["can_stop"])
+        engine._task_runtime_is_live.assert_awaited_once_with(parent_task)
 
     async def test_runtime_control_treats_dispatch_hold_as_suspending_without_checkpoint(self) -> None:
         created_at = datetime.now(timezone.utc)
@@ -1482,7 +1489,7 @@ class CollabSyncCompanyModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["company_profile"], "custom")
         self.assertEqual(session["preferred_agent"], "codex")
 
-    async def test_build_collab_sync_deduplicates_shared_role_sessions(self) -> None:
+    async def test_build_collab_sync_does_not_promote_shared_role_session_without_ui_anchor(self) -> None:
         created_at = datetime.now(timezone.utc)
         shared_session_id = "root-session:role:cto"
         pending_task = SimpleNamespace(
@@ -1519,6 +1526,7 @@ class CollabSyncCompanyModeTests(unittest.IsolatedAsyncioTestCase):
         engine = MagicMock()
         engine.store = MagicMock()
         engine.store.get_tasks = AsyncMock(return_value=[pending_task, running_task])
+        engine.store.get_execution_checkpoints = AsyncMock(return_value=[])
         engine.project_id = "proj-shared"
         engine.llm = None
 
@@ -1586,10 +1594,7 @@ class CollabSyncCompanyModeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         sessions = result.get("sessions", [])
-        self.assertEqual(len(sessions), 1)
-        self.assertEqual(sessions[0]["project_id"], "proj-shared")
-        self.assertEqual(sessions[0]["task_id"], "task-running")
-        self.assertEqual(sessions[0]["session_id"], shared_session_id)
+        self.assertEqual(sessions, [])
 
     async def test_build_collab_sync_keeps_root_session_visible_when_final_decider_shares_session(self) -> None:
         created_at = datetime.now(timezone.utc)

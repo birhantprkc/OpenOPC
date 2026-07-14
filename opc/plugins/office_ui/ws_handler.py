@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from loguru import logger
+from opc.core.active_task_runs import (
+    ActiveTaskRunAdmissionClosed,
+    ActiveTaskRunRegistry,
+)
 from opc.core.config import (
     OPCConfig,
     get_project_workplace,
@@ -45,6 +49,12 @@ from opc.presentation.kanban import build_company_board_columns
 from opc.layer2_organization.phase import (
     kanban_column,
     should_hide_work_item_from_company_kanban,
+)
+from opc.layer2_organization.company_runtime_identity import (
+    ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES,
+    COMPANY_RUNTIME_CHECKPOINT_TYPES,
+    is_company_runtime_task,
+    load_company_runtime_identity_index,
 )
 from opc.layer2_organization.work_item_identity import (
     work_item_identity_payload,
@@ -205,6 +215,16 @@ _COMPANY_MODE_HIDDEN_RUNTIME_PROGRESS_TYPES: frozenset[str] = (
 )
 
 
+# These handlers can hand an accepted UI request to engine execution.  Reserve
+# at the router boundary (before their first await), because the persisted task
+# mode may not be known until the handler loads the task from the project store.
+_EXECUTION_HANDOFF_MESSAGE_TYPES: frozenset[str] = frozenset({
+    "run_task",
+    "session_send",
+    "session_resume",
+})
+
+
 _TASK_MODE_VISIBLE_RUNTIME_PROGRESS_TYPES: frozenset[str] = frozenset({
     "thinking_delta",
     "tool_started",
@@ -358,8 +378,6 @@ _PROJECT_SCOPED_ENVELOPE_TYPES = frozenset({
     "seat_digest_updated",
     "work_item_batch_updated",
     "project_recovery_updated",
-    "recovery_status",
-    "recovery_result",
     "project_revision_created",
     "comms_state",
     "comms_message",
@@ -425,6 +443,7 @@ class WSHandler:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._task_bg_map: dict[str, set[asyncio.Task[Any]]] = {}
         self._task_bg_context: dict[asyncio.Task[Any], dict[str, Any]] = {}
+        self._handoff_route_tasks: dict[asyncio.Task[Any], str] = {}
         self._broadcast_seq: int = 0
         self._broadcast_lock = asyncio.Lock()
         self._task_locks: dict[str, asyncio.Lock] = {}
@@ -466,7 +485,6 @@ class WSHandler:
         self._progress_flush_task: asyncio.Task[None] | None = None
         self._shutting_down: bool = False
         self._active_message_tasks: set[asyncio.Task[Any]] = set()
-        self._recovery_managers: dict[str, Any] = {}
         self.dispatcher = Dispatcher(engine, chat_store)
         self.services_context = OfficeServiceContext(
             engine=engine,
@@ -610,21 +628,6 @@ class WSHandler:
         project_id = self._request_project_id(data)
         engine = await self._engine_for_project(project_id)
         return engine, project_id
-
-    def _recovery_manager_for_engine(self, engine: Any, project_id: str) -> Any:
-        normalized = self._normalize_project_id(project_id)
-        existing = self._recovery_managers.get(normalized)
-        if existing is not None and getattr(existing, "_engine", None) is engine:
-            return existing
-        root_manager = getattr(self, "recovery_manager", None)
-        if root_manager is not None and getattr(root_manager, "_engine", None) is engine:
-            self._recovery_managers[normalized] = root_manager
-            return root_manager
-        from opc.plugins.office_ui.recovery_manager import RuntimeRecoveryManager
-
-        manager = RuntimeRecoveryManager(engine, self.broadcast)
-        self._recovery_managers[normalized] = manager
-        return manager
 
     def _progress_callback_for_engine(self, engine: Any) -> Any:
         async def _progress(text: str, **kw: Any) -> None:
@@ -839,90 +842,6 @@ class WSHandler:
             lock = asyncio.Lock()
             self._task_locks[task_id] = lock
         return lock
-
-    async def heal_orphan_tasks_on_boot(self, *, lease_seconds: int = 300) -> None:
-        """Called once at server startup, before accepting WS connections.
-
-        Any task still sitting at ``status=running`` must be an orphan from a
-        previous (crashed / killed / power-cut) process, because the new server
-        has not yet started any work. ``reset_orphan_running_tasks`` reverts
-        those rows to ``idle`` and drops stale execution locks so:
-
-          - The UI shows them as idle (not permanently stuck as "running").
-          - Continue / normal session send can acquire the lock freely.
-
-        The ``lease_seconds`` grace window is defensive for theoretical
-        multi-process deployments: if another live worker is still
-        heartbeating, its ``execution_locked_at`` will be fresh and we skip it.
-        In the single-process default deployment the check is a no-op and all
-        stale rows are reset.
-        """
-        store = self.engine.store
-        if not self._store_is_ready(store):
-            return
-        if not hasattr(store, "reset_orphan_running_tasks"):
-            return
-        try:
-            summary = await store.reset_orphan_running_tasks(lease_seconds=lease_seconds)
-        except Exception:
-            logger.opt(exception=True).warning("heal_orphan_tasks_on_boot: reset_orphan_running_tasks failed")
-            return
-        reset_count = summary.get("statuses_reset", 0)
-        locks_cleared = summary.get("locks_cleared", 0)
-        if reset_count or locks_cleared:
-            logger.info(
-                f"Startup self-heal: reset {reset_count} orphan running task(s), "
-                f"cleared {locks_cleared} stale execution lock(s) "
-                f"(lease={lease_seconds}s)."
-            )
-
-    async def _task_heartbeat_loop(
-        self,
-        task_id: str,
-        *,
-        interval_seconds: float = 15.0,
-        store: Any | None = None,
-    ) -> None:
-        """Bump ``tasks.execution_locked_at`` every ``interval_seconds`` while
-        the task is being processed by this server.
-
-        Paired with ``reset_orphan_running_tasks`` on startup: a fresh timestamp
-        proves the task is actually alive, so crash recovery can safely reset
-        only those whose heartbeat has gone stale.
-
-        Silently exits when cancelled (normal shutdown of the processing
-        coroutine) or when the DB row stops being locked.
-        """
-        store = store or self.engine.store
-        if not self._store_is_ready(store):
-            return
-        try:
-            # Fire once immediately so an early crash still leaves a fresh
-            # timestamp behind (avoids recent work being mistaken for an orphan
-            # from a prior run if the task row already had a stale value).
-            try:
-                still_ours = await store.renew_task_lock(task_id)
-            except Exception:
-                logger.opt(exception=True).debug(
-                    f"Heartbeat (initial) renew_task_lock failed for {task_id}",
-                )
-                still_ours = True
-            if not still_ours:
-                return
-            while True:
-                await asyncio.sleep(interval_seconds)
-                try:
-                    still_ours = await store.renew_task_lock(task_id)
-                except Exception:
-                    logger.opt(exception=True).debug(
-                        f"Heartbeat renew_task_lock failed for {task_id}",
-                    )
-                    continue
-                if not still_ours:
-                    # Task is no longer running — stop bumping the timestamp.
-                    return
-        except asyncio.CancelledError:
-            return
 
     def _resolve_agent_for_idle(self, task_id: str, task: Any = None) -> str | None:
         """Resolve agent_id for a task, trying event_adapter map first, then task.assigned_to."""
@@ -1157,7 +1076,7 @@ class WSHandler:
         import aiohttp.web as web
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        if self._shutting_down:
+        if bool(getattr(self, "_shutting_down", False)):
             await ws.close()
             return ws
         self._clients.add(ws)
@@ -1188,22 +1107,6 @@ class WSHandler:
                     initial_project_id,
                 ),
             )
-
-            # Push work-item recovery status if any interrupted work-item runtimes exist
-            initial_recovery_project_id = initial_project_id
-            _rm = self._recovery_manager_for_engine(self.engine, initial_recovery_project_id)
-            if _rm:
-                try:
-                    from opc.plugins.office_ui.recovery_manager import _serialize_status
-                    _rs = await _rm.get_recovery_status()
-                    if _rs.interrupted:
-                        if not await self._safe_send_json(
-                            ws,
-                            {"type": "recovery_status", "payload": _serialize_status(_rs, project_id=initial_recovery_project_id)},
-                        ):
-                            return ws
-                except Exception:
-                    pass
 
             # Process messages
             async for msg in ws:
@@ -2020,10 +1923,6 @@ class WSHandler:
         if not source_task_id:
             return None
 
-        parent_task_id = str(self._active_runtime_children.get(source_task_id) or "").strip()
-        if parent_task_id:
-            return parent_task_id
-
         runtime_engine = engine or self.engine
         store = getattr(runtime_engine, "store", None)
         get_task = getattr(store, "get_task", None)
@@ -2034,6 +1933,27 @@ class WSHandler:
                 logger.warning(f"Failed to resolve escalation task mapping for {source_task_id}: {e}")
                 task = None
             if task is not None:
+                try:
+                    identity_index = await load_company_runtime_identity_index(
+                        store,
+                        self._normalize_project_id(
+                            getattr(task, "project_id", None)
+                            or getattr(runtime_engine, "project_id", None)
+                        ),
+                    )
+                    runtime_identity = identity_index.resolve(task_id=source_task_id)
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "failed to resolve durable company identity for escalation"
+                    )
+                    runtime_identity = None
+                if runtime_identity is not None:
+                    # Escalations are a control decision.  Route only through
+                    # the durable runtime identity; process-local progress maps
+                    # are not evidence that a work-item Task is the UI parent.
+                    return runtime_identity.ui_anchor_task_id or None
+                if is_company_runtime_task(task):
+                    return None
                 internal_turn_target = self._company_internal_turn_escalation_target(task)
                 if internal_turn_target is not None:
                     return internal_turn_target or None
@@ -2044,11 +1964,6 @@ class WSHandler:
                 origin_task_id = str(metadata.get("origin_task_id") or "").strip()
                 if origin_task_id:
                     return origin_task_id
-                session_id = str(getattr(task, "session_id", "") or "").strip()
-                if session_id:
-                    mapped_task_id = str(self._session_to_task.get(session_id) or "").strip()
-                    if mapped_task_id:
-                        return mapped_task_id
 
         return source_task_id
 
@@ -2064,10 +1979,10 @@ class WSHandler:
         parks on AWAITING_HUMAN.
 
         Returns None when ``task`` is not such an internal turn (caller keeps
-        its normal resolution), the primary task id of the run's root session
-        when resolvable, or "" when the turn is internal but no visible session
-        is known (caller should fall back to the activity channel rather than
-        the hidden channel).
+        its normal resolution), the durable origin task when present, or ""
+        when no visible channel is known.  Company runtime control routing is
+        resolved before this helper; process-local session maps are deliberately
+        not consulted here.
         """
         if task is None:
             return None
@@ -2080,15 +1995,6 @@ class WSHandler:
         task_id = str(getattr(task, "id", "") or "").strip()
         if origin_task_id and origin_task_id != task_id:
             return origin_task_id
-        for candidate_session_id in (
-            root_session_id,
-            str(getattr(task, "parent_session_id", "") or "").strip(),
-        ):
-            if not candidate_session_id:
-                continue
-            mapped_task_id = str(self._session_to_task.get(candidate_session_id) or "").strip()
-            if mapped_task_id and mapped_task_id != task_id:
-                return mapped_task_id
         return ""
 
     @staticmethod
@@ -3394,12 +3300,37 @@ class WSHandler:
             logger.debug(f"Ignoring WS message during shutdown: {msg_type}")
             return
         handler = self._HANDLERS.get(msg_type)
+        handoff_registry = None
+        handoff_token: str | None = None
+        if handler and msg_type in _EXECUTION_HANDOFF_MESSAGE_TYPES:
+            handoff_registry = self._controller_active_task_run_registry()
+            if handoff_registry is not None:
+                try:
+                    handoff_token = handoff_registry.reserve_handoff()
+                except ActiveTaskRunAdmissionClosed:
+                    await self._send_ack(
+                        ws,
+                        ok=False,
+                        error="service_shutting_down",
+                        action=msg_type,
+                    )
+                    return
         if handler:
             current_task = asyncio.current_task()
             if current_task is not None:
                 self._active_message_tasks.add(current_task)
+                if handoff_token is not None:
+                    handoff_routes = getattr(self, "_handoff_route_tasks", None)
+                    if not isinstance(handoff_routes, dict):
+                        handoff_routes = {}
+                        self._handoff_route_tasks = handoff_routes
+                    handoff_routes[current_task] = handoff_token
             try:
-                await handler(self, ws, data)
+                if handoff_registry is not None and handoff_token is not None:
+                    with handoff_registry.bind_handoff(handoff_token):
+                        await handler(self, ws, data)
+                else:
+                    await handler(self, ws, data)
             except Exception as e:
                 if self._is_ws_disconnect_error(e) or self._is_expected_shutdown_error(e):
                     logger.debug(
@@ -3425,10 +3356,21 @@ class WSHandler:
                     except Exception:
                         pass  # WS may already be closed
             finally:
+                if handoff_registry is not None and handoff_token is not None:
+                    handoff_registry.release_handoff(handoff_token)
                 if current_task is not None:
                     self._active_message_tasks.discard(current_task)
+                    handoff_routes = getattr(self, "_handoff_route_tasks", None)
+                    if isinstance(handoff_routes, dict):
+                        handoff_routes.pop(current_task, None)
         else:
             logger.debug(f"Unknown WS message type: {msg_type}")
+            await self._send_ack(
+                ws,
+                ok=False,
+                error="unknown_message_type",
+                action=msg_type,
+            )
 
     # ── Sync ──────────────────────────────────────────────────────────
 
@@ -4305,9 +4247,65 @@ class WSHandler:
     # Private helpers
     # ══════════════════════════════════════════════════════════════════════
 
+    def _controller_active_task_run_registry(self) -> Any | None:
+        root_engine = getattr(self, "_root_engine", None) or getattr(self, "engine", None)
+        registry = getattr(root_engine, "_active_task_run_registry", None)
+        return registry if isinstance(registry, ActiveTaskRunRegistry) else None
+
+    def _release_current_execution_handoff(self) -> None:
+        registry = self._controller_active_task_run_registry()
+        release = getattr(registry, "release_current_handoff", None)
+        if callable(release):
+            release()
+
     def _track(self, coro: Any) -> asyncio.Task[Any]:
         """Create a tracked background task that auto-removes itself on completion."""
-        task = asyncio.create_task(coro)
+        handoff_registry = self._controller_active_task_run_registry()
+        handoff_token = (
+            handoff_registry.retain_current_handoff()
+            if handoff_registry is not None
+            else None
+        )
+        try:
+            task = asyncio.create_task(coro)
+        except BaseException:
+            if handoff_registry is not None and handoff_token is not None:
+                handoff_registry.release_handoff(handoff_token)
+            if inspect.iscoroutine(coro):
+                coro.close()
+            raise
+        if handoff_registry is not None and handoff_token is not None:
+            def _release_execution_handoff(
+                done_task: asyncio.Task[Any],
+                *,
+                registry: ActiveTaskRunRegistry = handoff_registry,
+                token: str = handoff_token,
+            ) -> None:
+                registry.release_handoff(token)
+                task_context = getattr(self, "_task_bg_context", None)
+                if isinstance(task_context, dict):
+                    context = task_context.get(done_task)
+                    if isinstance(context, dict):
+                        context.pop("execution_handoff_token", None)
+                        if not context:
+                            task_context.pop(done_task, None)
+
+            task.add_done_callback(
+                _release_execution_handoff
+            )
+            # This task owns the accepted engine handoff even before callers
+            # such as _track_session add their richer session context.  Keep it
+            # in the existing execution-owned task index so shutdown cannot
+            # close the store while its cancellation cleanup is still running.
+            task_context = getattr(self, "_task_bg_context", None)
+            if isinstance(task_context, dict):
+                context = task_context.setdefault(task, {})
+                context["execution_handoff_token"] = handoff_token
+        # Work scheduled after the gate closes is rejected.  A coroutine
+        # retained by a pre-shutdown reservation is the one exception: it must
+        # reach registry.register (or exit) before checkpoint snapshotting.
+        if self._shutting_down and handoff_token is None:
+            task.cancel()
         self._background_tasks.add(task)
         task.add_done_callback(self._on_bg_task_done)
         return task
@@ -4361,11 +4359,13 @@ class WSHandler:
     ) -> asyncio.Task[Any]:
         """Like _track but keeps all live tasks for explicit cancellation."""
         bg = self._track(coro)
-        self._task_bg_context[bg] = {
+        context = dict(self._task_bg_context.get(bg) or {})
+        context.update({
             "task_id": task_id,
             "project_id": self._normalize_project_id(project_id or getattr(engine, "project_id", None)),
             "engine": engine,
-        }
+        })
+        self._task_bg_context[bg] = context
         task_group = self._task_bg_map.setdefault(task_id, set())
         task_group.add(bg)
         bg.add_done_callback(lambda t: self._discard_session_bg_task(task_id, t))
@@ -4449,18 +4449,143 @@ class WSHandler:
                 return False
             raise
 
-    async def shutdown(self, timeout: float = 2.0) -> None:
-        """Stop accepting new WS work and close clients before DB shutdown."""
+    async def shutdown(self, timeout: float = 15.0) -> None:
+        """Checkpoint owned runtimes, then stop all WS work before DB shutdown."""
         import aiohttp
 
         self._shutting_down = True
+        pending_handlers = [
+            task
+            for task in self._active_message_tasks
+            if task is not asyncio.current_task() and not task.done()
+        ]
+
+        def execution_owned_tasks() -> set[asyncio.Task[Any]]:
+            owned = set(self._task_bg_context)
+            for task_group in self._task_bg_map.values():
+                owned.update(task_group)
+            return {
+                task
+                for task in owned
+                if task is not asyncio.current_task() and not task.done()
+            }
+
+        # A preaccepted handler can replace its handoff reservation with the
+        # real execution task while the admission barrier drains.  Union this
+        # pre-barrier view with the post-checkpoint view so neither owner can
+        # disappear from the cancellation set during that handoff.
+        execution_tasks_before_prepare = execution_owned_tasks()
+
+        # Atomically close execution admission, then wait only for requests
+        # accepted before that close to either register their first real engine
+        # coroutine or exit.  There is intentionally no timeout window here:
+        # registration drains the reservation, so long execution is not part
+        # of this wait.
+        active_run_registry = self._controller_active_task_run_registry()
+        close_and_wait = getattr(
+            active_run_registry,
+            "close_admission_and_wait_for_handoffs",
+            None,
+        )
+        if callable(close_and_wait):
+            # Close synchronously, then cancel accepted requests which are
+            # still queued before their first engine registration.  In
+            # particular, a duplicate Continue can be waiting behind the
+            # per-runtime reply lock for the entire first execution; waiting
+            # for that reservation here would deadlock shutdown before it can
+            # checkpoint and cancel the live owner.
+            active_run_registry.close_admission()
+            is_handoff_pending = getattr(
+                active_run_registry,
+                "is_handoff_pending",
+                None,
+            )
+            pending_handoff_tasks: set[asyncio.Task[Any]] = set()
+            pending_handoff_tokens: set[str] = set()
+            if callable(is_handoff_pending):
+                for task, context in list(self._task_bg_context.items()):
+                    token = (
+                        context.get("execution_handoff_token")
+                        if isinstance(context, dict)
+                        else None
+                    )
+                    if (
+                        task is not asyncio.current_task()
+                        and not task.done()
+                        and is_handoff_pending(token)
+                    ):
+                        pending_handoff_tasks.add(task)
+                        pending_handoff_tokens.add(str(token))
+                handoff_routes = getattr(self, "_handoff_route_tasks", {})
+                if isinstance(handoff_routes, dict):
+                    for task, token in list(handoff_routes.items()):
+                        if (
+                            task is not asyncio.current_task()
+                            and not task.done()
+                            and is_handoff_pending(token)
+                        ):
+                            pending_handoff_tasks.add(task)
+                            pending_handoff_tokens.add(token)
+            for task in pending_handoff_tasks:
+                task.cancel()
+            revoke_handoff = getattr(active_run_registry, "revoke_handoff", None)
+            if callable(revoke_handoff):
+                for token in pending_handoff_tokens:
+                    revoke_handoff(token)
+            await close_and_wait()
+
+        # The controller registry is the only source of truth for executions
+        # owned by this process.  Persist one checkpoint per active company
+        # scope while every execution coroutine and its store are still alive.
+        root_engine = getattr(self, "_root_engine", None) or self.engine
+        try:
+            await root_engine.prepare_active_company_runtimes_for_shutdown()
+        except Exception:
+            logger.opt(exception=True).error(
+                "Refusing to cancel WS execution because company runtime checkpointing failed"
+            )
+            raise
+
+        # No execution coroutine may get another scheduling turn after its
+        # checkpoint/holds are durable.  Build the cancellation set and set
+        # every cancellation flag synchronously, before awaiting progress
+        # flushing, client close handshakes, or any other UI cleanup.
+        execution_tasks = execution_tasks_before_prepare | execution_owned_tasks()
+        tracked_tasks = set(self._background_tasks)
+        tracked_tasks.update(execution_tasks)
+        tracked_tasks.update(pending_handlers)
+        tracked_tasks = {
+            task
+            for task in tracked_tasks
+            if task is not asyncio.current_task() and not task.done()
+        }
+        for task in tracked_tasks:
+            task.cancel()
         if self._progress_flush_task and not self._progress_flush_task.done():
             self._progress_flush_task.cancel()
+
+        # Await execution cleanup first so broker finally blocks reap process
+        # groups while the engine/store are guaranteed to remain available.
+        if execution_tasks:
+            _done, still_cleaning = await asyncio.wait(
+                execution_tasks,
+                timeout=max(0.0, float(timeout)),
+            )
+            if still_cleaning:
+                message = (
+                    "Timed out waiting for "
+                    f"{len(still_cleaning)} execution task(s) to finish cancellation cleanup"
+                )
+                logger.error(message)
+                raise RuntimeError(message)
+
+        if self._progress_flush_task:
             try:
                 await self._progress_flush_task
             except (asyncio.CancelledError, Exception):
                 pass
             self._progress_flush_task = None
+
         clients = list(self._clients)
         for ws in clients:
             try:
@@ -4472,50 +4597,17 @@ class WSHandler:
                 if not self._is_ws_disconnect_error(exc):
                     logger.debug(f"Failed to close WS client cleanly: {type(exc).__name__}: {exc!r}")
 
-        pending = [
-            task
-            for task in self._active_message_tasks
-            if task is not asyncio.current_task() and not task.done()
-        ]
-        if pending:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=timeout,
+        ui_background_tasks = tracked_tasks - execution_tasks
+        if ui_background_tasks:
+            _done, still_running = await asyncio.wait(
+                ui_background_tasks,
+                timeout=max(0.0, float(timeout)),
+            )
+            if still_running:
+                logger.warning(
+                    "Timed out waiting for {} non-execution WS background task(s) to stop",
+                    len(still_running),
                 )
-            except asyncio.TimeoutError:
-                logger.debug(f"Timed out waiting for {len(pending)} WS message handler(s) to finish")
-
-    async def _mark_task_tree_cancelled_if_active(
-        self,
-        task_id: str,
-        *,
-        store: Any | None = None,
-    ) -> list[str]:
-        store = store or self.engine.store
-        if not self._store_is_ready(store):
-            return []
-
-        from opc.core.models import TaskStatus as TS
-
-        affected_ids = [task_id]
-        affected_ids.extend(
-            child_id
-            for child_id, origin_id in self._active_runtime_children.items()
-            if origin_id == task_id and child_id != task_id
-        )
-
-        updated_ids: list[str] = []
-        for current_id in affected_ids:
-            if current_id in self._stop_requested_task_ids:
-                continue
-            task = await store.get_task(current_id)
-            if not task or task.status in (TS.CANCELLED, TS.DONE, TS.FAILED):
-                continue
-            task.status = TS.CANCELLED
-            await store.save_task(task)
-            updated_ids.append(current_id)
-        return updated_ids
 
     @staticmethod
     def _store_is_ready(store: Any | None) -> bool:
@@ -4707,9 +4799,31 @@ class WSHandler:
 
     async def _send_service_error(self, ws: Any, exc: ServiceError, *, action: str | None = None) -> None:
         payload = exc.to_payload()
+        payload.pop("ok", None)
         if action:
-            payload.setdefault("action", action)
+            payload["action"] = action
         await self._send_ack(ws, ok=False, **payload)
+
+    async def _refresh_runtime_control_for_client(
+        self,
+        ws: Any,
+        *,
+        engine: Any,
+        project_id: str,
+    ) -> None:
+        """Replace optimistic Continue state with a durable snapshot."""
+        try:
+            collab = await build_collab_sync(
+                engine,
+                self.agent_store,
+                self.chat_store,
+                self.event_adapter,
+                exec_mode=self._exec_mode,
+            )
+            collab["project_id"] = self._normalize_project_id(project_id)
+            await self._safe_send_json(ws, {"type": "collab_sync_push", "payload": collab})
+        except Exception:
+            logger.opt(exception=True).debug("failed to refresh runtime control after rejected Continue")
 
     # UI profile name → engine CompanyProfile name
     _PROFILE_TO_ENGINE: dict[str, str] = {"classic": "corporate"}
@@ -4824,7 +4938,6 @@ class WSHandler:
                 preferred_agent = identity.preferred_agent
 
         company_runtime_target: dict[str, Any] | None = None
-        heartbeat_task: asyncio.Task[Any] | None = None
         try:
             content = f"{title}\n{description}".strip()
             engine_mode, company_profile = self._resolve_engine_mode(mode, profile)
@@ -4858,11 +4971,6 @@ class WSHandler:
                         try:
                             company_runtime_target = await self._resolve_company_runtime_target(task_id, engine=engine)
                             await self._set_company_runtime_control(company_runtime_target, state="running")
-                            if self._store_is_ready(engine.store):
-                                heartbeat_task = asyncio.create_task(
-                                    self._task_heartbeat_loop(task_id, interval_seconds=15.0, store=engine.store),
-                                    name=f"task-heartbeat:{task_id}",
-                                )
                         except Exception:
                             logger.opt(exception=True).debug("failed to mark run_task company runtime running")
                     response = await engine.process_message(
@@ -4929,12 +5037,6 @@ class WSHandler:
             )
             await self.broadcast({"type": "session_message", "payload": msg})
         finally:
-            if heartbeat_task is not None and not heartbeat_task.done():
-                heartbeat_task.cancel()
-                try:
-                    await heartbeat_task
-                except (asyncio.CancelledError, Exception):
-                    pass
             # Always refresh the frontend after a task run so new delegation
             # runs / work items are reflected on the kanban immediately.
             try:
@@ -5780,8 +5882,29 @@ class WSHandler:
         if task:
             from opc.core.models import TaskStatus
             if task.status == TaskStatus.CANCELLED:
-                await self._send_ack(ws, ok=False, error="session_ended")
-                return
+                try:
+                    cancelled_target = await self._resolve_company_runtime_target(
+                        task_id,
+                        engine=run_engine,
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "failed to resolve cancelled company UI anchor"
+                    )
+                    cancelled_target = None
+                identity = (cancelled_target or {}).get("identity")
+                active_cancelled_anchor = bool(
+                    identity is not None
+                    and str(getattr(identity, "ui_anchor_task_id", "") or "") == task_id
+                    and str(getattr(identity, "pending_checkpoint_id", "") or "").strip()
+                    and str(getattr(identity, "pending_checkpoint_type", "") or "").strip()
+                    in COMPANY_RUNTIME_CHECKPOINT_TYPES
+                    and str(getattr(identity, "pending_checkpoint_status", "") or "").strip().lower()
+                    in ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES
+                )
+                if not active_cancelled_anchor:
+                    await self._send_ack(ws, ok=False, error="session_ended")
+                    return
 
         if attachment_errors:
             helper_lines = [
@@ -6407,8 +6530,10 @@ class WSHandler:
         task_id: str,
         *,
         engine: Any | None = None,
+        runtime_session_id: str = "",
+        checkpoint_id: str = "",
     ) -> dict[str, Any] | None:
-        """Resolve any company parent/child task id to the parent runtime scope."""
+        """Resolve a Task/UI channel to the canonical session-first scope."""
         runtime_engine = engine or self.engine
         store = runtime_engine.store
         if not task_id or not self._store_is_ready(store):
@@ -6416,64 +6541,32 @@ class WSHandler:
         task = await store.get_task(task_id)
         if task is None:
             return None
-        parent_session_id = str(
-            getattr(task, "parent_session_id", "")
-            or getattr(task, "session_id", "")
-            or ""
-        ).strip()
-        if not parent_session_id:
+        project_id = self._normalize_project_id(
+            getattr(task, "project_id", None) or getattr(runtime_engine, "project_id", None)
+        )
+        identity_index = await load_company_runtime_identity_index(store, project_id)
+        identity = identity_index.resolve(
+            task_id=task_id,
+            runtime_session_id=runtime_session_id,
+            checkpoint_id=checkpoint_id,
+        )
+        if identity is None:
             return None
-
-        project_id = str(getattr(task, "project_id", "") or runtime_engine.project_id or "default")
-        try:
-            project_tasks = await store.get_tasks(project_id=project_id)
-        except Exception:
-            project_tasks = [task]
-
-        parent_task_id = str(self._session_to_task.get(parent_session_id) or "").strip()
-        for candidate in project_tasks:
-            candidate_id = str(getattr(candidate, "id", "") or "").strip()
-            candidate_session_id = str(getattr(candidate, "session_id", "") or "").strip()
-            candidate_parent_session_id = str(getattr(candidate, "parent_session_id", "") or "").strip()
-            if candidate_session_id == parent_session_id and not candidate_parent_session_id:
-                parent_task_id = candidate_id
-                break
-        if not parent_task_id:
-            parent_task_id = str(
-                self._active_runtime_children.get(task_id)
-                or self._session_to_task.get(parent_session_id)
-                or task_id
-            ).strip()
-
-        affected_task_ids: list[str] = []
-        for candidate in project_tasks:
-            candidate_id = str(getattr(candidate, "id", "") or "").strip()
-            if not candidate_id:
-                continue
-            candidate_session_id = str(getattr(candidate, "session_id", "") or "").strip()
-            candidate_parent_session_id = str(getattr(candidate, "parent_session_id", "") or "").strip()
-            if (
-                candidate_id == task_id
-                or candidate_id == parent_task_id
-                or candidate_session_id == parent_session_id
-                or candidate_parent_session_id == parent_session_id
-            ):
-                if candidate_id not in affected_task_ids:
-                    affected_task_ids.append(candidate_id)
-        for child_id, origin_id in list(self._active_runtime_children.items()):
-            if origin_id == parent_task_id or child_id == task_id:
-                if child_id not in affected_task_ids:
-                    affected_task_ids.append(child_id)
-        if parent_task_id and parent_task_id not in affected_task_ids:
-            affected_task_ids.insert(0, parent_task_id)
+        ui_anchor_task_id = identity.ui_anchor_task_id
+        config_task = identity_index.task(identity.config_source_task_id) or task
 
         return {
             "task": task,
             "engine": runtime_engine,
-            "parent_session_id": parent_session_id,
-            "parent_task_id": parent_task_id or task_id,
-            "origin_task_id": parent_task_id or task_id,
-            "affected_task_ids": affected_task_ids or [task_id],
+            "identity": identity,
+            "runtime_session_id": identity.runtime_session_id,
+            "ui_channel_task_id": task_id,
+            "ui_anchor_task_id": ui_anchor_task_id,
+            "config_source_task_id": identity.config_source_task_id,
+            "config_task": config_task,
+            "checkpoint": identity.checkpoint,
+            "origin_task_id": ui_anchor_task_id,
+            "affected_task_ids": list(identity.runtime_task_ids),
         }
 
     async def _broadcast_company_runtime_control(
@@ -6489,7 +6582,6 @@ class WSHandler:
             for item in list(target.get("affected_task_ids", []) or [])
             if str(item).strip()
         ]
-        parent_task_id = str(target.get("parent_task_id", "") or "").strip()
         runtime_engine = target.get("engine") or self.engine
         project_id = self._normalize_project_id(getattr(runtime_engine, "project_id", None))
         payload = {
@@ -6497,8 +6589,7 @@ class WSHandler:
             "runtime_control_state": state,
             "can_stop": state == "running",
             "can_resume": state == "suspended",
-            "resume_parent_task_id": parent_task_id,
-            "resume_parent_session_id": str(target.get("parent_session_id", "") or "").strip(),
+            "resume_parent_session_id": str(target.get("runtime_session_id", "") or "").strip(),
             "pending_runtime_checkpoint_id": checkpoint_id,
             "stop_intent_id": stop_intent_id,
             "task_ids": affected_task_ids,
@@ -6522,82 +6613,9 @@ class WSHandler:
             stop_intent_id=stop_intent_id,
         )
 
-    async def _mark_company_runtime_stop_state(
-        self,
-        target: dict[str, Any],
-        *,
-        state: str,
-        stop_intent_id: str,
-    ) -> None:
-        runtime_engine = target.get("engine") or self.engine
-        store = runtime_engine.store
-        if not self._store_is_ready(store):
-            return
-        from opc.core.models import TaskStatus
-
-        for task_id in list(target.get("affected_task_ids", []) or []):
-            try:
-                task = await store.get_task(str(task_id))
-            except Exception:
-                task = None
-            if not task or task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}:
-                continue
-            task.metadata = dict(task.metadata or {})
-            task.metadata["company_runtime_stop_state"] = state
-            task.metadata["company_runtime_stop_intent_id"] = stop_intent_id
-            task.metadata["company_runtime_stop_marked_at"] = datetime.now().isoformat()
-            task.metadata.setdefault(
-                "suspended_task_status",
-                task.status.value if hasattr(task.status, "value") else str(task.status or ""),
-            )
-            task.execution_lock = False
-            task.execution_locked_at = None
-            try:
-                await store.save_task(task)
-            except Exception:
-                logger.opt(exception=True).debug("failed to mark company runtime stop state")
-
-    async def _clear_company_runtime_stop_state(
-        self,
-        target: dict[str, Any],
-        *,
-        stop_intent_id: str,
-    ) -> None:
-        runtime_engine = target.get("engine") or self.engine
-        store = runtime_engine.store
-        if not self._store_is_ready(store):
-            return
-        for task_id in list(target.get("affected_task_ids", []) or []):
-            try:
-                task = await store.get_task(str(task_id))
-            except Exception:
-                task = None
-            if not task:
-                continue
-            metadata = dict(task.metadata or {})
-            if str(metadata.get("company_runtime_stop_intent_id", "") or "") != str(stop_intent_id or ""):
-                continue
-            for key in (
-                "dispatch_hold",
-                "company_runtime_stop_state",
-                "company_runtime_stop_intent_id",
-                "company_runtime_stop_marked_at",
-                "company_runtime_suspend_checkpoint_type",
-                "company_runtime_suspended_at",
-                "suspended_task_status",
-            ):
-                metadata.pop(key, None)
-            task.metadata = metadata
-            task.execution_lock = False
-            task.execution_locked_at = None
-            try:
-                await store.save_task(task)
-            except Exception:
-                logger.opt(exception=True).debug("failed to clear company runtime stop state")
-
     async def _finalize_company_runtime_stop(self, target: dict[str, Any], *, stop_intent_id: str) -> None:
         runtime_engine = target.get("engine") or self.engine
-        parent_session_id = str(target.get("parent_session_id", "") or "").strip()
+        parent_session_id = str(target.get("runtime_session_id", "") or "").strip()
         origin_task_id = str(target.get("origin_task_id", "") or "").strip()
         affected_task_ids = [
             str(item).strip()
@@ -6628,14 +6646,6 @@ class WSHandler:
                 self._progress_project_ids.pop(tid, None)
                 self._cancel_session_tasks(tid)
             try:
-                await self._mark_company_runtime_stop_state(
-                    target,
-                    state="suspended",
-                    stop_intent_id=stop_intent_id,
-                )
-            except Exception:
-                logger.opt(exception=True).debug("failed to mark company runtime fully suspended")
-            try:
                 await self._set_company_runtime_control(
                     target,
                     state="suspended",
@@ -6644,7 +6654,7 @@ class WSHandler:
                 )
             except Exception:
                 logger.opt(exception=True).debug("failed to broadcast company runtime suspended state")
-            channel_id = f"session:{origin_task_id or target.get('parent_task_id', '')}"
+            channel_id = f"session:{target.get('ui_channel_task_id', '')}"
             pid = self._normalize_project_id(getattr(runtime_engine, "project_id", None))
             try:
                 msg = await self.chat_store.insert_message(
@@ -6665,10 +6675,6 @@ class WSHandler:
             except Exception:
                 logger.opt(exception=True).warning(f"Failed to insert suspend message for {origin_task_id}")
         else:
-            try:
-                await self._clear_company_runtime_stop_state(target, stop_intent_id=stop_intent_id)
-            except Exception:
-                logger.opt(exception=True).debug("failed to clear company runtime stop state after suspend failure")
             try:
                 await self._set_company_runtime_control(
                     target,
@@ -6698,15 +6704,16 @@ class WSHandler:
                 await self._send_ack(ws, ok=False, error="task_not_found", project_id=run_project_id, task_id=task_id)
                 return
 
-        exec_mode, _company_profile = self._resolve_task_session_config(task)
-        if exec_mode in {"company", "org", "custom"} and task is not None:
+        target = None
+        if task is not None:
             try:
                 target = await self._resolve_company_runtime_target(task_id, engine=run_engine)
             except Exception:
-                logger.opt(exception=True).warning(f"failed to resolve company runtime stop target for {task_id}")
-                target = None
+                logger.opt(exception=True).warning(
+                    f"failed to resolve company runtime stop target for {task_id}"
+                )
             if target is not None:
-                parent_session_id = str(target.get("parent_session_id", "") or "").strip()
+                parent_session_id = str(target.get("runtime_session_id", "") or "").strip()
                 existing_checkpoint = None
                 try:
                     existing_checkpoint = await run_engine.get_pending_company_runtime_suspend_checkpoint(parent_session_id)
@@ -6738,23 +6745,26 @@ class WSHandler:
                     "requested_at": datetime.now().isoformat(),
                     "origin_task_id": target.get("origin_task_id", task_id),
                 }
-                await self._mark_company_runtime_stop_state(
-                    target,
-                    state="suspending",
-                    stop_intent_id=stop_intent_id,
-                )
                 await self._set_company_runtime_control(
                     target,
                     state="suspending",
                     stop_intent_id=stop_intent_id,
                 )
-                finalizer = asyncio.create_task(
+                finalizer = self._track(
                     self._finalize_company_runtime_stop(target, stop_intent_id=stop_intent_id)
                 )
                 self._company_stop_finalize_tasks[parent_session_id] = finalizer
-                self._background_tasks.add(finalizer)
-                finalizer.add_done_callback(self._on_bg_task_done)
                 await self._send_ack(ws, ok=True, stop_intent_id=stop_intent_id)
+                return
+
+            if is_company_runtime_task(task):
+                await self._send_ack(
+                    ws,
+                    ok=False,
+                    error="company_runtime_identity_mismatch",
+                    project_id=run_project_id,
+                    task_id=task_id,
+                )
                 return
 
         try:
@@ -6810,20 +6820,20 @@ class WSHandler:
         await self._send_ack(ws, ok=True)
 
     async def _handle_session_resume(self, ws: Any, data: dict) -> None:
-        """Resume an existing runtime after disconnect / Stop without re-planning.
-
-        The engine's `_maybe_resume_existing_company_runtime` normally asks an
-        LLM to classify whether a user reply means "resume" or "start new".
-        The UI Continue button is unambiguous, so we set ``ui_force_resume`` in
-        the message metadata to bypass the classifier and re-awaken any
-        blocked/failed/pending tasks for the session (and their downstream
-        descendants) via the same path as a natural-language "继续".
-        """
+        """Resume by durable runtime-session/checkpoint identity."""
         task_id = str(data.get("task_id", "") or "").strip()
         if not task_id:
             await self._send_ack(ws, ok=False, error="missing_task_id")
             return
         run_engine, run_project_id = await self._engine_for_request(data)
+
+        async def reject(error: str, **extra: Any) -> None:
+            await self._send_ack(ws, ok=False, error=error, **extra)
+            await self._refresh_runtime_control_for_client(
+                ws,
+                engine=run_engine,
+                project_id=run_project_id,
+            )
 
         task = None
         session_id_override = str(data.get("session_id", "") or "").strip() or None
@@ -6833,47 +6843,114 @@ class WSHandler:
             except Exception:
                 logger.opt(exception=True).warning(f"session_resume: get_task failed for {task_id}")
             if task is None:
-                await self._send_ack(ws, ok=False, error="task_not_found", project_id=run_project_id, task_id=task_id)
+                await reject("task_not_found", project_id=run_project_id, task_id=task_id)
                 return
         session_id = session_id_override
         if not session_id and task is not None:
             session_id = str(task.session_id or task.parent_session_id or "").strip() or None
         exec_mode, _company_profile = self._resolve_task_session_config(task)
-        resume_task_id = task_id
-        if exec_mode in {"company", "org", "custom"} and task is not None:
+        runtime_session_id = str(data.get("runtime_session_id", "") or "").strip()
+        checkpoint_id = str(data.get("checkpoint_id", "") or "").strip()
+        is_company_resume = bool(runtime_session_id or checkpoint_id) or exec_mode in {
+            "company",
+            "org",
+            "custom",
+        }
+        if is_company_resume and task is not None:
+            if not runtime_session_id:
+                await reject("missing_runtime_session_id")
+                return
+            if not checkpoint_id:
+                await reject("missing_checkpoint_id")
+                return
             try:
-                target = await self._resolve_company_runtime_target(task_id, engine=run_engine)
+                target = await self._resolve_company_runtime_target(
+                    task_id,
+                    engine=run_engine,
+                    runtime_session_id=runtime_session_id,
+                    checkpoint_id=checkpoint_id,
+                )
             except Exception:
                 logger.opt(exception=True).warning(f"session_resume: failed to resolve company runtime target for {task_id}")
                 target = None
-            if target is not None:
-                parent_session_id = str(target.get("parent_session_id", "") or "").strip()
-                resume_task_id = str(target.get("parent_task_id", "") or task_id).strip()
-                session_id = parent_session_id or session_id
-                finalizer = self._company_stop_finalize_tasks.get(parent_session_id)
-                if finalizer is not None and not finalizer.done():
-                    try:
-                        await asyncio.wait_for(asyncio.shield(finalizer), timeout=10.0)
-                    except asyncio.TimeoutError:
-                        await self._send_ack(ws, ok=False, error="stop_finalize_in_progress")
-                        return
-                    except Exception:
-                        logger.opt(exception=True).debug("session_resume: stop finalizer ended with error")
-                self._company_stop_intents.pop(parent_session_id, None)
+            if target is None:
+                await reject(
+                    "company_runtime_identity_mismatch",
+                    project_id=run_project_id,
+                    task_id=task_id,
+                )
+                return
+            checkpoint = target.get("checkpoint")
+            if checkpoint is None or str(getattr(checkpoint, "status", "") or "").strip().lower() != "pending":
+                await reject("checkpoint_not_pending", checkpoint_id=checkpoint_id)
+                return
+            session_id = runtime_session_id
+            finalizer = self._company_stop_finalize_tasks.get(runtime_session_id)
+            if finalizer is not None and not finalizer.done():
                 try:
-                    await self._set_company_runtime_control(target, state="resuming")
+                    await asyncio.wait_for(asyncio.shield(finalizer), timeout=10.0)
+                except asyncio.TimeoutError:
+                    await reject("stop_finalize_in_progress")
+                    return
                 except Exception:
-                    logger.opt(exception=True).debug("session_resume: failed to broadcast resuming state")
+                    logger.opt(exception=True).debug("session_resume: stop finalizer ended with error")
+            self._company_stop_intents.pop(runtime_session_id, None)
+            content = str(data.get("content", "") or "").strip() or "Resume the existing runtime."
+            lock = self._company_suspend_reply_locks.get(runtime_session_id)
+            if lock is not None:
+                self._release_current_execution_handoff()
+                await reject(
+                    "checkpoint_handoff_in_progress",
+                    checkpoint_id=checkpoint_id,
+                )
+                return
+            lock = asyncio.Lock()
+            self._company_suspend_reply_locks[runtime_session_id] = lock
+            try:
+                bg = self._track_session(
+                    task_id,
+                    self._process_company_suspend_reply(
+                        ui_task_id=task_id,
+                        runtime_session_id=runtime_session_id,
+                        content=content,
+                        attachment_refs=None,
+                        message_metadata={
+                            "ui_force_resume": True,
+                            "response_to_checkpoint_id": checkpoint_id,
+                            "response_to_checkpoint_type": str(getattr(checkpoint, "checkpoint_type", "") or ""),
+                        },
+                        user_message_id=None,
+                        user_message_created_at=None,
+                        run_engine=run_engine,
+                        run_project_id=run_project_id,
+                        target=target,
+                        checkpoint=checkpoint,
+                        lock=lock,
+                    ),
+                    project_id=run_project_id,
+                    engine=run_engine,
+                )
+            except BaseException:
+                self._company_suspend_reply_locks.pop(runtime_session_id, None)
+                raise
+            self._task_bg_context[bg]["company_suspend_reply"] = True
+            await self._send_ack(
+                ws,
+                ok=True,
+                runtime_session_id=runtime_session_id,
+                checkpoint_id=checkpoint_id,
+            )
+            return
         if not session_id:
-            await self._send_ack(ws, ok=False, error="session_not_found")
+            await reject("session_not_found")
             return
 
         content = str(data.get("content", "") or "").strip() or "Resume the existing runtime."
 
         self._track_session(
-            resume_task_id,
+            task_id,
             self._process_session_message(
-                resume_task_id,
+                task_id,
                 content,
                 session_id=session_id,
                 message_metadata={"ui_force_resume": True},
@@ -6946,14 +7023,13 @@ class WSHandler:
         checkpoint: Any,
         payload: dict[str, Any],
         engine: Any,
-        project_id: str,
     ) -> dict[str, str]:
-        parent_session_id = str(
+        expected_runtime_session_id = str(
             payload.get("parent_session_id")
             or getattr(waiting_task, "parent_session_id", "")
+            or getattr(checkpoint, "session_id", "")
             or ""
         ).strip()
-        parent_task_id = ""
 
         for candidate_task_id in (waiting_task_id, task_id):
             if not candidate_task_id:
@@ -6965,59 +7041,20 @@ class WSHandler:
                 target = None
             if not target:
                 continue
-            candidate_parent_session_id = str(target.get("parent_session_id", "") or "").strip()
-            candidate_parent_task_id = str(target.get("parent_task_id", "") or "").strip()
-            if not parent_session_id and candidate_parent_session_id:
-                parent_session_id = candidate_parent_session_id
-            if candidate_parent_task_id and (
-                not parent_task_id
-                or not parent_session_id
-                or candidate_parent_session_id == parent_session_id
-            ):
-                parent_task_id = candidate_parent_task_id
-            if parent_session_id and parent_task_id:
-                break
+            runtime_session_id = str(target.get("runtime_session_id", "") or "").strip()
+            if expected_runtime_session_id and runtime_session_id != expected_runtime_session_id:
+                continue
+            ui_anchor_task_id = str(target.get("ui_anchor_task_id", "") or "").strip()
+            if runtime_session_id and ui_anchor_task_id:
+                return {
+                    "parent_task_id": ui_anchor_task_id,
+                    "parent_session_id": runtime_session_id,
+                }
 
-        if not parent_session_id:
-            raw_session_id = str(
-                payload.get("session_id")
-                or getattr(checkpoint, "session_id", "")
-                or getattr(waiting_task, "session_id", "")
-                or ""
-            ).strip()
-            if raw_session_id and ":" in raw_session_id:
-                parent_session_id = raw_session_id.split(":", 1)[0]
-            else:
-                parent_session_id = raw_session_id
-
-        store = getattr(engine, "store", None)
-        if (not parent_task_id or not parent_session_id) and self._store_is_ready(store):
-            try:
-                tasks = await store.get_tasks(project_id=project_id)
-            except Exception:
-                tasks = []
-            for candidate in tasks:
-                candidate_id = str(getattr(candidate, "id", "") or "").strip()
-                candidate_session_id = str(getattr(candidate, "session_id", "") or "").strip()
-                candidate_parent_session_id = str(getattr(candidate, "parent_session_id", "") or "").strip()
-                if parent_session_id and candidate_session_id == parent_session_id and not candidate_parent_session_id:
-                    parent_task_id = candidate_id
-                    break
-                if not parent_session_id and candidate_id == task_id:
-                    parent_session_id = candidate_session_id
-                    parent_task_id = candidate_id
-                    break
-
-        if not parent_task_id:
-            parent_task_id = str(task_id or waiting_task_id or "").strip()
-        if not parent_session_id:
-            parent_session_id = str(
-                getattr(waiting_task, "session_id", "")
-                or payload.get("session_id")
-                or getattr(checkpoint, "session_id", "")
-                or ""
-            ).strip()
-        return {"parent_task_id": parent_task_id, "parent_session_id": parent_session_id}
+        # Delivery feedback is a company checkpoint action, not a generic
+        # chat operation.  Ambiguous/missing durable identity must be rejected
+        # instead of selecting the first Task sharing the root session.
+        return {"parent_task_id": "", "parent_session_id": ""}
 
     async def _delivery_feedback_checkpoint_visible_to_session(
         self,
@@ -7331,8 +7368,12 @@ class WSHandler:
                                 "feedback_superseded_at": superseded_at,
                                 "feedback_resolution": "superseded_by_new_company_turn",
                             })
-                            waiting_task.status = TaskStatus.DONE
-                            await store.save_task(waiting_task)
+                            await apply_task_status_transition(
+                                store,
+                                waiting_task,
+                                target_status_or_phase=TaskStatus.DONE,
+                                reason="superseded_by_new_company_turn",
+                            )
             except Exception:
                 logger.opt(exception=True).debug("failed to mark delivery feedback checkpoint superseded")
                 continue
@@ -7554,12 +7595,35 @@ class WSHandler:
             checkpoint=checkpoint,
             payload=payload,
             engine=run_engine,
-            project_id=run_project_id,
         )
-        parent_task_id = str(target.get("parent_task_id", "") or task_id).strip() or task_id
-        parent_session_id = str(target.get("parent_session_id", "") or session_id or "").strip()
-        if not parent_session_id:
-            return False
+        parent_task_id = str(target.get("parent_task_id", "") or "").strip()
+        parent_session_id = str(target.get("parent_session_id", "") or "").strip()
+        if not parent_task_id or not parent_session_id:
+            # This is already known to be an explicit delivery-feedback reply.
+            # Consuming it here prevents a missing/ambiguous durable identity
+            # from falling through as an ordinary turn on the work-item Task.
+            if self._chat_store_is_ready(self.chat_store):
+                try:
+                    helper = await self.chat_store.insert_message(
+                        channel_id=reply_channel_id,
+                        sender="assistant",
+                        sender_name="OPC",
+                        content=(
+                            "This review no longer matches an active company runtime. "
+                            "Refresh the session before replying again."
+                        ),
+                        project_id=run_project_id,
+                        metadata={
+                            "type": "system",
+                            "reason": "company_runtime_identity_mismatch",
+                        },
+                    )
+                    await self.broadcast({"type": "session_message", "payload": helper})
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "failed to emit delivery feedback identity rejection"
+                    )
+            return True
 
         lock_key = checkpoint_id or parent_session_id
         lock = self._company_delivery_feedback_reply_locks.get(lock_key)
@@ -7726,28 +7790,86 @@ class WSHandler:
         resume path.
         """
         explicit_checkpoint_type = str((message_metadata or {}).get("response_to_checkpoint_type", "") or "").strip()
-        if explicit_checkpoint_type and explicit_checkpoint_type not in {
-            "company_runtime_suspended",
-            "company_runtime_interrupted",
-        }:
+        explicit_runtime_handoff = (
+            explicit_checkpoint_type in COMPANY_RUNTIME_CHECKPOINT_TYPES
+        )
+        if explicit_checkpoint_type and not explicit_runtime_handoff:
             return False
         if task is None:
             return False
-        exec_mode, _company_profile = self._resolve_task_session_config(task)
-        if exec_mode not in {"company", "org", "custom"}:
-            return False
+        explicit_checkpoint_id = str(
+            (message_metadata or {}).get("response_to_checkpoint_id", "") or ""
+        ).strip()
+
+        async def reject(reason: str, content: str) -> bool:
+            if self._chat_store_is_ready(self.chat_store):
+                try:
+                    helper = await self.chat_store.insert_message(
+                        channel_id=f"session:{task_id}",
+                        sender="assistant",
+                        sender_name="OPC",
+                        content=content,
+                        project_id=run_project_id,
+                        metadata={"type": "system", "reason": reason},
+                    )
+                    await self.broadcast({"type": "session_message", "payload": helper})
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "failed to emit company runtime handoff rejection"
+                    )
+            return True
+
+        if explicit_runtime_handoff and not explicit_checkpoint_id:
+            return await reject(
+                "missing_runtime_checkpoint_id",
+                "This Continue request has no runtime checkpoint identity. Refresh the session and try again.",
+            )
+
         try:
-            target = await self._resolve_company_runtime_target(task_id, engine=run_engine)
+            base_target = await self._resolve_company_runtime_target(
+                task_id,
+                engine=run_engine,
+            )
         except Exception:
             logger.opt(exception=True).debug("failed to resolve company suspend reply target")
-            return False
-        if target is None:
-            return False
-        parent_session_id = str(target.get("parent_session_id", "") or session_id or "").strip()
-        if not parent_session_id:
+            base_target = None
+        if base_target is None:
+            if explicit_runtime_handoff or is_company_runtime_task(task):
+                return await reject(
+                    "company_runtime_identity_mismatch",
+                    "This message no longer matches an active company runtime. Refresh the session before retrying.",
+                )
             return False
 
-        finalizer = self._company_stop_finalize_tasks.get(parent_session_id)
+        target = base_target
+        if explicit_checkpoint_id:
+            try:
+                target = await self._resolve_company_runtime_target(
+                    task_id,
+                    engine=run_engine,
+                    checkpoint_id=explicit_checkpoint_id,
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "failed to resolve explicit company runtime checkpoint"
+                )
+                target = None
+            if target is None:
+                if explicit_runtime_handoff or base_target.get("checkpoint") is not None:
+                    return await reject(
+                        "company_runtime_identity_mismatch",
+                        "This runtime checkpoint does not match the current company session. Refresh before retrying.",
+                    )
+                return False
+
+        runtime_session_id = str(target.get("runtime_session_id", "") or "").strip()
+        if not runtime_session_id:
+            return await reject(
+                "company_runtime_identity_mismatch",
+                "The active company runtime has no canonical session identity. Refresh before retrying.",
+            )
+
+        finalizer = self._company_stop_finalize_tasks.get(runtime_session_id)
         if finalizer is not None and not finalizer.done():
             try:
                 await asyncio.wait_for(asyncio.shield(finalizer), timeout=10.0)
@@ -7765,52 +7887,88 @@ class WSHandler:
             except Exception:
                 logger.opt(exception=True).debug("company stop finalizer failed before follow-up routing")
 
-        checkpoint = None
-        get_checkpoint = getattr(run_engine, "get_active_company_runtime_suspend_checkpoint", None)
-        if callable(get_checkpoint):
+            # Stop finalization may have created the checkpoint after the first
+            # index load.  Reload durable identity before deciding whether this
+            # message is an ordinary turn.
             try:
-                checkpoint = await get_checkpoint(parent_session_id)
+                target = await self._resolve_company_runtime_target(
+                    task_id,
+                    engine=run_engine,
+                    checkpoint_id=explicit_checkpoint_id,
+                )
             except Exception:
-                logger.opt(exception=True).debug("failed to load active company suspend checkpoint")
+                logger.opt(exception=True).debug(
+                    "failed to reload company runtime identity after stop finalization"
+                )
+                target = None
+            if target is None:
+                return await reject(
+                    "company_runtime_identity_mismatch",
+                    "The stopped runtime could not be matched to this session. Refresh before retrying.",
+                )
+
+        checkpoint = target.get("checkpoint")
         if checkpoint is None:
+            if explicit_runtime_handoff:
+                return await reject(
+                    "company_runtime_checkpoint_not_found",
+                    "This company runtime checkpoint is no longer active. Refresh before retrying.",
+                )
             return False
-        if str(getattr(checkpoint, "status", "") or "").strip() != "pending":
-            return False
-
-        parent_task_id = str(target.get("parent_task_id", "") or task_id).strip() or task_id
-        lock = self._company_suspend_reply_locks.get(parent_session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._company_suspend_reply_locks[parent_session_id] = lock
-
-        bg = self._track(
-            self._process_company_suspend_reply(
-                parent_task_id=parent_task_id,
-                parent_session_id=parent_session_id,
-                content=content,
-                attachment_refs=attachment_refs,
-                message_metadata=message_metadata,
-                user_message_id=user_message_id,
-                user_message_created_at=user_message_created_at,
-                run_engine=run_engine,
-                run_project_id=run_project_id,
-                target=target,
-                lock=lock,
+        checkpoint_status = str(
+            getattr(checkpoint, "status", "") or ""
+        ).strip().lower()
+        if checkpoint_status != "pending":
+            return await reject(
+                "company_runtime_checkpoint_not_pending",
+                (
+                    "This company runtime is already being resumed. Wait for the current handoff to finish."
+                    if checkpoint_status == "resuming"
+                    else "This company runtime checkpoint is no longer pending. Refresh before retrying."
+                ),
             )
-        )
-        self._task_bg_context[bg] = {
-            "task_id": parent_task_id,
-            "project_id": self._normalize_project_id(run_project_id),
-            "engine": run_engine,
-            "company_suspend_reply": True,
-        }
+
+        lock = self._company_suspend_reply_locks.get(runtime_session_id)
+        if lock is not None:
+            self._release_current_execution_handoff()
+            return await reject(
+                "checkpoint_handoff_in_progress",
+                "This company runtime is already being resumed by another request.",
+            )
+        lock = asyncio.Lock()
+        self._company_suspend_reply_locks[runtime_session_id] = lock
+
+        try:
+            bg = self._track_session(
+                task_id,
+                self._process_company_suspend_reply(
+                    ui_task_id=task_id,
+                    runtime_session_id=runtime_session_id,
+                    content=content,
+                    attachment_refs=attachment_refs,
+                    message_metadata=message_metadata,
+                    user_message_id=user_message_id,
+                    user_message_created_at=user_message_created_at,
+                    run_engine=run_engine,
+                    run_project_id=run_project_id,
+                    target=target,
+                    checkpoint=checkpoint,
+                    lock=lock,
+                ),
+                project_id=run_project_id,
+                engine=run_engine,
+            )
+        except BaseException:
+            self._company_suspend_reply_locks.pop(runtime_session_id, None)
+            raise
+        self._task_bg_context[bg]["company_suspend_reply"] = True
         return True
 
     async def _process_company_suspend_reply(
         self,
         *,
-        parent_task_id: str,
-        parent_session_id: str,
+        ui_task_id: str,
+        runtime_session_id: str,
         content: str,
         attachment_refs: list[dict] | None,
         message_metadata: dict[str, Any] | None,
@@ -7819,9 +7977,10 @@ class WSHandler:
         run_engine: Any,
         run_project_id: str,
         target: dict[str, Any],
+        checkpoint: Any,
         lock: asyncio.Lock,
     ) -> None:
-        channel_id = f"session:{parent_task_id}"
+        channel_id = f"session:{ui_task_id}"
         pid = self._normalize_project_id(run_project_id or getattr(run_engine, "project_id", None))
         async with lock:
             try:
@@ -7830,52 +7989,67 @@ class WSHandler:
                 except Exception:
                     logger.opt(exception=True).debug("failed to broadcast company suspend reply routing state")
 
-                parent_task = None
-                if self._store_is_ready(run_engine.store):
-                    try:
-                        parent_task = await run_engine.store.get_task(parent_task_id)
-                    except Exception:
-                        logger.opt(exception=True).debug("failed to load parent task for company suspend reply")
+                config_task = target.get("config_task")
                 session_exec_mode = self._normalize_session_exec_mode(self._exec_mode)
                 session_company_profile = self._normalize_session_company_profile(self._company_profile)
                 session_org_id = ""
-                if parent_task is not None:
-                    session_exec_mode, session_company_profile = self._resolve_task_session_config(parent_task)
-                    session_org_id = self._resolve_task_org_id(parent_task)
+                if config_task is not None:
+                    session_exec_mode, session_company_profile = self._resolve_task_session_config(config_task)
+                    session_org_id = self._resolve_task_org_id(config_task)
                 engine_mode, company_profile = self._resolve_engine_mode(
                     session_exec_mode,
                     session_company_profile,
                 )
                 engine_message_metadata = dict(message_metadata or {})
+                engine_message_metadata.update({
+                    "response_to_checkpoint_id": str(getattr(checkpoint, "checkpoint_id", "") or ""),
+                    "response_to_checkpoint_type": str(getattr(checkpoint, "checkpoint_type", "") or ""),
+                })
                 engine_message_metadata.update(_ui_message_identity_metadata(
                     message_id=user_message_id,
                     conversation_turn_id=_ui_conversation_turn_id(user_message_id),
                     created_at=user_message_created_at,
                 ))
-                self._active_runtime_children[parent_task_id] = parent_task_id
-                self._session_to_task[parent_session_id] = parent_task_id
+                execution_anchor_task_id = str(
+                    target.get("ui_anchor_task_id", "") or ""
+                ).strip()
+                if execution_anchor_task_id:
+                    self._active_runtime_children[execution_anchor_task_id] = execution_anchor_task_id
+                self._session_to_task[runtime_session_id] = (
+                    execution_anchor_task_id or ui_task_id
+                )
                 await run_engine.process_message(
                     content,
                     project_id=pid,
-                    session_id=parent_session_id,
+                    session_id=runtime_session_id,
                     mode=engine_mode,
                     org_id=session_org_id or None,
                     company_profile=company_profile,
                     preferred_agent=None,
-                    origin_task_id=parent_task_id,
+                    origin_task_id=execution_anchor_task_id or None,
                     attachment_refs=attachment_refs,
                     message_metadata=engine_message_metadata or None,
                 )
                 checkpoint_meta = await self._extract_checkpoint_metadata(
-                    parent_task_id,
-                    session_id=parent_session_id,
+                    ui_task_id,
+                    session_id=runtime_session_id,
                     engine=run_engine,
                 )
                 await self._sync_task_transcript_messages(
-                    parent_task_id,
+                    ui_task_id,
                     engine=run_engine,
                     latest_assistant_metadata=checkpoint_meta if checkpoint_meta else None,
                 )
+                # Replace the optimistic ``resuming`` projection with the
+                # checkpoint state committed by the engine.  Successful and
+                # already-consumed handoffs need the same durable refresh as
+                # failed handoffs so every client converges on snapshot state.
+                try:
+                    await self.on_kanban_changed(engine=run_engine)
+                except Exception:
+                    logger.opt(exception=True).debug(
+                        "failed to refresh company runtime control after handoff"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -7908,11 +8082,15 @@ class WSHandler:
                                 logger.opt(exception=True).debug(
                                     "Failed to write company suspend reply error message",
                                 )
+                    # The engine restores a failed handoff checkpoint to
+                    # pending.  Replace the optimistic ``resuming`` projection
+                    # for every client with that durable state immediately.
+                    await self.on_kanban_changed(engine=run_engine)
             finally:
                 if self._chat_store_is_ready(self.chat_store):
-                    await self._flush_progress(parent_task_id, project_id=pid)
+                    await self._flush_progress(ui_task_id, project_id=pid)
                 self._task_bg_context.pop(asyncio.current_task(), None)
-                self._company_suspend_reply_locks.pop(parent_session_id, None)
+                self._company_suspend_reply_locks.pop(runtime_session_id, None)
 
     def _resolve_task_comms_dir(self, task: Any) -> Path | None:
         """Resolve `<workspace>/.opc-comms/<project>/<session>` for a task.
@@ -8290,15 +8468,6 @@ class WSHandler:
             await self.broadcast({"type": "board_task_status_changed", "payload": {
                 "project_id": pid, "task_id": task_id, "column_id": "in-progress", "status": "running",
             }})
-            # Bump execution_locked_at periodically while we own this task, so
-            # crash recovery (reset_orphan_running_tasks) can distinguish live
-            # work from abandoned locks by timestamp freshness.
-            heartbeat_task: asyncio.Task[Any] | None = None
-            if self._store_is_ready(engine.store):
-                heartbeat_task = asyncio.create_task(
-                    self._task_heartbeat_loop(task_id, interval_seconds=15.0, store=engine.store),
-                    name=f"task-heartbeat:{task_id}",
-                )
             # Register company runtime origin so child-task progress can dual-route
             company_runtime_target: dict[str, Any] | None = None
             if session_exec_mode in ("company", "org", "custom"):
@@ -8395,11 +8564,6 @@ class WSHandler:
                     except Exception:
                         logger.opt(exception=True).debug("failed to mark company session runtime idle")
             except asyncio.CancelledError:
-                cancelled_ids = await self._mark_task_tree_cancelled_if_active(task_id, store=engine.store)
-                for cancelled_id in cancelled_ids:
-                    await self.broadcast({"type": "board_task_status_changed", "payload": {
-                        "project_id": pid, "task_id": cancelled_id, "column_id": "done", "status": "cancelled",
-                    }})
                 raise
             except Exception as e:
                 logger.exception(f"Session processing error: {e}")
@@ -8430,14 +8594,6 @@ class WSHandler:
                     except Exception:
                         logger.opt(exception=True).debug("failed to clear company session runtime after error")
             finally:
-                # Stop heartbeat before anything else so we don't keep bumping
-                # execution_locked_at for a task we've just finished handling.
-                if heartbeat_task is not None and not heartbeat_task.done():
-                    heartbeat_task.cancel()
-                    try:
-                        await heartbeat_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
                 # Flush progress buffers before clearing company runtime mappings
                 child_ids = [k for k, v in self._active_runtime_children.items() if v == task_id and k != task_id]
                 for cid in child_ids:
@@ -9943,24 +10099,6 @@ class WSHandler:
         except ServiceError as exc:
             await self._send_service_error(ws, exc, action="comms_read_message")
 
-    async def _handle_recovery_action(self, ws: Any, data: dict) -> None:
-        """Handle work-item recovery actions (resume/cancel/scan)."""
-        try:
-            _engine, project_id = await self._engine_for_request(data)
-            action = str(data.get("action", "") or "").strip()
-            result = await self._ensure_office_services().runtime.recovery_action(
-                project_id=project_id,
-                action=action,
-                parent_task_id=str(data.get("parent_task_id", "") or "").strip(),
-            )
-            if action == "scan":
-                await ws.send_json({"type": "recovery_status", "payload": result.payload})
-            else:
-                await self._send_service_ack(ws, result)
-        except ServiceError as exc:
-            await self._send_service_error(ws, exc, action="recovery_action")
-
     # Register handlers defined after _HANDLERS class-level dict
-    _HANDLERS["recovery_action"] = _handle_recovery_action
     _HANDLERS["comms_state"] = _handle_comms_state
     _HANDLERS["comms_read_message"] = _handle_comms_read_message

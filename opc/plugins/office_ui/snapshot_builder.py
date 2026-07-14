@@ -39,6 +39,11 @@ from opc.layer2_organization.phase import (
     should_hide_work_item_from_company_kanban,
     verdict,
 )
+from opc.layer2_organization.company_runtime_identity import (
+    ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES,
+    COMPANY_RUNTIME_CHECKPOINT_TYPES,
+    build_company_runtime_identity_index,
+)
 from opc.layer2_organization.work_item_context_view import WorkItemContextView
 from opc.layer2_organization.work_item_identity import (
     WORK_ITEM_PROJECTION_ID_KEY,
@@ -1503,6 +1508,11 @@ def _primary_session_tasks_by_session_id(
     *,
     task_meta_map: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
+    identity_index = build_company_runtime_identity_index(tasks)
+    company_identities = {
+        identity.runtime_session_id: identity
+        for identity in identity_index.identities
+    }
     primary_tasks_by_session_id: dict[str, Any] = {}
     ordered_session_ids: list[str] = []
     for task in tasks:
@@ -1513,6 +1523,19 @@ def _primary_session_tasks_by_session_id(
         if bool(task_meta.get("review_task", False)):
             continue
         session_id = str(getattr(task, "session_id", "") or "").strip()
+        company_identity = company_identities.get(session_id)
+        if company_identity is not None:
+            anchor = identity_index.task(company_identity.ui_anchor_task_id)
+            if anchor is not None and session_id not in primary_tasks_by_session_id:
+                primary_tasks_by_session_id[session_id] = anchor
+                ordered_session_ids.append(session_id)
+            if anchor is not None:
+                # A shared final-decider/work-item Task must never replace a
+                # pure UI anchor that owns the same session id.
+                continue
+            # Without a pure anchor this scope has no primary chat container.
+            # Never synthesize one from a role/work-item Task.
+            continue
         if not session_id or _task_parent_session_link(task, task_meta):
             continue
         current = primary_tasks_by_session_id.get(session_id)
@@ -1530,31 +1553,16 @@ def _primary_session_tasks_by_session_id(
     return primary_tasks_by_session_id, ordered_session_ids
 
 
-def _shared_role_identity_tasks_by_session_id(
+def _company_config_source_tasks_by_session_id(
     tasks: list[Any],
-    *,
-    task_meta_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    identity_tasks_by_session_id: dict[str, Any] = {}
-    for task in tasks:
-        task_id = str(getattr(task, "id", "") or "").strip()
-        task_meta = (
-            task_meta_map.get(task_id, {}) if task_meta_map is not None and task_id else _task_metadata(task)
-        )
-        session_id = _shared_role_session_key(task, task_meta)
-        if not session_id:
-            continue
-        current = identity_tasks_by_session_id.get(session_id)
-        if current is None:
-            identity_tasks_by_session_id[session_id] = task
-            continue
-        current_id = str(getattr(current, "id", "") or "").strip()
-        current_meta = (
-            task_meta_map.get(current_id, {}) if task_meta_map is not None and current_id else _task_metadata(current)
-        )
-        if _session_representative_rank(task, task_meta) > _session_representative_rank(current, current_meta):
-            identity_tasks_by_session_id[session_id] = task
-    return identity_tasks_by_session_id
+    identity_index = build_company_runtime_identity_index(tasks)
+    return {
+        identity.runtime_session_id: task
+        for identity in identity_index.identities
+        if identity.config_source_task_id
+        and (task := identity_index.task(identity.config_source_task_id)) is not None
+    }
 
 
 async def build_company_kanban_projection(
@@ -2594,31 +2602,7 @@ async def _build_company_runtime_control_by_task(
     if not store:
         return {}
 
-    parent_task_by_session: dict[str, str] = {}
-    tasks_by_parent_session: dict[str, list[Any]] = {}
-    for task in tasks:
-        metadata = dict(getattr(task, "metadata", {}) or {})
-        mode = str(metadata.get("mode", "") or metadata.get("exec_mode", "") or "").strip().lower()
-        is_company_runtime_task = bool(
-            mode in {"company", "org", "custom"}
-            or str(getattr(task, "parent_session_id", "") or "").strip()
-            or metadata.get("company_profile")
-            or metadata.get("company_work_item_plan")
-            or metadata.get("work_item_runtime")
-            or metadata.get("work_item_projection_id")
-        )
-        if not is_company_runtime_task:
-            continue
-        session_id = str(getattr(task, "session_id", "") or "").strip()
-        parent_session_id = str(getattr(task, "parent_session_id", "") or "").strip()
-        task_id = str(getattr(task, "id", "") or "").strip()
-        if session_id and not parent_session_id:
-            parent_task_by_session[session_id] = task_id
-        runtime_parent_session_id = parent_session_id or session_id
-        if runtime_parent_session_id:
-            tasks_by_parent_session.setdefault(runtime_parent_session_id, []).append(task)
-
-    checkpoints_by_session: dict[str, Any] = {}
+    checkpoints: list[Any] = []
     getter = getattr(store, "get_execution_checkpoints", None)
     if not callable(getter):
         getter = getattr(store, "get_pending_checkpoints", None)
@@ -2626,29 +2610,25 @@ async def _build_company_runtime_control_by_task(
         try:
             kwargs = {
                 "project_id": project_id,
-                "checkpoint_types": ["company_runtime_suspended", "company_runtime_interrupted"],
+                "checkpoint_types": sorted(COMPANY_RUNTIME_CHECKPOINT_TYPES),
             }
             if getattr(getter, "__name__", "") == "get_execution_checkpoints":
-                kwargs["statuses"] = ["pending", "resuming"]
+                kwargs["statuses"] = sorted(ACTIVE_COMPANY_RUNTIME_CHECKPOINT_STATUSES)
             checkpoints = await getter(**kwargs)
-            for checkpoint in checkpoints:
-                sid = str(getattr(checkpoint, "session_id", "") or "").strip()
-                if sid and sid not in checkpoints_by_session:
-                    checkpoints_by_session[sid] = checkpoint
         except Exception:
             logger.opt(exception=True).debug("snapshot: failed to load company runtime checkpoints")
+            checkpoints = []
+
+    identity_index = build_company_runtime_identity_index(tasks, checkpoints)
 
     result: dict[str, dict[str, Any]] = {}
-    for parent_session_id, group in tasks_by_parent_session.items():
-        checkpoint = checkpoints_by_session.get(parent_session_id)
-        parent_task_id = parent_task_by_session.get(parent_session_id, "")
-        if not parent_task_id:
-            for task in group:
-                if not str(getattr(task, "parent_session_id", "") or "").strip():
-                    parent_task_id = str(getattr(task, "id", "") or "").strip()
-                    break
-        if not parent_task_id and group:
-            parent_task_id = str(getattr(group[0], "id", "") or "").strip()
+    for identity in identity_index.identities:
+        group = [
+            task
+            for task_id in identity.runtime_task_ids
+            if (task := identity_index.task(task_id)) is not None
+        ]
+        checkpoint = identity.checkpoint
 
         def _task_status_value(task: Any) -> str:
             status = getattr(task, "status", "")
@@ -2660,10 +2640,19 @@ async def _build_company_runtime_control_by_task(
             task for task in group
             if _task_status_value(task) not in {"done", "failed", "cancelled"}
         ]
-        has_running_task = any(
-            _task_status_value(task) == "running"
-            for task in non_terminal_group
-        )
+        # Persisted RUNNING is only a projection.  The controller-local
+        # execution registry is the sole proof that this process still owns a
+        # coroutine capable of monitoring and persisting the run.
+        runtime_is_live = getattr(engine, "_task_runtime_is_live", None)
+        has_running_task = False
+        if callable(runtime_is_live):
+            for task in non_terminal_group:
+                live_result = runtime_is_live(task)
+                if inspect.isawaitable(live_result):
+                    live_result = await live_result
+                if live_result is True:
+                    has_running_task = True
+                    break
         any_stop_in_progress = any(
             str((getattr(task, "metadata", {}) or {}).get("company_runtime_stop_state", "") or "").strip()
             in {"suspending", "suspended", "resuming_after_suspending"}
@@ -2708,8 +2697,7 @@ async def _build_company_runtime_control_by_task(
                 "runtime_control_state": state,
                 "can_stop": state == "running",
                 "can_resume": state == "suspended",
-                "resume_parent_task_id": parent_task_id,
-                "resume_parent_session_id": parent_session_id,
+                "resume_parent_session_id": identity.runtime_session_id,
                 "pending_runtime_checkpoint_id": pending_checkpoint_id,
                 "stop_intent_id": str(checkpoint_payload.get("stop_intent_id", "") or ""),
             }
@@ -3014,9 +3002,8 @@ async def build_project_index_sync(
         session_tasks,
         task_meta_map=task_meta_map,
     )
-    shared_identity_tasks_by_session_id = _shared_role_identity_tasks_by_session_id(
+    company_config_tasks_by_session_id = _company_config_source_tasks_by_session_id(
         session_tasks,
-        task_meta_map=task_meta_map,
     )
     child_tasks_by_parent: dict[str, list[Any]] = {}
     for task in session_tasks:
@@ -3087,11 +3074,12 @@ async def build_project_index_sync(
         representative_task = primary_tasks_by_session_id.get(session_id)
         representative_task_id = str(getattr(representative_task, "id", "") or "").strip()
         shared_session_id = _shared_role_session_key(t, t_meta)
-        if shared_session_id and representative_task_id and representative_task_id != task_id:
-            continue
+        if shared_session_id:
+            if not representative_task_id or representative_task_id != task_id:
+                continue
         identity_task = t
         identity_meta = t_meta
-        shared_identity_task = shared_identity_tasks_by_session_id.get(session_id)
+        shared_identity_task = company_config_tasks_by_session_id.get(session_id)
         shared_identity_task_id = str(getattr(shared_identity_task, "id", "") or "").strip()
         if shared_identity_task_id and shared_identity_task_id != task_id:
             identity_task = shared_identity_task
@@ -3569,9 +3557,8 @@ async def build_collab_sync(
         session_tasks,
         task_meta_map=task_meta_map,
     )
-    shared_identity_tasks_by_session_id = _shared_role_identity_tasks_by_session_id(
+    company_config_tasks_by_session_id = _company_config_source_tasks_by_session_id(
         session_tasks,
-        task_meta_map=task_meta_map,
     )
     child_tasks_by_parent: dict[str, list[Any]] = {}
     for task in session_tasks:
@@ -3616,11 +3603,15 @@ async def build_collab_sync(
         representative_task = primary_tasks_by_session_id.get(session_id)
         representative_task_id = str(getattr(representative_task, "id", "") or "").strip()
         shared_session_id = _shared_role_session_key(t, t_meta)
-        if shared_session_id and representative_task_id and representative_task_id != str(getattr(t, "id", "") or "").strip():
-            continue
+        if shared_session_id:
+            if (
+                not representative_task_id
+                or representative_task_id != str(getattr(t, "id", "") or "").strip()
+            ):
+                continue
         identity_task = t
         identity_meta = t_meta
-        shared_identity_task = shared_identity_tasks_by_session_id.get(session_id)
+        shared_identity_task = company_config_tasks_by_session_id.get(session_id)
         shared_identity_task_id = str(getattr(shared_identity_task, "id", "") or "").strip()
         if shared_identity_task_id and shared_identity_task_id != str(getattr(t, "id", "") or "").strip():
             identity_task = shared_identity_task

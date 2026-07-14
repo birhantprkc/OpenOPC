@@ -30,6 +30,17 @@ const flushPromises = async () => {
 
 const client = new VisualSocketClient('ws://unit.test', {})
 
+// Company Continue keeps the selected UI channel task separate from the
+// durable runtime identity used by the checkpoint handoff.
+client.sessionResume('project-a', 'ui-task', 'runtime-session', 'checkpoint-1')
+const resumeEnvelope = JSON.parse(
+  (client as unknown as TestSocketClient).pendingQueue.pop() ?? '{}',
+) as Record<string, unknown>
+assert.equal(resumeEnvelope.type, 'session_resume')
+assert.equal(resumeEnvelope.task_id, 'ui-task')
+assert.equal(resumeEnvelope.runtime_session_id, 'runtime-session')
+assert.equal(resumeEnvelope.checkpoint_id, 'checkpoint-1')
+
 // A summary and a full request for the same task are distinct correlations.
 // Neither Promise may settle merely because the request was queued locally.
 const summaryPromise = client.sessionDetail('project-a', 'task-1', { detailLevel: 'summary' })

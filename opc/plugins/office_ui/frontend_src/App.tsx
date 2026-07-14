@@ -476,7 +476,6 @@ export default function App() {
   const [globalCompanyProfile, setGlobalCompanyProfile] = useState<'corporate' | 'custom'>('corporate')
   const [globalTaskPreferredAgent, setGlobalTaskPreferredAgent] = useState<TaskPreferredAgent>('native')
   const [orgInfoData, setOrgInfoData] = useState<OrgInfoPayload | null>(null)
-  const [recoveryStatus, setRecoveryStatus] = useState<any>(null)
   const [commsState, setCommsState] = useState<import('./lib/wsClient').CommsStatePayload | null>(null)
   const [commsMessage, setCommsMessage] = useState<import('./lib/wsClient').CommsMessagePayload | null>(null)
   const [talentTemplates, setTalentTemplates] = useState<TalentTemplate[]>([])
@@ -1239,7 +1238,6 @@ export default function App() {
                 runtimeControlState: String(payload.runtime_control_state ?? payload.runtimeControlState ?? 'idle') as any,
                 canStop: Boolean(payload.can_stop ?? payload.canStop),
                 canResume: Boolean(payload.can_resume ?? payload.canResume),
-                resumeParentTaskId: String(payload.resume_parent_task_id ?? payload.resumeParentTaskId ?? ''),
                 resumeParentSessionId: String(payload.resume_parent_session_id ?? payload.resumeParentSessionId ?? ''),
                 pendingRuntimeCheckpointId: String(payload.pending_runtime_checkpoint_id ?? payload.pendingRuntimeCheckpointId ?? ''),
                 stopIntentId: String(payload.stop_intent_id ?? payload.stopIntentId ?? ''),
@@ -1749,10 +1747,6 @@ export default function App() {
           clientRef.current?.collabSync(getActiveProjectId(), undefined, projectViewGenerationRef.current)
         }
       },
-      onRecoveryStatus: (payload) => {
-        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
-        setRecoveryStatus(payload)
-      },
       onCommsState: (payload) => {
         if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
         setCommsState(payload)
@@ -1760,13 +1754,6 @@ export default function App() {
       onCommsMessage: (payload) => {
         if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, true)) return
         setCommsMessage(payload)
-      },
-      onRecoveryResult: (payload) => {
-        if (!payloadMatchesActiveProject(payload as unknown as Record<string, unknown>, false)) return
-        if (payload?.status === 'completed' || payload?.status === 'cancelled') {
-          // Trigger a re-scan
-          clientRef.current?.recoveryAction(getActiveProjectId(), 'scan')
-        }
       },
       onTalentList: (payload) => {
         setTalentTemplates(payload.templates ?? [])
@@ -2242,18 +2229,13 @@ export default function App() {
   ) => {
     const session = sessionStore.sessions.find(s => s.taskId === taskId)
     const parentSessionId = session?.resumeParentSessionId ?? session?.parentSessionId ?? session?.sessionId
-    const parentTaskId = session?.resumeParentTaskId
-      ?? (parentSessionId ? sessionStore.sessions.find(s => s.sessionId === parentSessionId && !s.parentSessionId)?.taskId : undefined)
-      ?? taskId
     for (const candidate of sessionStore.sessions) {
       if (
         candidate.taskId === taskId
-        || candidate.taskId === parentTaskId
         || (!!parentSessionId && (candidate.parentSessionId === parentSessionId || candidate.sessionId === parentSessionId))
       ) {
         sessionStore.updateSession(candidate.taskId, {
           ...patch,
-          resumeParentTaskId: parentTaskId,
           resumeParentSessionId: parentSessionId,
         })
       }
@@ -2278,7 +2260,7 @@ export default function App() {
     clientRef.current?.sessionStop(getActiveProjectId(), taskId)
   }, [sessionStore.sessions, markRuntimeControlForTask, getActiveProjectId])
 
-  const handleSessionResume = useCallback((taskId: string) => {
+  const handleSessionResume = useCallback((taskId: string, runtimeSessionId?: string, checkpointId?: string) => {
     const session = sessionStore.sessions.find(s => s.taskId === taskId)
     const isCompanyRuntime = session?.execMode === 'company'
       || session?.execMode === 'org'
@@ -2293,7 +2275,12 @@ export default function App() {
         canResume: false,
       })
     }
-    clientRef.current?.sessionResume(getActiveProjectId(), taskId)
+    clientRef.current?.sessionResume(
+      getActiveProjectId(),
+      taskId,
+      runtimeSessionId ?? session?.resumeParentSessionId ?? session?.parentSessionId ?? session?.sessionId,
+      checkpointId ?? session?.pendingRuntimeCheckpointId,
+    )
   }, [sessionStore.sessions, markRuntimeControlForTask, getActiveProjectId])
 
   const handleGlobalModeChange = useCallback((mode: 'task' | 'company' | 'org' | 'custom', profile?: string, orgId?: string) => {
@@ -2426,9 +2413,6 @@ export default function App() {
           activeSavedOrg={activeSavedOrg}
           onSavedOrgsList={handleSavedOrgsList}
           onSavedOrgLoad={handleSavedOrgLoad}
-          recoveryStatus={recoveryStatus}
-          onRecoveryResume={(id) => clientRef.current?.recoveryAction(getActiveProjectId(), 'resume', id)}
-          onRecoveryCancel={(id) => clientRef.current?.recoveryAction(getActiveProjectId(), 'cancel', id)}
           commsState={commsState}
           commsMessage={commsMessage}
           onCommsRefresh={(opts) => {

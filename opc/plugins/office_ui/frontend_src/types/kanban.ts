@@ -318,7 +318,6 @@ export interface Session {
   runtimeControlState?: 'running' | 'suspending' | 'suspended' | 'resuming' | 'idle'
   canStop?: boolean
   canResume?: boolean
-  resumeParentTaskId?: string
   resumeParentSessionId?: string
   pendingRuntimeCheckpointId?: string
   stopIntentId?: string
