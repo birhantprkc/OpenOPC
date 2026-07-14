@@ -575,23 +575,43 @@ class ChatStore:
     @staticmethod
     def _strip_narrative_title_prefix(content: str) -> str:
         trimmed = str(content or "").strip()
-        markdown_title = re.match(r"^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$", trimmed)
-        if markdown_title:
+        # Only discard an explicit, anchored narrative wrapper.  The former
+        # fallback used the first ``": "`` anywhere in the first 160
+        # characters, so ordinary Markdown such as ``**Work Item 1: ...**``
+        # was progressively truncated every time a sync was merged.  Peeling
+        # explicit nested wrappers to a fixed point keeps this comparison
+        # helper idempotent without interpreting body punctuation as structure.
+        while True:
+            markdown_title = re.match(r"^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$", trimmed)
+            if not markdown_title:
+                return trimmed
             body = markdown_title.group(2).strip()
-            if len(body) >= 80:
-                return body
-        colon_index = trimmed.find(": ")
-        if colon_index < 8 or colon_index > 160:
-            return trimmed
-        prefix = trimmed[:colon_index].replace("*", "").strip()
-        body = trimmed[colon_index + 2 :].strip()
-        if len(body) < 80:
-            return trimmed
-        if not re.search(r"[A-Za-z\u4e00-\u9fff]", prefix):
-            return trimmed
-        if re.match(r"^(https?|file)$", prefix, flags=re.IGNORECASE):
-            return trimmed
-        return body
+            if len(body) < 80 or body == trimmed:
+                return trimmed
+            trimmed = body
+
+    @classmethod
+    def _select_duplicate_display_content(
+        cls,
+        preferred: dict[str, Any],
+        secondary: dict[str, Any],
+    ) -> str:
+        """Choose an exact input body; never persist the comparison key itself."""
+        preferred_content = str(preferred.get("content", "") or "")
+        secondary_content = str(secondary.get("content", "") or "")
+        preferred_key = cls._normalize_duplicate_content(preferred_content)
+        if not preferred_key or preferred_key != cls._normalize_duplicate_content(secondary_content):
+            return preferred_content
+        # If one real surface is already the comparison body while the other
+        # carries an explicit narrative wrapper/footer, reuse that real body.
+        # This preserves the historical visible answer without manufacturing
+        # display text from a lossy canonicalization function.
+        if (
+            secondary_content.strip() == preferred_key
+            and preferred_content.strip() != preferred_key
+        ):
+            return secondary_content
+        return preferred_content
 
     @staticmethod
     def _message_timestamp(message: dict[str, Any]) -> float:
@@ -663,6 +683,9 @@ class ChatStore:
             normalized = str(value or "").strip()
             if normalized:
                 keys.add(normalized)
+        result_delivery_id = str(metadata.get("result_delivery_id", "") or "").strip()
+        if result_delivery_id:
+            keys.add(f"result_delivery:{result_delivery_id}")
         return keys
 
     @classmethod
@@ -681,10 +704,15 @@ class ChatStore:
         cls,
         existing: dict[str, Any],
         candidate: dict[str, Any],
+        *,
+        prefer_candidate: bool = False,
     ) -> dict[str, Any]:
         preferred = existing
         secondary = candidate
-        if cls._message_preference_score(candidate) > cls._message_preference_score(existing):
+        if (
+            prefer_candidate
+            or cls._message_preference_score(candidate) > cls._message_preference_score(existing)
+        ):
             preferred = candidate
             secondary = existing
 
@@ -694,12 +722,7 @@ class ChatStore:
         secondary_meta = dict(secondary.get("metadata", {}) or {})
         preferred_meta = dict(preferred.get("metadata", {}) or {})
         merged["metadata"] = {**secondary_meta, **preferred_meta}
-        normalized_content = cls._normalize_duplicate_content(preferred.get("content", ""))
-        if (
-            normalized_content
-            and normalized_content == cls._normalize_duplicate_content(secondary.get("content", ""))
-        ):
-            merged["content"] = normalized_content
+        merged["content"] = cls._select_duplicate_display_content(preferred, secondary)
 
         shared_ids = cls._message_identity_keys(existing) & cls._message_identity_keys(candidate)
         canonical_id = ""
@@ -742,7 +765,10 @@ class ChatStore:
         return (
             str(existing.get("sender", "") or "") == str(candidate.get("sender", "") or "")
             and str(existing.get("sender_name", "") or "") == str(candidate.get("sender_name", "") or "")
-            and cls._normalize_duplicate_content(existing.get("content", "")) == cls._normalize_duplicate_content(candidate.get("content", ""))
+            # Display content is persisted data, not a duplicate-comparison
+            # key.  Exact comparison lets authoritative transcript backfill
+            # repair a legacy row whose body was destructively normalized.
+            and str(existing.get("content", "") or "") == str(candidate.get("content", "") or "")
             and cls._message_timestamp(existing) == cls._message_timestamp(candidate)
             and str(existing.get("reply_to_id", "") or "") == str(candidate.get("reply_to_id", "") or "")
             and list(existing.get("mentions", []) or []) == list(candidate.get("mentions", []) or [])
@@ -791,6 +817,55 @@ class ChatStore:
             return None
         return await self._message_scope(str(message_id).strip())
 
+    async def _persist_merged_message(
+        self,
+        existing: dict[str, Any],
+        merged: dict[str, Any],
+        *,
+        channel_id: str,
+        project_id: str,
+        preserve_timestamp: bool = False,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist a duplicate merge while retaining the mounted cache row.
+
+        Semantic transcript duplicates can have a different source message id.
+        Keeping the existing cache identity (and, for semantic replacement, its
+        timestamp) upgrades the row in place instead of moving it in the UI.
+        """
+        persisted_id = str(existing.get("message_id", "") or existing.get("id", "") or "")
+        existing_timestamp = self._message_timestamp(existing)
+        merged_timestamp = (
+            existing_timestamp
+            if preserve_timestamp and existing_timestamp
+            else self._message_timestamp(merged) or time.time()
+        )
+        persisted = {
+            **merged,
+            "message_id": persisted_id,
+            "channel_id": channel_id,
+            "timestamp": merged_timestamp,
+            "created_at": merged_timestamp,
+        }
+        if self._message_persisted_equal(existing, persisted):
+            return persisted, False
+        await self._db.execute(
+            "UPDATE messages SET sender = ?, sender_name = ?, content = ?, timestamp = ?, "
+            "reply_to_id = ?, mentions = ?, metadata = ? WHERE message_id = ? AND channel_id = ? AND project_id = ?",
+            (
+                persisted["sender"],
+                persisted["sender_name"],
+                persisted["content"],
+                merged_timestamp,
+                persisted.get("reply_to_id"),
+                json.dumps(persisted.get("mentions", [])),
+                json.dumps(persisted.get("metadata", {})),
+                persisted_id,
+                channel_id,
+                project_id,
+            ),
+        )
+        return persisted, True
+
     async def _merge_into_same_scope_row(
         self,
         message_id: str,
@@ -798,13 +873,14 @@ class ChatStore:
         channel_id: str,
         project_id: str,
         candidate: dict[str, Any],
-    ) -> dict[str, Any] | None:
+        prefer_candidate: bool = False,
+    ) -> tuple[dict[str, Any], bool] | None:
         """Merge ``candidate`` into an already-persisted row with the same id/scope.
 
-        Returns the merged row when the update happened (or nothing changed), or
-        None when the row could not be loaded. Backfill and the live insert path
-        can race on the same message id; the duplicate must merge in place, never
-        be re-inserted under a scoped alias id in the same channel.
+        Returns ``(merged row, materially changed)`` or ``None`` when the row
+        could not be loaded. Backfill and the live insert path can race on the
+        same message id; the duplicate must merge in place, never be re-inserted
+        under a scoped alias id in the same channel.
         """
         cursor = await self._db.execute(
             "SELECT message_id, channel_id, sender, sender_name, content, "
@@ -816,29 +892,17 @@ class ChatStore:
         if row is None:
             return None
         existing = self._row_to_message_dict(row)
-        merged = self._merge_duplicate_messages(existing, candidate)
-        if self._message_persisted_equal(existing, merged):
-            return merged
-        merged_timestamp = self._message_timestamp(merged) or time.time()
-        await self._db.execute(
-            "UPDATE messages SET sender = ?, sender_name = ?, content = ?, timestamp = ?, "
-            "reply_to_id = ?, mentions = ?, metadata = ? WHERE message_id = ? AND channel_id = ? AND project_id = ?",
-            (
-                merged["sender"],
-                merged["sender_name"],
-                merged["content"],
-                merged_timestamp,
-                merged.get("reply_to_id"),
-                json.dumps(merged.get("mentions", [])),
-                json.dumps(merged.get("metadata", {})),
-                message_id,
-                channel_id,
-                project_id,
-            ),
+        merged = self._merge_duplicate_messages(
+            existing,
+            candidate,
+            prefer_candidate=prefer_candidate,
         )
-        merged["timestamp"] = merged_timestamp
-        merged["created_at"] = merged_timestamp
-        return merged
+        return await self._persist_merged_message(
+            existing,
+            merged,
+            channel_id=channel_id,
+            project_id=project_id,
+        )
 
     async def _allocate_scoped_message_id(
         self,
@@ -1581,35 +1645,24 @@ class ChatStore:
                 existing_index = existing_positions.get(mid)
                 if existing_index is not None:
                     existing_match = existing_messages[existing_index]
-                    merged_existing = self._merge_duplicate_messages(existing_match, normalized_message)
-                    if not self._message_persisted_equal(existing_match, merged_existing):
-                        merged_timestamp = self._message_timestamp(merged_existing) or time.time()
-                        await self._db.execute(
-                            "UPDATE messages SET sender = ?, sender_name = ?, content = ?, timestamp = ?, "
-                            "reply_to_id = ?, mentions = ?, metadata = ? WHERE message_id = ? AND channel_id = ? AND project_id = ?",
-                            (
-                                merged_existing["sender"],
-                                merged_existing["sender_name"],
-                                merged_existing["content"],
-                                merged_timestamp,
-                                merged_existing.get("reply_to_id"),
-                                json.dumps(merged_existing.get("mentions", [])),
-                                json.dumps(merged_existing.get("metadata", {})),
-                                mid,
-                                channel_id,
-                                project_id,
-                            ),
-                        )
-                        semantic_index.replace(existing_index, {
-                            **merged_existing,
-                            "created_at": merged_timestamp,
-                        })
-                        inserted_messages.append({
-                            **merged_existing,
-                            "channel_id": channel_id,
-                            "timestamp": merged_timestamp,
-                            "created_at": merged_timestamp,
-                        })
+                    # This candidate came directly from the durable transcript.
+                    # For the same identity its original display body is
+                    # authoritative, while metadata unique to the cache is
+                    # still retained by the merge.
+                    merged_existing = self._merge_duplicate_messages(
+                        existing_match,
+                        normalized_message,
+                        prefer_candidate=True,
+                    )
+                    persisted, did_change = await self._persist_merged_message(
+                        existing_match,
+                        merged_existing,
+                        channel_id=channel_id,
+                        project_id=project_id,
+                    )
+                    if did_change:
+                        semantic_index.replace(existing_index, persisted)
+                        inserted_messages.append(persisted)
                         changed_existing = True
                 continue
 
@@ -1623,10 +1676,15 @@ class ChatStore:
                     channel_id=channel_id,
                     project_id=project_id,
                     candidate=normalized_message,
+                    prefer_candidate=True,
                 )
                 if merged is not None:
+                    persisted, did_change = merged
                     existing_ids.add(mid)
-                    existing_positions[mid] = semantic_index.append(merged)
+                    existing_positions[mid] = semantic_index.append(persisted)
+                    if did_change:
+                        inserted_messages.append(persisted)
+                        changed_existing = True
                     continue
             if existing_scope and existing_scope != (channel_id, project_id):
                 metadata = dict(normalized_message.get("metadata", {}) or {})
@@ -1644,9 +1702,33 @@ class ChatStore:
                 excluded_message_ids=consumed_existing_ids,
             )
             if duplicate_index is not None:
-                consumed_existing_ids.add(
-                    existing_messages[duplicate_index]["message_id"]
+                existing_duplicate = existing_messages[duplicate_index]
+                existing_id = str(existing_duplicate["message_id"])
+                # Prefer the authoritative transcript on an equal score, but
+                # do not replace a stronger canonical result surface with a
+                # lower-priority mirror.  The existing cache id and timestamp
+                # remain stable either way.
+                prefer_candidate = (
+                    self._message_preference_score(normalized_message)
+                    >= self._message_preference_score(existing_duplicate)
                 )
+                merged_duplicate = self._merge_duplicate_messages(
+                    existing_duplicate,
+                    normalized_message,
+                    prefer_candidate=prefer_candidate,
+                )
+                persisted, did_change = await self._persist_merged_message(
+                    existing_duplicate,
+                    merged_duplicate,
+                    channel_id=channel_id,
+                    project_id=project_id,
+                    preserve_timestamp=True,
+                )
+                if did_change:
+                    semantic_index.replace(duplicate_index, persisted)
+                    inserted_messages.append(persisted)
+                    changed_existing = True
+                consumed_existing_ids.add(existing_id)
                 continue
 
             try:
@@ -1674,11 +1756,16 @@ class ChatStore:
                     channel_id=channel_id,
                     project_id=project_id,
                     candidate=normalized_message,
+                    prefer_candidate=True,
                 )
                 if merged is not None:
+                    persisted, did_change = merged
                     merged_id = normalized_message["message_id"]
                     existing_ids.add(merged_id)
-                    existing_positions[merged_id] = semantic_index.append(merged)
+                    existing_positions[merged_id] = semantic_index.append(persisted)
+                    if did_change:
+                        inserted_messages.append(persisted)
+                        changed_existing = True
                     continue
                 metadata = dict(normalized_message.get("metadata", {}) or {})
                 metadata.setdefault("ui_message_id", normalized_message["message_id"])

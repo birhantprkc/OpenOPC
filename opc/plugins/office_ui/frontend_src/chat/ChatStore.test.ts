@@ -241,6 +241,153 @@ assert.equal(repeatedNativeCompanySync.length, 1)
 assert.equal(repeatedNativeCompanySync[0].metadata?.ui_timeline_id, 'message:native-raw-1')
 assert.equal(repeatedNativeCompanySync[0].timestamp, 5)
 
+const structuredDeliveryMerge = __chatStoreTestUtils.dedupeMessages([
+  {
+    ...nativeCompanyRawTurn,
+    content: 'Raw runtime wording before the canonical result wrapper.',
+    metadata: {
+      ...nativeCompanyRawTurn.metadata,
+      result_delivery_id: 'result:company-turn-1:attempt:0',
+    },
+  },
+  {
+    ...companyRoleResult,
+    content: 'Canonical committed wording may differ without creating another row.',
+    metadata: {
+      ...companyRoleResult.metadata,
+      result_delivery_id: 'result:company-turn-1:attempt:0',
+    },
+  },
+])
+assert.equal(structuredDeliveryMerge.length, 1)
+assert.equal(structuredDeliveryMerge[0].id, 'role-result-1')
+assert.equal(
+  structuredDeliveryMerge[0].content,
+  'Canonical committed wording may differ without creating another row.',
+)
+
+const deliveryMirrorWithLongerWrapper = __chatStoreTestUtils.dedupeMessages([
+  {
+    ...nativeCompanyRawTurn,
+    content: 'Runtime wrapper that must not outrank the committed surface.\n\nCanonical result body.',
+    metadata: {
+      ...nativeCompanyRawTurn.metadata,
+      result_delivery_id: 'result:company-turn-wrapper:attempt:0',
+    },
+  },
+  {
+    ...companyRoleResult,
+    content: 'Canonical result body.',
+    metadata: {
+      ...companyRoleResult.metadata,
+      result_delivery_id: 'result:company-turn-wrapper:attempt:0',
+    },
+  },
+])
+assert.equal(deliveryMirrorWithLongerWrapper.length, 1)
+assert.equal(
+  deliveryMirrorWithLongerWrapper[0].content,
+  'Canonical result body.',
+  'delivery mirrors follow surface authority; suffix repair only applies to one persistent message id',
+)
+
+const ctoDispatchContent = `Both work items have been successfully dispatched to my senior engineer. Here's the status:
+
+## Dispatch Summary
+
+**Work Item 1: OpenOPC Source Code Architecture Deep-Dive Analysis**
+- ID: \`1ed5f5f1-ac41-49a1-b1fa-23bbc9adab82\`
+- Owner: senior_engineer
+- Scope: \`openopc-source-analysis\`
+- Output: \`/data2/bjdwhzzh/project-hku/OpenOPC_workplace/0009/openopc-architecture-analysis.md\`
+- Covers: Layered architecture, the work-item state machine, collaboration policy, and seat executor mechanisms.
+
+**Work Item 2: External Multi-Agent Frameworks Architecture Research**
+- ID: \`d0307208-6b95-44c1-9b51-6bf073bbdcef\`
+- Owner: senior_engineer
+
+Both work items are independent and can execute in parallel.`
+
+const ctoCompanyFinal: ChatMessage = {
+  id: 'runtime-v2-company-assistant-final:cto-turn-9',
+  channelId: 'session:cto-work-item',
+  sender: 'cto',
+  senderName: 'CTO',
+  content: ctoDispatchContent,
+  timestamp: 20,
+  mentions: [],
+  metadata: {
+    source: 'engine',
+    transcript_kind: 'runtime_v2_company_assistant',
+    canonical_turn_id: 'cto-turn-9',
+    ui_message_id: 'runtime-v2-company-assistant-final:cto-turn-9',
+  },
+}
+
+const repeatedCtoSnapshot = __chatStoreTestUtils.dedupeMessages([
+  ctoCompanyFinal,
+  { ...ctoCompanyFinal, metadata: { ...ctoCompanyFinal.metadata } },
+])
+assert.equal(repeatedCtoSnapshot.length, 1)
+assert.equal(
+  repeatedCtoSnapshot[0].content,
+  ctoDispatchContent,
+  'comparison normalization must never peel Work Item, ID, or Owner fields from rendered content',
+)
+
+let repeatedCtoMerge = [ctoCompanyFinal]
+for (let replay = 0; replay < 6; replay += 1) {
+  repeatedCtoMerge = __chatStoreTestUtils.mergeMessagesIntoExisting(
+    repeatedCtoMerge,
+    [{ ...ctoCompanyFinal, metadata: { ...ctoCompanyFinal.metadata } }],
+  )
+  assert.equal(repeatedCtoMerge.length, 1)
+  assert.equal(
+    repeatedCtoMerge[0].content,
+    ctoDispatchContent,
+    `identical MERGE replay ${replay + 1} must preserve the complete source text`,
+  )
+}
+
+const truncatedCtoContent = ctoDispatchContent.slice(
+  ctoDispatchContent.indexOf('OpenOPC Source Code Architecture Deep-Dive Analysis**'),
+)
+const truncatedCtoFinal: ChatMessage = {
+  ...ctoCompanyFinal,
+  content: truncatedCtoContent,
+}
+
+let interleavedCtoReplay = [ctoCompanyFinal]
+for (const replayedMessage of [
+  truncatedCtoFinal,
+  ctoCompanyFinal,
+  truncatedCtoFinal,
+  ctoCompanyFinal,
+]) {
+  interleavedCtoReplay = __chatStoreTestUtils.mergeMessagesIntoExisting(
+    interleavedCtoReplay,
+    [{ ...replayedMessage, metadata: { ...replayedMessage.metadata } }],
+  )
+  assert.equal(interleavedCtoReplay.length, 1)
+  assert.equal(
+    interleavedCtoReplay[0].content,
+    ctoDispatchContent,
+    'a same-identity truncated cache replay must neither replace nor duplicate the complete message',
+  )
+}
+
+const repairedCtoReplay = __chatStoreTestUtils.mergeMessagesIntoExisting(
+  [truncatedCtoFinal],
+  [ctoCompanyFinal],
+)
+assert.equal(repairedCtoReplay.length, 1)
+assert.equal(repairedCtoReplay[0].content, ctoDispatchContent)
+assert.equal(
+  __chatStoreTestUtils.mergeMessagesIntoExisting(repairedCtoReplay, [truncatedCtoFinal])[0].content,
+  ctoDispatchContent,
+  'once a complete same-identity source arrives, later truncated replays must not regress it',
+)
+
 const mountedHighPriorityResult: ChatMessage = {
   ...companyRoleResult,
   id: 'mounted-high-result',

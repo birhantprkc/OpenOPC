@@ -192,23 +192,33 @@ def _normalize_duplicate_content(content: Any) -> str:
 
 def _strip_narrative_title_prefix(content: str) -> str:
     trimmed = str(content or "").strip()
-    markdown_title = re.match(r"^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$", trimmed)
-    if markdown_title:
+    # Comparison-only canonicalization may unwrap a deliberate leading title,
+    # but must never interpret a colon inside ordinary Markdown body text as a
+    # wrapper boundary.  Resolve explicit nested wrappers to a fixed point so
+    # the comparison key itself is idempotent.
+    while True:
+        markdown_title = re.match(r"^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$", trimmed)
+        if not markdown_title:
+            return trimmed
         body = markdown_title.group(2).strip()
-        if len(body) >= 80:
-            return body
-    colon_index = trimmed.find(": ")
-    if colon_index < 8 or colon_index > 160:
-        return trimmed
-    prefix = trimmed[:colon_index].replace("*", "").strip()
-    body = trimmed[colon_index + 2 :].strip()
-    if len(body) < 80:
-        return trimmed
-    if not re.search(r"[A-Za-z\u4e00-\u9fff]", prefix):
-        return trimmed
-    if re.match(r"^(https?|file)$", prefix, flags=re.IGNORECASE):
-        return trimmed
-    return body
+        if len(body) < 80 or body == trimmed:
+            return trimmed
+        trimmed = body
+
+
+def _select_duplicate_display_content(
+    preferred: dict[str, Any],
+    secondary: dict[str, Any],
+) -> str:
+    """Return one original surface body, never the lossy comparison key."""
+    preferred_content = str(preferred.get("content", "") or "")
+    secondary_content = str(secondary.get("content", "") or "")
+    preferred_key = _normalize_duplicate_content(preferred_content)
+    if not preferred_key or preferred_key != _normalize_duplicate_content(secondary_content):
+        return preferred_content
+    if secondary_content.strip() == preferred_key and preferred_content.strip() != preferred_key:
+        return secondary_content
+    return preferred_content
 
 
 def _normalize_transcript_detail_level(value: Any) -> TranscriptDetailLevel:
@@ -1132,7 +1142,19 @@ def _transcript_item_to_ui_message(
             **({"runtime_thinking": runtime_thinking} if runtime_thinking else {}),
             **({
                 key: message_metadata.get(key)
-                for key in ("canonical_turn_id", "turn_id")
+                for key in (
+                    "canonical_turn_id",
+                    "turn_id",
+                    "result_delivery_id",
+                    "source_result_message_id",
+                    "source_task_id",
+                    "child_session_id",
+                    "conversation_turn_id",
+                    "execution_turn_id",
+                    "work_item_projection_id",
+                    "work_item_turn_type",
+                    "runtime_session_id",
+                )
                 if message_metadata.get(key)
             }),
             **ui_meta,
@@ -1193,18 +1215,10 @@ def collapse_adjacent_transcript_duplicates(messages: list[dict[str, Any]]) -> l
         ):
             merged_visibility = "full"
         merged_metadata["detail_visibility"] = merged_visibility
-        preferred_content = str(preferred.get("content", "") or "")
-        secondary_content = str(secondary.get("content", "") or "")
-        normalized_content = _normalize_duplicate_content(preferred_content)
-        merged_content = (
-            normalized_content
-            if normalized_content and normalized_content == _normalize_duplicate_content(secondary_content)
-            else preferred_content
-        )
         collapsed[-1] = {
             **secondary,
             **preferred,
-            "content": merged_content,
+            "content": _select_duplicate_display_content(preferred, secondary),
             "metadata": merged_metadata,
         }
     return collapsed

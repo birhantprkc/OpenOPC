@@ -414,6 +414,13 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         # cannot swallow it into the frozen shared-iteration row.
         self.assertTrue(metadata["company_final_turn"])
         self.assertEqual(metadata["ui_message_id"], "runtime-v2-company-assistant-final:ui-turn:company")
+        self.assertEqual(
+            metadata["result_delivery_id"],
+            "result:task:company-role-task:turn:ui-turn:company:attempt:0",
+        )
+        self.assertEqual(metadata["source_task_id"], "company-role-task")
+        self.assertEqual(metadata["child_session_id"], "sess-company")
+        self.assertEqual(metadata["work_item_projection_id"], "chao::intake")
         self.assertNotIn("visible_speaker", metadata)
 
         await runtime._persist_assistant_turn(
@@ -429,6 +436,7 @@ class NativeRuntimeV2Tests(unittest.IsolatedAsyncioTestCase):
         intermediate_metadata = memory.appended_messages[-1]["kwargs"]["metadata"]
         self.assertEqual(intermediate_metadata["kind"], "runtime_v2_company_assistant")
         self.assertNotIn("company_final_turn", intermediate_metadata)
+        self.assertNotIn("result_delivery_id", intermediate_metadata)
         self.assertEqual(
             intermediate_metadata["ui_message_id"],
             "runtime-v2-company-assistant:ui-turn:company",

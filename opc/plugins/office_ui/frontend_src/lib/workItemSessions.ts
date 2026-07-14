@@ -2,7 +2,7 @@ import type { ChatMessage } from '../types/chat'
 import type { ProgressEntry, Session } from '../types/kanban'
 import { getContextUsageMetrics } from './contextUsage'
 import { isSessionWorking } from './sessionRuntime'
-import { stableMessageTimelineKey } from './messageTimelineIdentity'
+import { stableMessageTimelineKey, stableResultDeliveryKey } from './messageTimelineIdentity'
 
 const CONTEXT_TOKENS_RE = /(\d[\d,]*)\s*\/\s*(\d[\d,]*)\s+tokens/i
 const USED_PCT_RE = /(\d{1,3})%\s*used/i
@@ -20,22 +20,32 @@ function compactWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim()
 }
 
-function stripNarrativeTitlePrefix(content: string): string {
-  const trimmed = String(content || '').trim()
-  const markdownTitle = trimmed.match(/^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$/)
-  if (markdownTitle) {
-    const body = markdownTitle[2].trim()
-    if (body.length >= 80) return body
-  }
-  const colonIndex = trimmed.indexOf(': ')
-  if (colonIndex < 8 || colonIndex > 160) return trimmed
+function normalizeResultContentFallback(content: string): string {
+  let normalized = String(content || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 
-  const prefix = trimmed.slice(0, colonIndex).replace(/\*/g, '').trim()
-  const body = trimmed.slice(colonIndex + 2).trim()
-  if (body.length < 80) return trimmed
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(prefix)) return trimmed
-  if (/^(https?|file)$/i.test(prefix)) return trimmed
-  return body
+  // Some result mirrors add one explicit Markdown narrative label. Only
+  // remove that anchored wrapper; a colon later in Markdown (for example
+  // "**Work Item 1: ..." or "- ID: ...") is message content, not a title.
+  for (;;) {
+    const markdownTitle = normalized.match(/^\*\*([^\r\n]{8,160}?)\*\*:(?:[ \t]+|\r?\n+)([\s\S]+)$/)
+    if (!markdownTitle) break
+    const body = markdownTitle[2].trim()
+    if (body.length < 80 || body === normalized) break
+    normalized = body
+  }
+
+  const paragraphs = normalized.split(/\n{2,}/).map(part => part.trim()).filter(Boolean)
+  if (paragraphs.length > 1 && /^Verification:\s/i.test(paragraphs[paragraphs.length - 1])) {
+    normalized = paragraphs.slice(0, -1).join('\n\n').trim()
+  }
+  return compactWhitespace(normalized).slice(0, 2000)
 }
 
 function resultSurfacePriority(message: ChatMessage): number {
@@ -67,9 +77,52 @@ function resultSurfacePriority(message: ChatMessage): number {
   return 0
 }
 
+function normalizedResultContentLength(message: ChatMessage): number {
+  return String(message.content ?? '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(line => line.trimEnd())
+    .join('\n')
+    .trim()
+    .length
+}
+
+function resultAuthorityScore(message: ChatMessage): number {
+  const metadata = (message.metadata ?? {}) as Record<string, unknown>
+  let score = 0
+  if (String(metadata.source ?? '').trim() === 'engine') score += 4
+  if (String(metadata.source_result_message_id ?? '').trim()) score += 2
+  if (metadata.authoritative_output === true || metadata.canonical_result === true) score += 1
+  return score
+}
+
+function compareResultSurfacePreference(left: ChatMessage, right: ChatMessage): number {
+  const numericComparisons: Array<[number, number]> = [
+    [resultSurfacePriority(left), resultSurfacePriority(right)],
+    [resultAuthorityScore(left), resultAuthorityScore(right)],
+    [normalizedResultContentLength(left), normalizedResultContentLength(right)],
+  ]
+  for (const [leftValue, rightValue] of numericComparisons) {
+    if (leftValue !== rightValue) return leftValue > rightValue ? 1 : -1
+  }
+  const idComparison = left.id.localeCompare(right.id)
+  if (idComparison !== 0) return idComparison
+  const contentComparison = left.content.localeCompare(right.content)
+  if (contentComparison !== 0) return contentComparison
+  // Result chronology is later rewritten to the earliest underlying delivery.
+  // Timestamp is therefore safe only after immutable identity/content have
+  // tied; it must never be able to flip the selected surface on replay.
+  if (left.timestamp === right.timestamp) return 0
+  return left.timestamp > right.timestamp ? 1 : -1
+}
+
 export function resultSurfaceDedupeKey(message: ChatMessage): string {
   if (resultSurfacePriority(message) <= 0) return ''
-  const content = compactWhitespace(stripNarrativeTitlePrefix(message.content)).slice(0, 2000)
+  const deliveryKey = stableResultDeliveryKey(message)
+  if (deliveryKey) return `result:${deliveryKey}`
+
+  const content = normalizeResultContentFallback(message.content)
   return content ? `result:${content}` : ''
 }
 
@@ -492,7 +545,7 @@ export function mergeConversationMessages(messageGroups: ChatMessage[][]): ChatM
         const existingIndex = resultKeyIndex.get(resultKey)
         if (existingIndex !== undefined) {
           const existing = merged[existingIndex]
-          const candidateWins = resultSurfacePriority(message) > resultSurfacePriority(existing)
+          const candidateWins = compareResultSurfacePreference(message, existing) > 0
           const preferred = candidateWins ? message : existing
           const secondary = candidateWins ? existing : message
           merged[existingIndex] = {
@@ -505,7 +558,7 @@ export function mergeConversationMessages(messageGroups: ChatMessage[][]): ChatM
             metadata: {
               ...(secondary.metadata ?? {}),
               ...(preferred.metadata ?? {}),
-              ui_timeline_id: stableMessageTimelineKey(existing),
+              ui_timeline_id: resultKey || stableMessageTimelineKey(existing),
             },
           }
           continue
@@ -541,22 +594,6 @@ export function selectCompanySummaryMessages(
   messages: ChatMessage[],
   parentChannelId: string,
 ): ChatMessage[] {
-  const terminalAssistantTurn = (message: ChatMessage): string => {
-    const metadata = (message.metadata ?? {}) as Record<string, unknown>
-    const kind = String(metadata.transcript_kind ?? metadata.kind ?? '').trim()
-    if (kind !== 'runtime_v2_assistant' && kind !== 'runtime_v2_company_assistant') return ''
-    return String(metadata.canonical_turn_id ?? metadata.turn_id ?? '').trim()
-  }
-  const parentTerminalTurns = new Set(
-    messages
-      .filter(message => (
-        message.channelId === parentChannelId
-        && isMessageVisibleAtDetailLevel(message, 'summary')
-      ))
-      .map(terminalAssistantTurn)
-      .filter(Boolean),
-  )
-  const childTerminalByTurn = new Map<string, ChatMessage>()
   const durableMessages: ChatMessage[] = []
   for (const message of messages) {
     if (message.channelId === parentChannelId) {
@@ -584,38 +621,8 @@ export function selectCompanySummaryMessages(
       'top_level_reply',
     ].includes(kind)) {
       durableMessages.push(message)
-      continue
-    }
-    // Snapshot builder deliberately marks the final runtime surface as
-    // summary-visible. Preserve that durable contract instead of reusing the
-    // result-dedupe priority table as a visibility threshold.
-    const isSummaryTerminal = String(metadata.detail_visibility ?? '').trim() === 'summary'
-      && (kind === 'runtime_v2_assistant' || kind === 'runtime_v2_company_assistant')
-    if (!isSummaryTerminal) continue
-    const turnId = terminalAssistantTurn(message)
-    if (!turnId) {
-      durableMessages.push(message)
-      continue
-    }
-    if (parentTerminalTurns.has(turnId)) continue
-    const existing = childTerminalByTurn.get(turnId)
-    if (!existing) {
-      childTerminalByTurn.set(turnId, message)
-      continue
-    }
-    const existingPriority = resultSurfacePriority(existing)
-    const candidatePriority = resultSurfacePriority(message)
-    if (candidatePriority > existingPriority) {
-      childTerminalByTurn.set(turnId, message)
-    } else if (
-      candidatePriority === existingPriority
-      && (message.timestamp > existing.timestamp
-        || (message.timestamp === existing.timestamp && message.id.localeCompare(existing.id) > 0))
-    ) {
-      childTerminalByTurn.set(turnId, message)
     }
   }
-  durableMessages.push(...childTerminalByTurn.values())
   return mergeConversationMessages([durableMessages])
 }
 

@@ -341,7 +341,13 @@ export interface ChatMessageMeta {
   /** UI-only identity retained across semantic result-surface replacement. */
   ui_timeline_id?: string
   canonical_turn_id?: string
+  conversation_turn_id?: string
   turn_id?: string
+  execution_turn_id?: string
+  result_delivery_id?: string
+  source_result_message_id?: string
+  source_task_id?: string
+  child_session_id?: string
   execution_mode?: string
   transcript_kind?: string
   detail_visibility?: DetailVisibility

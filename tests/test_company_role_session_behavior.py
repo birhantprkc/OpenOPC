@@ -67,8 +67,95 @@ class MemoryManagerCompactionTests(unittest.IsolatedAsyncioTestCase):
 
             compactor.maybe_compact_after_message.assert_not_awaited()
 
+    async def test_parent_child_result_preserves_structured_source_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _MemoryStoreStub()
+            memory = MemoryManager(Path(tmpdir), project_id="0009", store=store)
+            task = Task(
+                id="task-cto-result",
+                title="CTO Result",
+                assigned_to="cto",
+                project_id="0009",
+                session_id="child-session",
+                parent_session_id="parent-session",
+                metadata={"work_item_projection_id": "cto::analysis"},
+            )
+
+            await memory.record_child_session_result(
+                "parent-session",
+                "child-session",
+                task=task,
+                result_content="done",
+                result_delivery_id=(
+                    "result:task:task-cto-result:turn:canonical-cto-turn:attempt:0"
+                ),
+                source_result_message_id="source-result-message",
+                canonical_turn_id="canonical-cto-turn",
+            )
+
+            metadata = store.session_messages[-1].metadata
+            self.assertEqual(
+                metadata["result_delivery_id"],
+                "result:task:task-cto-result:turn:canonical-cto-turn:attempt:0",
+            )
+            self.assertEqual(metadata["source_result_message_id"], "source-result-message")
+            self.assertEqual(metadata["source_task_id"], "task-cto-result")
+            self.assertEqual(metadata["child_session_id"], "child-session")
+            self.assertEqual(metadata["canonical_turn_id"], "canonical-cto-turn")
+
 
 class SharedRoleSessionExecutionTests(unittest.IsolatedAsyncioTestCase):
+    def test_fallback_delivery_identity_is_per_result_not_per_provider_session(self) -> None:
+        task = Task(
+            id="shared-role-task",
+            title="Shared role",
+            assigned_to="cto",
+            retry_count=0,
+        )
+        first = TaskResult(
+            status=TaskStatus.AWAITING_HUMAN,
+            content="first pause",
+            artifacts={"provider_session_id": "provider-session-reused"},
+        )
+        second = TaskResult(
+            status=TaskStatus.DONE,
+            content="second result",
+            artifacts={"provider_session_id": "provider-session-reused"},
+        )
+
+        first_identity = OPCEngine._ensure_result_delivery_identity_for_commit(task, first)
+        second_identity = OPCEngine._ensure_result_delivery_identity_for_commit(task, second)
+
+        self.assertNotEqual(
+            first_identity["result_delivery_id"],
+            second_identity["result_delivery_id"],
+        )
+        self.assertNotEqual(
+            first.artifacts["result_execution_id"],
+            second.artifacts["result_execution_id"],
+        )
+        self.assertNotIn("provider-session-reused", first_identity["result_delivery_id"])
+
+    def test_fallback_delivery_identity_is_stable_after_result_persistence(self) -> None:
+        task = Task(id="external-task", title="External", assigned_to="cto")
+        result = TaskResult(
+            status=TaskStatus.DONE,
+            content="done",
+            artifacts={"runtime_session_id": "runtime-session-reused"},
+        )
+        first_identity = OPCEngine._ensure_result_delivery_identity_for_commit(task, result)
+        persisted_artifacts = dict(result.artifacts)
+        reloaded = TaskResult(
+            status=TaskStatus.DONE,
+            content="done",
+            artifacts=persisted_artifacts,
+        )
+
+        replay_identity = OPCEngine._ensure_result_delivery_identity_for_commit(task, reloaded)
+
+        self.assertEqual(replay_identity, first_identity)
+        self.assertEqual(reloaded.artifacts, persisted_artifacts)
+
     async def test_company_shared_role_session_keeps_results_local(self) -> None:
         engine = OPCEngine()
         engine.store = SimpleNamespace(
@@ -81,7 +168,11 @@ class SharedRoleSessionExecutionTests(unittest.IsolatedAsyncioTestCase):
             record_task_completion_async=AsyncMock(),
         )
         engine._run_task_once = AsyncMock(
-            return_value=TaskResult(status=TaskStatus.DONE, content="done", artifacts={})
+            return_value=TaskResult(
+                status=TaskStatus.DONE,
+                content="done",
+                artifacts={"result_delivery_id": "delivery-shared-role"},
+            )
         )
         engine._apply_runtime_state_to_task = lambda task, result: None
 
@@ -105,3 +196,64 @@ class SharedRoleSessionExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         engine.memory.record_assistant_turn.assert_awaited_once()
         engine.memory.record_child_session_result.assert_not_awaited()
+        metadata = engine.memory.record_assistant_turn.await_args.kwargs["metadata"]
+        self.assertEqual(metadata["result_delivery_id"], "delivery-shared-role")
+        self.assertEqual(metadata["source_task_id"], "task-cmo-review")
+        self.assertEqual(metadata["child_session_id"], "app14:role:cmo")
+
+    async def test_child_result_and_parent_mirror_share_delivery_identity(self) -> None:
+        engine = OPCEngine()
+        engine.store = SimpleNamespace(
+            get_task=AsyncMock(return_value=None),
+            save_task=AsyncMock(),
+        )
+        engine.memory = SimpleNamespace(
+            record_assistant_turn=AsyncMock(
+                return_value=SimpleNamespace(message_id="source-result-message")
+            ),
+            record_child_session_result=AsyncMock(),
+            record_task_completion_async=AsyncMock(),
+        )
+        engine._run_task_once = AsyncMock(
+            return_value=TaskResult(
+                status=TaskStatus.DONE,
+                content="done",
+                artifacts={
+                    "canonical_turn_id": "runtime-generated-turn",
+                    "result_delivery_id": (
+                        "result:task:task-cto-result:turn:runtime-generated-turn:attempt:0"
+                    ),
+                    "runtime_session_id": "runtime-session-1",
+                },
+            )
+        )
+        engine._apply_runtime_state_to_task = lambda task, result: None
+
+        task = Task(
+            id="task-cto-result",
+            title="CTO Result",
+            assigned_to="cto",
+            status=TaskStatus.PENDING,
+            project_id="0009",
+            session_id="child-session",
+            parent_session_id="parent-session",
+            metadata={
+                "execution_mode": "company_mode",
+                "work_item_projection_id": "cto::analysis",
+            },
+        )
+
+        await engine._execute_task(task)
+
+        child_metadata = engine.memory.record_assistant_turn.await_args.kwargs["metadata"]
+        parent_call = engine.memory.record_child_session_result.await_args.kwargs
+        self.assertEqual(
+            child_metadata["result_delivery_id"],
+            "result:task:task-cto-result:turn:runtime-generated-turn:attempt:0",
+        )
+        self.assertEqual(
+            parent_call["result_delivery_id"],
+            child_metadata["result_delivery_id"],
+        )
+        self.assertEqual(parent_call["source_result_message_id"], "source-result-message")
+        self.assertEqual(parent_call["canonical_turn_id"], "runtime-generated-turn")

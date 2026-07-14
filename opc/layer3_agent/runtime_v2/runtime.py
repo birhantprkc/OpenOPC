@@ -19,6 +19,7 @@ from opc.core.models import OPCEvent, PermissionResolution, Task, TaskResult, Ta
 from opc.layer2_organization.collaboration_policy import ownership_guard_violation
 from opc.layer2_organization.work_item_identity import (
     projection_id_for_task,
+    result_delivery_identity_payload_for_task,
     turn_type_for_task,
     work_item_identity_payload_for_task,
 )
@@ -703,6 +704,14 @@ class NativeRuntimeV2:
                     runtime_notes=runtime_notes,
                 )
                 if verification_gate is not None:
+                    verification_gate.artifacts = {
+                        **dict(verification_gate.artifacts or {}),
+                        "runtime_session_id": runtime_session_id,
+                        **result_delivery_identity_payload_for_task(
+                            task,
+                            canonical_turn_id=conversation_turn_id,
+                        ),
+                    }
                     await self._save_runtime_session(
                         runtime_session_id,
                         task,
@@ -728,6 +737,10 @@ class NativeRuntimeV2:
                 artifacts = {
                     **aggregated_artifacts,
                     "runtime_session_id": runtime_session_id,
+                    **result_delivery_identity_payload_for_task(
+                        task,
+                        canonical_turn_id=conversation_turn_id,
+                    ),
                     "permission_requests": self._permission_requests_from_results([]),
                     "active_subagents": active_subagents,
                     "compaction_boundaries": list(compaction_boundaries),
@@ -2799,6 +2812,16 @@ class NativeRuntimeV2:
             "runtime_session_id": runtime_session_id,
             "source_kind": source_kind,
         }
+        if not tool_calls:
+            metadata.update(
+                result_delivery_identity_payload_for_task(
+                    task,
+                    canonical_turn_id=canonical_turn_id,
+                )
+            )
+            metadata.update(work_item_identity_payload_for_task(task))
+            if task.session_id:
+                metadata["child_session_id"] = str(task.session_id)
         if is_company_mode:
             metadata["execution_mode"] = "company_mode"
             metadata["company_runtime_raw_turn"] = True

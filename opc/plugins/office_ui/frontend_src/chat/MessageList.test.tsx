@@ -17,6 +17,16 @@ assert.match(
 assert.match(messageListSource, /scrollPolicy = 'follow'/, 'main transcript behavior should default to follow mode')
 assert.doesNotMatch(messageListSource, /useVirtualizer/, 'chat transcript must use stable normal DOM rows')
 assert.doesNotMatch(messageListSource, /PROGRAMMATIC_SCROLL_GRACE_MS/, 'scroll behavior must not regress to timer-based intent guessing')
+assert.doesNotMatch(
+  messageListSource,
+  /seenNarrativeMessages|seenProjectUpdates/,
+  'MessageList must not independently remove durable rows using rendered content',
+)
+assert.match(
+  messageListSource,
+  /terminalAssistantTurnId\(message\)/,
+  'draft suppression must use the shared committed-turn resolver',
+)
 
 const progressWithoutServerId = {
   type: 'status_change' as const,
@@ -147,7 +157,16 @@ const companyTurnKeys = [
     metadata: { kind: 'company_role_result', canonical_turn_id: sharedCompanyTurn },
   }),
 ]
-assert.equal(new Set(companyTurnKeys).size, companyTurnKeys.length, 'distinct company rows sharing a turn need unique DOM keys')
+assert.equal(
+  companyTurnKeys[1],
+  companyTurnKeys[2],
+  'company draft/final surfaces for one canonical turn must reuse the same DOM slot',
+)
+assert.notEqual(
+  companyTurnKeys[2],
+  companyTurnKeys[3],
+  'a separately committed role result keeps its result-delivery identity',
+)
 
 const narrativeItems = buildNarrativeMessageItems([
   baseMessage('m1', '[Company:cto::execute::abc] starting Research source reliability', 1000),
@@ -163,35 +182,63 @@ assert.equal(narrativeItems[0].kind === 'ops-bundle' ? narrativeItems[0].events.
 assert.equal(narrativeItems[1].kind, 'message')
 assert.equal(narrativeItems[2].kind, 'ops-bundle')
 
+const longResult = 'Completed the focused recheck and produced the QA artifact with caveats for downstream aggregation.'
 const dedupedProjectUpdates = buildNarrativeMessageItems([
   baseMessage('u1', prefixedPayload, 2000, 'qa_analyst'),
   baseMessage('u2', `**Report #1: Recheck remediated screen**: ${prefixedPayload}`, 2000, 'qa_analyst'),
 ], { isCompanyRuntime: true, detailMode: 'summary' })
-assert.equal(dedupedProjectUpdates.length, 1)
+assert.equal(
+  dedupedProjectUpdates.length,
+  2,
+  'renderer must preserve distinct project-update rows; upstream identity owns consolidation',
+)
 assert.equal(dedupedProjectUpdates[0].kind, 'message')
 assert.equal(dedupedProjectUpdates[0].kind === 'message' ? dedupedProjectUpdates[0].msg.id : '', 'u1')
 
-const longResult = 'Completed the focused recheck and produced the QA artifact with caveats for downstream aggregation.'
-const dedupedNarrativeMessages = buildNarrativeMessageItems([
+const identicalDurableNarratives = buildNarrativeMessageItems([
+  baseMessage('same-content-1', longResult, 2500, 'qa_analyst'),
+  baseMessage('same-content-2', longResult, 2500, 'qa_analyst'),
+], { isCompanyRuntime: true, detailMode: 'summary' })
+assert.deepEqual(
+  identicalDurableNarratives.map(item => item.kind === 'message' ? item.msg.id : item.id),
+  ['same-content-1', 'same-content-2'],
+  'distinct stable identities must survive even when sender, timestamp, and content are identical',
+)
+
+const ambiguousNarrativeMessages = buildNarrativeMessageItems([
   baseMessage('n1', longResult, 3000, 'qa_analyst'),
   baseMessage('n2', `Recheck remediated ten-bagger candidate screen: ${longResult}`, 3000, 'qa_analyst'),
 ], { isCompanyRuntime: true, detailMode: 'summary' })
-assert.equal(dedupedNarrativeMessages.length, 1)
-assert.equal(dedupedNarrativeMessages[0].kind === 'message' ? dedupedNarrativeMessages[0].msg.id : '', 'n1')
+assert.equal(
+  ambiguousNarrativeMessages.length,
+  2,
+  'plain narrative prefixes are content and must not be stripped to guess message identity',
+)
 
 const duplicatedResultSurface = buildNarrativeMessageItems([
   {
     ...baseMessage('r1', longResult, 4000, 'chao'),
-    metadata: { source: 'engine', transcript_kind: 'child_task_result' },
+    metadata: {
+      source: 'engine',
+      transcript_kind: 'child_task_result',
+      result_delivery_id: 'delivery-r1',
+    },
   },
   {
     ...baseMessage('r2', `Deliver final result to user: ${longResult}`, 4500, 'system'),
     senderName: 'Company Member',
-    metadata: { source: 'runtime_event', kind: 'worker_notification', notification_kind: 'task_complete' },
+    metadata: {
+      source: 'engine',
+      transcript_kind: 'child_result',
+      result_delivery_id: 'delivery-r1',
+    },
   },
 ], { isCompanyRuntime: true, detailMode: 'summary' })
-assert.equal(duplicatedResultSurface.length, 1)
-assert.equal(duplicatedResultSurface[0].kind === 'message' ? duplicatedResultSurface[0].msg.id : '', 'r1')
+assert.equal(
+  duplicatedResultSurface.length,
+  2,
+  'MessageList must not run a second result consolidator after the store/company projection',
+)
 
 const fullItems = buildNarrativeMessageItems([
   baseMessage('m1', '[Company:cto::execute::abc] starting Research source reliability', 1000),

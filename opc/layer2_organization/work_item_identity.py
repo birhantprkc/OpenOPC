@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 WORK_ITEM_PROJECTION_ID_KEY = "work_item_projection_id"
 WORK_ITEM_TURN_TYPE_KEY = "work_item_turn_type"
+RESULT_DELIVERY_ID_KEY = "result_delivery_id"
+SOURCE_TASK_ID_KEY = "source_task_id"
 GATE_REWORK_PROJECTION_ID_KEY = "rework_projection_id"
 GATE_TARGET_PROJECTION_ID_KEY = "target_projection_id"
 GATE_TARGET_PROJECTION_IDS_KEY = "target_projection_ids"
@@ -257,6 +259,94 @@ def work_item_identity_payload_for_task(
         turn_type=turn_type_for_task(task, fallback=fallback_turn_type),
         include_empty=include_empty,
     )
+
+
+def canonical_result_turn_id_for_task(
+    task: Any,
+    *,
+    canonical_turn_id: str = "",
+) -> str:
+    """Return the canonical conversation turn owning a task result.
+
+    Runtime events also carry iteration-scoped ``turn_id`` values.  Result
+    surfaces must never use those values as their logical delivery identity,
+    so this helper only falls back to the task's canonical runtime fields.
+    """
+    explicit = _clean(canonical_turn_id)
+    if explicit:
+        return explicit
+    metadata = dict(getattr(task, "metadata", {}) or {}) if task is not None else {}
+    runtime_metadata = dict(metadata.get("runtime_v2", {}) or {})
+    for source in (metadata, runtime_metadata):
+        for key in (
+            "canonical_turn_id",
+            "conversation_turn_id",
+            "current_turn_id",
+            "runtime_v2_current_turn_id",
+        ):
+            value = _clean(source.get(key))
+            if value:
+                return value
+    return ""
+
+
+def result_delivery_id_for_task(
+    task: Any,
+    *,
+    canonical_turn_id: str = "",
+    execution_id: str = "",
+    result_delivery_id: str = "",
+) -> str:
+    """Build one stable identity shared by every surface of a task result.
+
+    The attempt suffix keeps a failed result and its retry distinct while the
+    canonical turn (when available) links the runtime final, child result and
+    parent mirror without inspecting their display text.
+    """
+    explicit = _clean(result_delivery_id)
+    if explicit:
+        return explicit
+    task_id = _clean(getattr(task, "id", ""))
+    turn_id = canonical_result_turn_id_for_task(
+        task,
+        canonical_turn_id=canonical_turn_id,
+    )
+    execution = _clean(execution_id)
+    if not task_id or (not turn_id and not execution):
+        return ""
+    try:
+        attempt = max(0, int(getattr(task, "retry_count", 0) or 0))
+    except (TypeError, ValueError):
+        attempt = 0
+    identity_kind = "turn" if turn_id else "execution"
+    identity_value = turn_id or execution
+    return f"result:task:{task_id}:{identity_kind}:{identity_value}:attempt:{attempt}"
+
+
+def result_delivery_identity_payload_for_task(
+    task: Any,
+    *,
+    canonical_turn_id: str = "",
+    execution_id: str = "",
+    result_delivery_id: str = "",
+) -> dict[str, str]:
+    """Return structured lineage shared by persisted result projections."""
+    delivery_id = result_delivery_id_for_task(
+        task,
+        canonical_turn_id=canonical_turn_id,
+        execution_id=execution_id,
+        result_delivery_id=result_delivery_id,
+    )
+    source_task_id = _clean(getattr(task, "id", ""))
+    canonical_id = canonical_result_turn_id_for_task(
+        task,
+        canonical_turn_id=canonical_turn_id,
+    )
+    return {
+        **({RESULT_DELIVERY_ID_KEY: delivery_id} if delivery_id else {}),
+        **({SOURCE_TASK_ID_KEY: source_task_id} if source_task_id else {}),
+        **({"canonical_turn_id": canonical_id} if canonical_id else {}),
+    }
 
 
 def migrate_work_item_projection_metadata(

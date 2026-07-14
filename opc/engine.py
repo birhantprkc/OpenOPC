@@ -144,6 +144,7 @@ from opc.layer2_organization.work_item_identity import (
     projection_id_for_task,
     projection_id_for_work_item,
     rework_projection_id_for_gate,
+    result_delivery_identity_payload_for_task,
     turn_type_for_task,
     turn_type_for_work_item,
     work_item_identity_payload,
@@ -9076,6 +9077,48 @@ class OPCEngine:
             in {"suspending", "suspended"}
         )
 
+    @staticmethod
+    def _ensure_result_delivery_identity_for_commit(
+        task: Task,
+        result: TaskResult,
+    ) -> dict[str, str]:
+        """Reuse the runtime's immutable delivery id or mint one once.
+
+        A runtime-generated canonical turn is not guaranteed to be copied back
+        into mutable Task metadata.  The TaskResult artifact is therefore the
+        hand-off boundary between runtime persistence and the engine mirrors.
+        External/pause results without a canonical turn receive a per-result
+        execution seed here. Runtime/provider *session* ids are deliberately
+        excluded because those sessions survive resume and can produce several
+        legitimate deliveries for the same task and retry count.
+
+        The generated identity is written back to ``TaskResult.artifacts``
+        before the task result is persisted. Replaying that durable result is
+        therefore stable instead of minting a second UI row after a restart.
+        """
+        artifacts = dict(result.artifacts or {})
+        canonical_turn_id = str(
+            artifacts.get("canonical_turn_id")
+            or artifacts.get("conversation_turn_id")
+            or ""
+        ).strip()
+        persisted_delivery_id = str(artifacts.get("result_delivery_id") or "").strip()
+        execution_id = str(artifacts.get("result_execution_id") or "").strip()
+        if not persisted_delivery_id and not canonical_turn_id and not execution_id:
+            execution_id = uuid.uuid4().hex
+        identity = result_delivery_identity_payload_for_task(
+            task,
+            canonical_turn_id=canonical_turn_id,
+            execution_id=execution_id,
+            result_delivery_id=persisted_delivery_id,
+        )
+        result.artifacts = {
+            **artifacts,
+            **({"result_execution_id": execution_id} if execution_id else {}),
+            **identity,
+        }
+        return identity
+
     async def _execute_registered_task_attempt(self, task: Task) -> TaskResult:
         try:
             result = await self._run_task_once(task)
@@ -9115,6 +9158,7 @@ class OPCEngine:
                 "company runtime was suspended before result commit"
             )
         self._apply_runtime_state_to_task(task, result)
+        result_identity = self._ensure_result_delivery_identity_for_commit(task, result)
         task.status = result.status
         task.result = {"content": result.content, "artifacts": result.artifacts}
         await self.store.save_task(task)
@@ -9131,6 +9175,8 @@ class OPCEngine:
                     "status": result.status.value,
                     "employee_id": str(assignment.get("employee_id", "")).strip(),
                     "role_id": str(assignment.get("role_id") or task.assigned_to or "").strip(),
+                    "child_session_id": str(task.session_id),
+                    **result_identity,
                     **work_item_identity_payload_for_task(task),
                 },
             )
@@ -9141,7 +9187,7 @@ class OPCEngine:
             and task.session_id != task.parent_session_id
         ):
             assignment = dict(task.metadata.get("employee_assignment", {}) or {})
-            await self.memory.record_assistant_turn(
+            child_result_message = await self.memory.record_assistant_turn(
                 session_id=task.session_id,
                 content=result.content,
                 project_id=task.project_id,
@@ -9152,6 +9198,8 @@ class OPCEngine:
                     "status": result.status.value,
                     "employee_id": str(assignment.get("employee_id", "")).strip(),
                     "role_id": str(assignment.get("role_id") or task.assigned_to or "").strip(),
+                    "child_session_id": str(task.session_id),
+                    **result_identity,
                     **work_item_identity_payload_for_task(task),
                 },
             )
@@ -9161,6 +9209,11 @@ class OPCEngine:
                 task=task,
                 result_content=result.content,
                 artifacts=result.artifacts,
+                result_delivery_id=result_identity.get("result_delivery_id", ""),
+                source_result_message_id=str(
+                    getattr(child_result_message, "message_id", "") or ""
+                ),
+                canonical_turn_id=result_identity.get("canonical_turn_id", ""),
             )
         if result.status == TaskStatus.DONE:
             await self._record_task_mode_external_result_reply(task, result.content)
@@ -9197,6 +9250,7 @@ class OPCEngine:
                     "company runtime was suspended before retry result commit"
                 )
             self._apply_runtime_state_to_task(task, result)
+            result_identity = self._ensure_result_delivery_identity_for_commit(task, result)
             task.status = result.status
             task.result = {"content": result.content, "artifacts": result.artifacts}
             await self.store.save_task(task)
@@ -9214,6 +9268,8 @@ class OPCEngine:
                         "retry_count": task.retry_count,
                         "employee_id": str(assignment.get("employee_id", "")).strip(),
                         "role_id": str(assignment.get("role_id") or task.assigned_to or "").strip(),
+                        "child_session_id": str(task.session_id),
+                        **result_identity,
                         **work_item_identity_payload_for_task(task),
                     },
                 )
@@ -9224,7 +9280,7 @@ class OPCEngine:
                 and task.session_id != task.parent_session_id
             ):
                 assignment = dict(task.metadata.get("employee_assignment", {}) or {})
-                await self.memory.record_assistant_turn(
+                child_result_message = await self.memory.record_assistant_turn(
                     session_id=task.session_id,
                     content=result.content,
                     project_id=task.project_id,
@@ -9236,6 +9292,8 @@ class OPCEngine:
                         "retry_count": task.retry_count,
                         "employee_id": str(assignment.get("employee_id", "")).strip(),
                         "role_id": str(assignment.get("role_id") or task.assigned_to or "").strip(),
+                        "child_session_id": str(task.session_id),
+                        **result_identity,
                         **work_item_identity_payload_for_task(task),
                     },
                 )
@@ -9245,6 +9303,11 @@ class OPCEngine:
                     task=task,
                     result_content=result.content,
                     artifacts=result.artifacts,
+                    result_delivery_id=result_identity.get("result_delivery_id", ""),
+                    source_result_message_id=str(
+                        getattr(child_result_message, "message_id", "") or ""
+                    ),
+                    canonical_turn_id=result_identity.get("canonical_turn_id", ""),
                 )
             if result.status == TaskStatus.DONE:
                 await self._record_task_mode_external_result_reply(task, result.content)

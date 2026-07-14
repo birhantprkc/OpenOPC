@@ -23,8 +23,8 @@ function messageMetadata(message: ChatMessage): Record<string, unknown> {
   return (message.metadata ?? {}) as Record<string, unknown>
 }
 
-function normalizeMessageContent(content: string): string {
-  const normalized = String(content ?? '')
+function normalizeMessageFormatting(content: string): string {
+  return String(content ?? '')
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .split('\n')
@@ -32,6 +32,10 @@ function normalizeMessageContent(content: string): string {
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+function normalizeMessageContent(content: string): string {
+  const normalized = normalizeMessageFormatting(content)
   const titleStripped = stripNarrativeTitlePrefix(normalized)
   const paragraphs = titleStripped.split(/\n{2,}/).map(part => part.trim()).filter(Boolean)
   if (paragraphs.length > 1 && /^Verification:\s/i.test(paragraphs[paragraphs.length - 1])) {
@@ -41,21 +45,40 @@ function normalizeMessageContent(content: string): string {
 }
 
 function stripNarrativeTitlePrefix(content: string): string {
-  const trimmed = String(content || '').trim()
-  const markdownTitle = trimmed.match(/^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$/)
-  if (markdownTitle) {
+  let trimmed = String(content || '').trim()
+  // Only an explicit, first-line "**Title**: body" wrapper is removable.
+  // Searching for an arbitrary `: ` in the first N characters is destructive:
+  // ordinary Markdown such as "**Work Item 1: ...**" and list fields such as
+  // "- ID: ..." would be peeled one layer at a time on repeated syncs.
+  for (;;) {
+    const markdownTitle = trimmed.match(/^\*\*([^\r\n]{8,160}?)\*\*:(?:[ \t]+|\r?\n+)([\s\S]+)$/)
+    if (!markdownTitle) return trimmed
     const body = markdownTitle[2].trim()
-    if (body.length >= 80) return body
+    if (body.length < 80 || body === trimmed) return trimmed
+    trimmed = body
   }
-  const colonIndex = trimmed.indexOf(': ')
-  if (colonIndex < 8 || colonIndex > 160) return trimmed
+}
 
-  const prefix = trimmed.slice(0, colonIndex).replace(/\*/g, '').trim()
-  const body = trimmed.slice(colonIndex + 2).trim()
-  if (body.length < 80) return trimmed
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(prefix)) return trimmed
-  if (/^(https?|file)$/i.test(prefix)) return trimmed
-  return body
+function losslessIdentityContent(
+  existing: ChatMessage,
+  candidate: ChatMessage,
+  preferred: ChatMessage,
+  sharesConcreteIdentity: boolean,
+): string {
+  if (!sharesConcreteIdentity) return preferred.content
+
+  const existingComparable = normalizeMessageFormatting(existing.content)
+  const candidateComparable = normalizeMessageFormatting(candidate.content)
+  if (!existingComparable || !candidateComparable || existingComparable === candidateComparable) {
+    return preferred.content
+  }
+
+  // A cache/detail replay can contain a prefix-truncated copy of the same
+  // persistent message. Preserve the lossless source regardless of arrival
+  // order; unrelated edits still follow the normal preference rules.
+  if (existingComparable.endsWith(candidateComparable)) return existing.content
+  if (candidateComparable.endsWith(existingComparable)) return candidate.content
+  return preferred.content
 }
 
 function messageIdentityKeys(message: ChatMessage): Set<string> {
@@ -66,6 +89,9 @@ function messageIdentityKeys(message: ChatMessage): Set<string> {
   for (const value of [
     message.id,
     typeof metadata.ui_message_id === 'string' ? metadata.ui_message_id : '',
+    typeof metadata.result_delivery_id === 'string' && metadata.result_delivery_id.trim()
+      ? `delivery:${metadata.result_delivery_id.trim()}`
+      : '',
     checkpointType && checkpointId ? `checkpoint:${checkpointType}:${checkpointId}` : '',
   ]) {
     const normalized = String(value ?? '').trim()
@@ -81,7 +107,7 @@ function scopedMessageIdentityKeys(message: ChatMessage): Set<string> {
 }
 
 function isDerivedIdentityKey(value: string): boolean {
-  return value.startsWith('checkpoint:')
+  return value.startsWith('checkpoint:') || value.startsWith('delivery:')
 }
 
 function messageTimestamp(message: ChatMessage): number {
@@ -229,18 +255,17 @@ function mergeDuplicateMessages(
 
   const existingIds = messageIdentityKeys(existing)
   const candidateIds = messageIdentityKeys(candidate)
+  let sharesConcreteIdentity = false
   let canonicalId = ''
   for (const id of existingIds) {
-    if (candidateIds.has(id) && !isDerivedIdentityKey(id)) {
-      canonicalId = id
-      break
+    if (!candidateIds.has(id)) continue
+    if (!isDerivedIdentityKey(id)) {
+      sharesConcreteIdentity = true
+      if (!canonicalId) canonicalId = id
     }
   }
 
-  const normalizedContent = normalizeMessageContent(preferred.content)
-  const content = normalizedContent && normalizedContent === normalizeMessageContent(secondary.content)
-    ? normalizedContent
-    : preferred.content
+  const content = losslessIdentityContent(existing, candidate, preferred, sharesConcreteIdentity)
 
   const existingCheckpointId = String(messageMetadata(existing).checkpoint_id ?? '').trim()
   const candidateCheckpointId = String(messageMetadata(candidate).checkpoint_id ?? '').trim()

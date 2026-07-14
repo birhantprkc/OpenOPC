@@ -16,8 +16,32 @@ from opc.plugins.office_ui.chat_store import (
     _MessageMatchIndex,
     _MessageMatchState,
 )
-from opc.plugins.office_ui.snapshot_builder import build_transcript_ui_messages
+from opc.plugins.office_ui.snapshot_builder import (
+    build_transcript_ui_messages,
+    collapse_adjacent_transcript_duplicates,
+)
 from opc.plugins.office_ui.ws_handler import WSHandler
+
+
+_WORK_ITEM_RESULT = """Both work items have been successfully dispatched and can execute in parallel.
+
+**Dispatch Summary**
+
+**Work Item 1: OpenOPC Source Code Architecture Deep-Dive Analysis**
+- ID: `1ed5f5f1-ac41-49a1-b1fa-23bbc9adab82`
+- Owner: senior_engineer
+- Scope: `openopc-source-analysis`
+- Output: `/workspace/openopc-architecture-analysis.md`
+- Covers: Layered architecture, work-item state machines, collaboration policy, and seat executors.
+
+**Work Item 2: External Multi-Agent Frameworks Architecture Research**
+- ID: `d0307208-6b95-44c1-9b51-6bf073bbdcef`
+- Owner: senior_engineer
+- Scope: `external-frameworks-research`
+- Output: `/workspace/external-frameworks-analysis.md`
+- Covers: Architecture models, coordination, communication, extensibility, and implementation details.
+
+Both are independent and can execute in parallel."""
 
 
 class TranscriptStorePaginationTests(unittest.IsolatedAsyncioTestCase):
@@ -216,6 +240,43 @@ class TranscriptStorePaginationTests(unittest.IsolatedAsyncioTestCase):
             detail_level="summary",
         ))
 
+    def test_renderer_preserves_structured_result_lineage(self) -> None:
+        lineage = {
+            "canonical_turn_id": "turn-canonical",
+            "turn_id": "turn-execution",
+            "result_delivery_id": "delivery-1",
+            "source_result_message_id": "source-message-1",
+            "source_task_id": "source-task-1",
+            "child_session_id": "child-session-1",
+            "conversation_turn_id": "conversation-turn-1",
+            "execution_turn_id": "execution-turn-1",
+            "work_item_projection_id": "architecture",
+            "work_item_turn_type": "delivery",
+            "runtime_session_id": "runtime-session-1",
+        }
+        rendered = build_transcript_ui_messages(
+            [{
+                "message": SimpleNamespace(
+                    message_id="result-message-1",
+                    role="assistant",
+                    agent_id="cto",
+                    created_at=datetime(2026, 7, 14, 10, 0, 0),
+                    summary_flag=False,
+                    metadata={"kind": "child_result", **lineage},
+                ),
+                "parts": [SimpleNamespace(
+                    part_type="text",
+                    payload={"text": "Completed architecture analysis."},
+                )],
+            }],
+            channel_id="session:parent-task",
+            task_id="parent-task",
+        )
+
+        self.assertEqual(len(rendered), 1)
+        for key, value in lineage.items():
+            self.assertEqual(rendered[0]["metadata"].get(key), value)
+
 
 class ChatStorePaginationTests(unittest.TestCase):
     @staticmethod
@@ -292,6 +353,129 @@ class ChatStorePaginationTests(unittest.TestCase):
         expected = self._legacy_dedupe(store, messages)
         actual = store._dedupe_messages(messages)
         self.assertEqual(actual, expected)
+
+    def test_work_item_colons_are_not_treated_as_narrative_wrappers(self) -> None:
+        normalized = ChatStore._normalize_duplicate_content(_WORK_ITEM_RESULT)
+        self.assertEqual(normalized, _WORK_ITEM_RESULT)
+        self.assertEqual(ChatStore._normalize_duplicate_content(normalized), normalized)
+
+    def test_duplicate_merge_keeps_work_item_display_content_across_replays(self) -> None:
+        store = ChatStore(None)  # type: ignore[arg-type]
+        current = {
+            "message_id": "runtime-final",
+            "channel_id": "session:cto",
+            "sender": "assistant",
+            "sender_name": "CTO",
+            "content": _WORK_ITEM_RESULT,
+            "created_at": 1.0,
+            "reply_to_id": None,
+            "mentions": [],
+            "metadata": {
+                "source": "engine",
+                "transcript_kind": "runtime_v2_company_assistant",
+            },
+        }
+        canonical = {
+            **current,
+            "message_id": "child-task-result",
+            "created_at": 2.0,
+            "metadata": {
+                "source": "engine",
+                "transcript_kind": "child_task_result",
+            },
+        }
+
+        for _ in range(6):
+            current = store._merge_duplicate_messages(current, canonical)
+            self.assertEqual(current["content"], _WORK_ITEM_RESULT)
+
+    def test_duplicate_merge_reuses_an_original_unwrapped_surface(self) -> None:
+        store = ChatStore(None)  # type: ignore[arg-type]
+        body = "Canonical answer " + ("with implementation details. " * 8)
+        wrapped = {
+            "message_id": "runtime-final",
+            "channel_id": "session:answer",
+            "sender": "assistant",
+            "sender_name": "OPC",
+            "content": f"**Top level answer**: {body}",
+            "created_at": 1.0,
+            "metadata": {
+                "source": "engine",
+                "transcript_kind": "runtime_v2_assistant",
+            },
+        }
+        unwrapped = {
+            **wrapped,
+            "message_id": "top-level-reply",
+            "content": body,
+            "created_at": 2.0,
+            "metadata": {
+                "source": "engine",
+                "transcript_kind": "top_level_reply",
+            },
+        }
+
+        merged = store._merge_duplicate_messages(wrapped, unwrapped)
+        self.assertEqual(merged["content"], unwrapped["content"])
+        self.assertIn(merged["content"], (wrapped["content"], unwrapped["content"]))
+
+    def test_result_delivery_identity_is_namespaced_without_canonical_turn_fallback(self) -> None:
+        store = ChatStore(None)  # type: ignore[arg-type]
+        existing = {
+            "message_id": "raw-final",
+            "channel_id": "session:result",
+            "sender": "assistant",
+            "content": "runtime wording",
+            "created_at": 1.0,
+            "metadata": {
+                "result_delivery_id": "delivery-1",
+                "canonical_turn_id": "turn-shared",
+            },
+        }
+        delivered = {
+            **existing,
+            "message_id": "child-task-result",
+            "content": "canonical result wording",
+            "metadata": {
+                "result_delivery_id": "delivery-1",
+                "canonical_turn_id": "turn-shared",
+            },
+        }
+        unrelated_user = {
+            **existing,
+            "message_id": "user-turn",
+            "sender": "user",
+            "content": "different user text",
+            "metadata": {"canonical_turn_id": "turn-shared"},
+        }
+
+        self.assertIn("result_delivery:delivery-1", store._message_identity_keys(existing))
+        self.assertTrue(store._messages_semantically_match(existing, delivered))
+        self.assertFalse(store._messages_semantically_match(existing, unrelated_user))
+
+    def test_transcript_collapse_keeps_work_item_display_content_across_replays(self) -> None:
+        runtime = {
+            "message_id": "runtime-final",
+            "sender": "assistant",
+            "sender_name": "CTO",
+            "content": _WORK_ITEM_RESULT,
+            "created_at": 1.0,
+            "metadata": {"transcript_kind": "runtime_v2_company_assistant"},
+        }
+        canonical = {
+            **runtime,
+            "message_id": "child-task-result",
+            "created_at": 2.0,
+            "metadata": {"transcript_kind": "child_task_result"},
+        }
+
+        collapsed = collapse_adjacent_transcript_duplicates([runtime, canonical])
+        self.assertEqual(len(collapsed), 1)
+        self.assertEqual(collapsed[0]["content"], _WORK_ITEM_RESULT)
+
+        replayed = collapse_adjacent_transcript_duplicates([runtime, collapsed[0]])
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(replayed[0]["content"], _WORK_ITEM_RESULT)
 
     def test_indexed_dedupe_normalizes_long_content_once_per_row(self) -> None:
         class CountingChatStore(ChatStore):
@@ -497,6 +681,136 @@ class ChatStorePaginationTests(unittest.TestCase):
                 (channel_id, project_id),
             )
             self.assertEqual((await cursor.fetchone())[0], 201)
+        finally:
+            await db.close()
+            tmpdir.cleanup()
+
+    def test_backfill_same_id_repairs_destructively_normalized_content(self) -> None:
+        asyncio.run(self._exercise_backfill_same_id_repairs_content())
+
+    async def _exercise_backfill_same_id_repairs_content(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        db = _SQLiteConnectionAdapter(str(Path(tmpdir.name) / "ui-state.db"))
+        store = ChatStore(db)  # type: ignore[arg-type]
+        await store.initialize()
+        channel_id = "session:work-item-repair"
+        project_id = "test-project"
+        damaged_content = _WORK_ITEM_RESULT[_WORK_ITEM_RESULT.index("OpenOPC Source"):]
+        metadata = {
+            "source": "engine",
+            "transcript_kind": "child_result",
+            "legacy_cache_marker": True,
+        }
+        authoritative = {
+            "message_id": "result-message-1",
+            "sender": "assistant",
+            "sender_name": "CTO",
+            "content": _WORK_ITEM_RESULT,
+            "created_at": 1.0,
+            "metadata": {
+                "source": "engine",
+                "transcript_kind": "child_result",
+            },
+        }
+        try:
+            await store.insert_message(
+                channel_id,
+                "assistant",
+                "CTO",
+                damaged_content,
+                metadata=metadata,
+                message_id="result-message-1",
+                project_id=project_id,
+                created_at=1.0,
+            )
+
+            repaired = await store.backfill_messages(
+                channel_id,
+                [authoritative],
+                project_id=project_id,
+            )
+            replayed = await store.backfill_messages(
+                channel_id,
+                [authoritative],
+                project_id=project_id,
+            )
+            rows = await store.get_channel_messages(
+                channel_id,
+                limit=20,
+                project_id=project_id,
+            )
+
+            self.assertEqual([message["message_id"] for message in repaired], ["result-message-1"])
+            self.assertEqual(replayed, [])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["content"], _WORK_ITEM_RESULT)
+            self.assertTrue(rows[0]["metadata"].get("legacy_cache_marker"))
+        finally:
+            await db.close()
+            tmpdir.cleanup()
+
+    def test_backfill_semantic_duplicate_upgrades_existing_row_in_place(self) -> None:
+        asyncio.run(self._exercise_backfill_semantic_duplicate_upgrade())
+
+    async def _exercise_backfill_semantic_duplicate_upgrade(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        db = _SQLiteConnectionAdapter(str(Path(tmpdir.name) / "ui-state.db"))
+        store = ChatStore(db)  # type: ignore[arg-type]
+        await store.initialize()
+        channel_id = "session:semantic-result-repair"
+        project_id = "test-project"
+        authoritative_content = _WORK_ITEM_RESULT
+        authoritative = {
+            "message_id": "source-result-message",
+            "sender": "cto",
+            "sender_name": "CTO",
+            "content": authoritative_content,
+            "created_at": 2.0,
+            "metadata": {
+                "source": "engine",
+                "transcript_kind": "child_task_result",
+            },
+        }
+        try:
+            await store.insert_message(
+                channel_id,
+                "assistant",
+                "CTO",
+                f"**Legacy result**: {_WORK_ITEM_RESULT}",
+                metadata={
+                    "source": "engine",
+                    "transcript_kind": "runtime_v2_company_assistant",
+                    "legacy_cache_marker": True,
+                },
+                message_id="mounted-cache-row",
+                project_id=project_id,
+                created_at=1.0,
+            )
+
+            upgraded = await store.backfill_messages(
+                channel_id,
+                [authoritative],
+                project_id=project_id,
+            )
+            replayed = await store.backfill_messages(
+                channel_id,
+                [authoritative],
+                project_id=project_id,
+            )
+            rows = await store.get_channel_messages(
+                channel_id,
+                limit=20,
+                project_id=project_id,
+            )
+
+            self.assertEqual([message["message_id"] for message in upgraded], ["mounted-cache-row"])
+            self.assertEqual(replayed, [])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["message_id"], "mounted-cache-row")
+            self.assertEqual(rows[0]["created_at"], 1.0)
+            self.assertEqual(rows[0]["content"], authoritative_content)
+            self.assertEqual(rows[0]["metadata"].get("transcript_kind"), "child_task_result")
+            self.assertTrue(rows[0]["metadata"].get("legacy_cache_marker"))
         finally:
             await db.close()
             tmpdir.cleanup()

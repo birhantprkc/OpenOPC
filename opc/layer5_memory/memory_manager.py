@@ -713,6 +713,9 @@ class MemoryManager:
         task: Any,
         result_content: str,
         artifacts: dict[str, Any] | None = None,
+        result_delivery_id: str = "",
+        source_result_message_id: str = "",
+        canonical_turn_id: str = "",
     ) -> None:
         if not self.store:
             return
@@ -728,9 +731,13 @@ class MemoryManager:
             metadata={
                 "kind": "child_result",
                 "child_session_id": child_session_id,
+                "source_task_id": str(getattr(task, "id", "") or ""),
                 "task_title": getattr(task, "title", ""),
                 "employee_id": str(assignment.get("employee_id", "")).strip(),
                 "role_id": str(assignment.get("role_id") or getattr(task, "assigned_to", "") or "").strip(),
+                **({"result_delivery_id": str(result_delivery_id).strip()} if str(result_delivery_id).strip() else {}),
+                **({"source_result_message_id": str(source_result_message_id).strip()} if str(source_result_message_id).strip() else {}),
+                **({"canonical_turn_id": str(canonical_turn_id).strip()} if str(canonical_turn_id).strip() else {}),
                 **work_item_identity_payload_for_task(task),
             },
         )
@@ -747,6 +754,8 @@ class MemoryManager:
                 "agent_id": getattr(task, "assigned_to", ""),
                 "summary": summary,
                 "artifacts": self._compact_artifacts(artifacts or {}),
+                **({"result_delivery_id": str(result_delivery_id).strip()} if str(result_delivery_id).strip() else {}),
+                **({"source_result_message_id": str(source_result_message_id).strip()} if str(source_result_message_id).strip() else {}),
             },
         )
 

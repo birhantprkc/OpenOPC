@@ -37,6 +37,7 @@ from opc.layer2_organization.work_item_identity import (
     migrate_work_item_projection_metadata,
     projection_id_for_work_item,
     rework_projection_id_for_gate,
+    result_delivery_identity_payload_for_task,
     target_projection_id_for_decision,
     target_projection_ids_for_decision,
     work_item_identity_payload,
@@ -216,6 +217,52 @@ class WorkItemProjectionIdentityTests(unittest.TestCase):
 
         self.assertEqual(payload[WORK_ITEM_PROJECTION_ID_KEY], "task-proj")
         self.assertEqual(payload[WORK_ITEM_TURN_TYPE_KEY], "report")
+
+    def test_result_delivery_identity_uses_canonical_turn_and_retry_attempt(self) -> None:
+        task = SimpleNamespace(
+            id="task-1",
+            retry_count=2,
+            metadata={"runtime_v2_current_turn_id": "canonical-turn-1"},
+        )
+
+        payload = result_delivery_identity_payload_for_task(task)
+
+        self.assertEqual(
+            payload["result_delivery_id"],
+            "result:task:task-1:turn:canonical-turn-1:attempt:2",
+        )
+        self.assertEqual(payload["source_task_id"], "task-1")
+        self.assertEqual(payload["canonical_turn_id"], "canonical-turn-1")
+
+    def test_result_delivery_identity_does_not_collide_for_parallel_tasks(self) -> None:
+        first = SimpleNamespace(id="task-1", retry_count=0, metadata={})
+        second = SimpleNamespace(id="task-2", retry_count=0, metadata={})
+
+        first_payload = result_delivery_identity_payload_for_task(
+            first,
+            canonical_turn_id="shared-parent-turn",
+        )
+        second_payload = result_delivery_identity_payload_for_task(
+            second,
+            canonical_turn_id="shared-parent-turn",
+        )
+
+        self.assertNotEqual(
+            first_payload["result_delivery_id"],
+            second_payload["result_delivery_id"],
+        )
+        self.assertIn(":task-1:", first_payload["result_delivery_id"])
+        self.assertIn(":task-2:", second_payload["result_delivery_id"])
+
+    def test_result_delivery_identity_requires_an_execution_scope(self) -> None:
+        task = SimpleNamespace(id="reused-task", retry_count=0, metadata={})
+
+        self.assertEqual(result_delivery_identity_payload_for_task(task), {
+            "source_task_id": "reused-task",
+        })
+        first = result_delivery_identity_payload_for_task(task, execution_id="execution-1")
+        second = result_delivery_identity_payload_for_task(task, execution_id="execution-2")
+        self.assertNotEqual(first["result_delivery_id"], second["result_delivery_id"])
 
     def test_migrate_projection_metadata_backfills_from_fallbacks_without_overwriting(self) -> None:
         migrated, changed = migrate_work_item_projection_metadata(

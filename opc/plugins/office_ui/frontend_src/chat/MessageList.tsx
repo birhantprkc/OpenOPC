@@ -4,6 +4,7 @@ import type { ProgressEntry, RoleWorkItemSummary, Session, WorkItemProgressEntry
 import { progressEntryKey } from '../lib/progressEntryKey'
 import { stableMessageTimelineKey } from '../lib/messageTimelineIdentity'
 import { isMessageVisibleAtDetailLevel, resultSurfaceDedupeKey } from '../lib/workItemSessions'
+import { resolveCanonicalTurnId, terminalAssistantTurnId } from '../lib/turnIdentity'
 import { IconCopy, IconCheck, IconChat, IconSparkle, IconShield, IconActivity, IconChevron } from './SvgIcons'
 import { AgentProgressBlock, AgentProgressEntryCard, INLINE_PROGRESS_ENTRY_TYPES } from './AgentProgressBlock'
 import { MarkdownBody } from './MarkdownBody'
@@ -345,13 +346,6 @@ export function messageTimelineKey(message: ChatMessage): string {
   return stableMessageTimelineKey(message)
 }
 
-function terminalAssistantTurnId(message: ChatMessage): string {
-  const timelineKey = messageTimelineKey(message)
-  return timelineKey.startsWith('turn:assistant:')
-    ? timelineKey.slice('turn:assistant:'.length)
-    : ''
-}
-
 function formatTime(ts: number) {
   return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
 }
@@ -398,44 +392,6 @@ function isExecutionContextMessage(message: ChatMessage): boolean {
 
 function compactWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim()
-}
-
-function stripNarrativeTitlePrefix(content: string): string {
-  const trimmed = String(content || '').trim()
-  const markdownTitle = trimmed.match(/^\*\*(.{8,160}?)\*\*:\s+([\s\S]+)$/)
-  if (markdownTitle) {
-    const body = markdownTitle[2].trim()
-    if (body.length >= 80) return body
-  }
-  const colonIndex = trimmed.indexOf(': ')
-  if (colonIndex < 8 || colonIndex > 160) return trimmed
-
-  const prefix = trimmed.slice(0, colonIndex).replace(/\*/g, '').trim()
-  const body = trimmed.slice(colonIndex + 2).trim()
-  if (body.length < 80) return trimmed
-  if (!/[A-Za-z\u4e00-\u9fff]/.test(prefix)) return trimmed
-  if (/^(https?|file)$/i.test(prefix)) return trimmed
-  return body
-}
-
-function isResultSurfaceMessage(message: ChatMessage): boolean {
-  const transcriptKind = String(message.metadata?.transcript_kind ?? message.metadata?.kind ?? '').trim()
-  if ([
-    'runtime_v2_assistant',
-    'runtime_v2_company_assistant',
-    'top_level_reply',
-    'company_role_result',
-    'company_role_result_retry',
-    'child_task_result',
-    'child_task_result_retry',
-    'child_result',
-  ].includes(transcriptKind)) {
-    return true
-  }
-  if (String(message.metadata?.kind ?? '').trim() === 'worker_notification') {
-    return true
-  }
-  return false
 }
 
 function parseJsonObjectText(content: string): Record<string, unknown> | null {
@@ -830,8 +786,6 @@ export function buildNarrativeMessageItems(
   const items: TimelineItem[] = []
   let bundle: SystemOpsBundleEvent[] = []
   let bundleSortOrder = 0
-  const seenProjectUpdates = new Set<string>()
-  const seenNarrativeMessages = new Set<string>()
 
   const flushBundle = () => {
     if (bundle.length === 0) return
@@ -853,33 +807,6 @@ export function buildNarrativeMessageItems(
       if (bundle.length === 0) bundleSortOrder = sortOrder
       bundle.push(ops)
       return
-    }
-    const projectUpdate = detailMode === 'summary' ? parseProjectUpdatePayload(msg.content) : null
-    if (projectUpdate) {
-      const dedupeKey = [
-        msg.sender,
-        Math.round(msg.timestamp / 1000),
-        projectUpdate.kind,
-        compactWhitespace(projectUpdate.summary || projectUpdate.acceptanceSummary || '').slice(0, 500),
-        projectUpdate.verdict ?? '',
-        projectUpdate.deliverables.map(item => `${item.name}:${item.path}`).join('|').slice(0, 800),
-      ].join('\u0001')
-      if (seenProjectUpdates.has(dedupeKey)) return
-      seenProjectUpdates.add(dedupeKey)
-    }
-    if (detailMode === 'summary' && !isCheckpointCardMetadata(msg.metadata)) {
-      const canonicalContent = compactWhitespace(stripNarrativeTitlePrefix(msg.content)).slice(0, 1200)
-      if (canonicalContent) {
-        const dedupeKey = isResultSurfaceMessage(msg)
-          ? ['result', canonicalContent].join('\u0001')
-          : [
-              msg.sender,
-              Math.round(msg.timestamp / 1000),
-              canonicalContent,
-            ].join('\u0001')
-        if (seenNarrativeMessages.has(dedupeKey)) return
-        seenNarrativeMessages.add(dedupeKey)
-      }
     }
     flushBundle()
     items.push({
@@ -1331,7 +1258,7 @@ export const MessageList = React.memo(function MessageList({
     for (const message of timelineMessages) {
       const thinking = String(message.metadata?.runtime_thinking ?? '').trim()
       if (!thinking) continue
-      const turnId = String(message.metadata?.canonical_turn_id ?? message.metadata?.turn_id ?? '').trim()
+      const turnId = resolveCanonicalTurnId(message.metadata)
       if (turnId && thinkingProgressTurnIds.has(turnId)) continue
       entries.push({
         type: 'thinking' as const,

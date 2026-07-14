@@ -127,16 +127,37 @@ assert.match(
   'runtime events carrying a non-empty tool_name must update stable displayTool (empty tool_name keeps the sticky last command)',
 )
 
-// 8. Assistant streaming drafts must disappear at real terminal boundaries.
+// 8. A streaming draft is one mounted logical turn. Completion/checkpoint
+// events cannot remove it before the matching persisted final is merged.
 assert.match(
   src,
-  /evt\.type === 'turn_completed' \|\| evt\.type === 'turn_failed' \|\| evt\.type === 'checkpoint_saved'/,
-  'runtime terminal/checkpoint events must clear task-mode Live Reply drafts',
+  /const turnId = resolveCanonicalTurnId\(data\) \|\| undefined/,
+  'runtime deltas must use the shared canonical-turn resolver',
 )
 assert.match(
   src,
-  /detailHasFinalForDraft[\s\S]*runtime_v2_assistant[\s\S]*ss\.clearDraft\(detailTaskId\)/,
-  'session_detail backfill of the final runtime assistant turn must clear matching Live Reply drafts',
+  /const startsNewCanonicalTurn = evt\.type === 'turn_started'[\s\S]*turnId !== activeDraftTurnId[\s\S]*evt\.type === 'turn_failed' \|\| startsNewCanonicalTurn/,
+  'only failure or a genuinely new canonical turn may clear an uncommitted draft',
+)
+assert.doesNotMatch(
+  src,
+  /evt\.type === 'turn_completed'[^\n]*clearDraft|evt\.type === 'checkpoint_saved'[^\n]*clearDraft/,
+  'turn completion and checkpoint persistence must not clear a draft ahead of its final message',
+)
+assert.match(
+  src,
+  /detailHasFinalForDraft[\s\S]*terminalAssistantTurnId\(message\) === draftTurnId[\s\S]*ss\.clearDraft\(detailTaskId\)/,
+  'session_detail may clear only after merging the matching terminal assistant turn',
+)
+assert.match(
+  src,
+  /cs\.addMessageFromBackend\(mapped\)[\s\S]*terminalTurnId = terminalAssistantTurnId\(mapped\)[\s\S]*terminalTurnId === activeDraftTurnId[\s\S]*clearDraft\(taskId\)/,
+  'session_message/chat_new_message must merge a matching terminal final before clearing its draft',
+)
+assert.doesNotMatch(
+  src,
+  /mapped\.sender !== 'user'\)\s*\{\s*sessionStoreRef\.current\?\.clearDraft/,
+  'an unrelated non-user session message must never clear an active draft',
 )
 
 // 9. Summary/full pagination and transport-local failures have independent

@@ -472,7 +472,7 @@ async function runTimelineIdentityCases(page: Page, baseUrl: string): Promise<vo
       collapsed: !!committed.querySelector('.msg-collapse-toggle'),
     }
   })
-  assert.equal(finalizedDraft.reused, true, 'draft -> runtime_v2_assistant final must reuse the same outer timeline DOM node')
+  assert.equal(finalizedDraft.reused, true, 'draft -> runtime_v2_company_assistant final must reuse the same outer timeline DOM node')
   assert.equal(finalizedDraft.collapsed, false, 'a mounted expanded draft must not auto-collapse when its final arrives')
   assert.ok(
     finalizedDraft.height >= draftGeometry.height - 4,

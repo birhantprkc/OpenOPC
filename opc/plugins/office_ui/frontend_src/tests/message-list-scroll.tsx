@@ -366,7 +366,8 @@ function Fixture() {
           mentions: [],
           metadata: {
             canonical_turn_id: LIVE_TURN_ID,
-            transcript_kind: 'runtime_v2_assistant',
+            result_delivery_id: `result:${LIVE_TURN_ID}:attempt:0`,
+            transcript_kind: 'runtime_v2_company_assistant',
           },
         },
       ])

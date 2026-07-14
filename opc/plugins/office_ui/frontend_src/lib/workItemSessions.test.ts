@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import type { ChatMessage } from '../types/chat'
 import type { Session } from '../types/kanban'
 import { mapBackendSession, mergeSessionDetailHasMore } from './collabSync'
+import { stableMessageTimelineKey, stableResultDeliveryKey } from './messageTimelineIdentity'
 import { canonicalizeSessionExecutionIdentity } from './sessionIdentity'
-import { deriveCompanyRuntimeDisplayStatus, getConversationHeaderSession, getConversationSessionView, getWorkItemChildSessions, getWorkItemRoleSessions, mergeConversationMessages, projectSessionConversation, selectCompanySummaryMessages } from './workItemSessions'
+import { resolveCanonicalTurnId, terminalAssistantTurnId } from './turnIdentity'
+import { deriveCompanyRuntimeDisplayStatus, getConversationHeaderSession, getConversationSessionView, getWorkItemChildSessions, getWorkItemRoleSessions, mergeConversationMessages, projectSessionConversation, resultSurfaceDedupeKey, selectCompanySummaryMessages } from './workItemSessions'
 
 function makeSession(overrides: Partial<Session> & Pick<Session, 'taskId' | 'channelId' | 'title' | 'status' | 'columnId' | 'assigneeIds' | 'priority' | 'tags' | 'progressLog' | 'createdAt' | 'updatedAt' | 'messageCount'>): Session {
   return {
@@ -338,12 +340,380 @@ assert.deepEqual(
   [
     'parent-user',
     'canonical-role-result',
-    'summary-company-final',
-    'summary-terminal-b',
     'child-checkpoint',
     'child-checkpoint-response',
   ].sort(),
 )
+
+const companyRuntimeTurn = resultMessage(
+  'company-runtime-turn',
+  'session:company-child',
+  'A company runtime terminal surface.',
+  {
+    source: 'engine',
+    transcript_kind: 'runtime_v2_company_assistant',
+    canonical_turn_id: 'company-turn-0009',
+    result_delivery_id: 'company-delivery-0009',
+  },
+  'assistant',
+)
+assert.equal(
+  stableMessageTimelineKey(companyRuntimeTurn),
+  'turn:assistant:company-turn-0009',
+)
+
+const conversationOnlyRuntimeTurn = resultMessage(
+  'company-runtime-conversation-turn',
+  'session:company-child',
+  'A terminal surface with only its conversation identity.',
+  {
+    source: 'engine',
+    transcript_kind: 'runtime_v2_company_assistant',
+    conversation_turn_id: 'conversation-turn-only',
+    turn_id: 'iteration-turn-must-not-win',
+    execution_turn_id: 'execution-turn-must-not-win',
+    detail_visibility: 'summary',
+  },
+  'assistant',
+)
+assert.equal(
+  resolveCanonicalTurnId(conversationOnlyRuntimeTurn.metadata),
+  'conversation-turn-only',
+)
+assert.equal(terminalAssistantTurnId(conversationOnlyRuntimeTurn), 'conversation-turn-only')
+assert.equal(
+  terminalAssistantTurnId({
+    ...conversationOnlyRuntimeTurn,
+    metadata: {
+      ...conversationOnlyRuntimeTurn.metadata,
+      detail_visibility: 'full',
+    },
+  }),
+  '',
+  'a company tool-call iteration must not suppress the active draft',
+)
+assert.equal(
+  stableMessageTimelineKey(conversationOnlyRuntimeTurn),
+  'turn:assistant:conversation-turn-only',
+)
+assert.equal(
+  terminalAssistantTurnId({
+    ...conversationOnlyRuntimeTurn,
+    metadata: {
+      ...conversationOnlyRuntimeTurn.metadata,
+      transcript_kind: 'company_role_result',
+    },
+  }),
+  'conversation-turn-only',
+  'committed result kinds must participate in terminal-turn matching',
+)
+assert.equal(
+  stableMessageTimelineKey({
+    ...conversationOnlyRuntimeTurn,
+    metadata: {
+      ...conversationOnlyRuntimeTurn.metadata,
+      transcript_kind: 'company_role_result',
+      source_task_id: 'committed-source-task',
+    },
+  }),
+  'result:source-task:committed-source-task',
+  'a committed terminal may expose its turn for matching without taking the runtime draft key',
+)
+
+const project0009CtoResult = [
+  'Both work items have been successfully dispatched to my senior engineer. Here\'s the status:',
+  '',
+  '## Dispatch Summary',
+  '',
+  '**Work Item 1: OpenOPC Source Code Architecture Deep-Dive Analysis**',
+  '- ID: `1ed5f5f1-ac41-49a1-b1fa-23bbc9adab82`',
+  '- Owner: senior_engineer',
+  '- Scope: `openopc-source-analysis`',
+  '- Output: `/data2/bjdwhzzh/project-hku/OpenOPC_workplace/0009/openopc-architecture-analysis.md`',
+  '- Covers: Layered architecture, collaboration policy, seat executor pattern, and self-evolution mechanisms.',
+  '',
+  '**Work Item 2: External Multi-Agent Frameworks Architecture Research**',
+  '- ID: `d0307208-6b95-44c1-9b51-6bf073bbdcef`',
+  '- Owner: senior_engineer',
+  '- Scope: `external-frameworks-research`',
+  '- Output: `/data2/bjdwhzzh/project-hku/OpenOPC_workplace/0009/external-frameworks-analysis.md`',
+  '',
+  'Both are independent and can execute in parallel. The runtime will monitor their completion.',
+].join('\n')
+
+const project0009WorkItemSuffix = project0009CtoResult.slice(
+  project0009CtoResult.indexOf('OpenOPC Source Code Architecture Deep-Dive Analysis'),
+)
+const project0009IdSuffix = project0009CtoResult.slice(
+  project0009CtoResult.indexOf('`1ed5f5f1-ac41-49a1-b1fa-23bbc9adab82`'),
+)
+
+// Content fallback must not treat arbitrary Markdown colons as removable
+// narrative wrappers. The old normalization repeatedly turned the full 0009
+// result into these two shorter variants, which changed the rendered height.
+const fallback0009Full = resultMessage(
+  '0009-fallback-full',
+  'session:company-root',
+  project0009CtoResult,
+  { source: 'engine', transcript_kind: 'child_result' },
+  'assistant',
+)
+const fallback0009WorkItem = resultMessage(
+  '0009-fallback-work-item',
+  'session:company-child',
+  project0009WorkItemSuffix,
+  { source: 'engine', transcript_kind: 'runtime_v2_assistant' },
+  'assistant',
+)
+const fallback0009Id = resultMessage(
+  '0009-fallback-id',
+  'session:company-child',
+  project0009IdSuffix,
+  { source: 'engine', transcript_kind: 'runtime_v2_assistant' },
+  'assistant',
+)
+assert.notEqual(resultSurfaceDedupeKey(fallback0009Full), resultSurfaceDedupeKey(fallback0009WorkItem))
+assert.notEqual(resultSurfaceDedupeKey(fallback0009WorkItem), resultSurfaceDedupeKey(fallback0009Id))
+
+const committed0009Parent = {
+  ...resultMessage(
+    '0009-parent-result',
+    'session:company-root',
+    project0009CtoResult,
+    {
+      source: 'engine',
+      transcript_kind: 'child_result',
+      source_task_id: 'cto-task-0009',
+    },
+    'assistant',
+  ),
+  timestamp: 2_000,
+}
+const committed0009Child = {
+  ...resultMessage(
+    '0009-child-result',
+    'session:company-child',
+    project0009CtoResult,
+    {
+      source: 'engine',
+      transcript_kind: 'child_task_result',
+      task_id: 'cto-task-0009',
+    },
+    'assistant',
+  ),
+  timestamp: 2_010,
+}
+const raw0009WorkItem = {
+  ...fallback0009WorkItem,
+  metadata: {
+    ...fallback0009WorkItem.metadata,
+    detail_visibility: 'summary' as const,
+    canonical_turn_id: 'cto-turn-0009',
+  },
+  timestamp: 2_020,
+}
+const raw0009Id = {
+  ...fallback0009Id,
+  metadata: {
+    ...fallback0009Id.metadata,
+    detail_visibility: 'summary' as const,
+    canonical_turn_id: 'cto-turn-0009',
+  },
+  timestamp: 2_030,
+}
+
+for (const messages of [
+  [committed0009Parent, committed0009Child, raw0009WorkItem, raw0009Id],
+  [raw0009Id, raw0009WorkItem, committed0009Child, committed0009Parent],
+]) {
+  const summary = selectCompanySummaryMessages(messages, 'session:company-root')
+  assert.equal(summary.length, 1)
+  assert.equal(summary[0]?.id, '0009-child-result')
+  assert.equal(summary[0]?.content, project0009CtoResult)
+  assert.equal(stableMessageTimelineKey(summary[0]!), 'result:source-task:cto-task-0009')
+}
+
+const sameRoleText = 'The role completed its independent architecture analysis and committed the result.'
+const multiRoleSummary = selectCompanySummaryMessages([
+  resultMessage(
+    '0009-cto-role-result',
+    'session:company-cto',
+    sameRoleText,
+    {
+      source: 'engine',
+      transcript_kind: 'company_role_result',
+      work_item_projection_id: '0009-cto-work-item',
+    },
+    'assistant',
+  ),
+  resultMessage(
+    '0009-coo-role-result',
+    'session:company-coo',
+    sameRoleText,
+    {
+      source: 'engine',
+      transcript_kind: 'company_role_result',
+      work_item_projection_id: '0009-coo-work-item',
+    },
+    'assistant',
+  ),
+], 'session:company-root')
+assert.deepEqual(
+  multiRoleSummary.map(message => stableMessageTimelineKey(message)).sort(),
+  [
+    'result:work-item:0009-coo-work-item',
+    'result:work-item:0009-cto-work-item',
+  ],
+)
+
+const sharedConversationTurn = 'shared-company-conversation-turn'
+const parallelRoleResults = [
+  resultMessage(
+    'parallel-cto-result',
+    'session:company-cto',
+    'CTO completed the architecture assessment.',
+    {
+      source: 'engine',
+      transcript_kind: 'company_role_result',
+      canonical_turn_id: sharedConversationTurn,
+      work_item_projection_id: 'architecture-assessment',
+    },
+    'assistant',
+  ),
+  resultMessage(
+    'parallel-coo-result',
+    'session:company-coo',
+    'COO completed the feature assessment.',
+    {
+      source: 'engine',
+      transcript_kind: 'company_role_result',
+      canonical_turn_id: sharedConversationTurn,
+      work_item_projection_id: 'feature-assessment',
+    },
+    'assistant',
+  ),
+]
+assert.deepEqual(
+  parallelRoleResults.map(resultSurfaceDedupeKey),
+  [
+    'result:work-item:architecture-assessment',
+    'result:work-item:feature-assessment',
+  ],
+  'parallel committed roles must use work-item identity before a shared conversation turn',
+)
+assert.equal(
+  selectCompanySummaryMessages(parallelRoleResults, 'session:company-root').length,
+  2,
+)
+
+const versionedSourceResult = resultMessage(
+  'versioned-source-result',
+  'session:company-child',
+  'Versioned result.',
+  {
+    source: 'engine',
+    transcript_kind: 'company_role_result_retry',
+    source_task_id: 'source-task-versioned',
+    retry_count: 2,
+    delivery_revision: 4,
+  } as ChatMessage['metadata'],
+  'assistant',
+)
+assert.equal(
+  stableResultDeliveryKey(versionedSourceResult),
+  'source-task:source-task-versioned:attempt:2:revision:4',
+)
+
+const fullEqualPriorityResult = {
+  ...resultMessage(
+    'full-equal-priority',
+    'session:company-child-a',
+    'The complete authoritative body includes every required architectural conclusion and its supporting rationale.',
+    {
+      source: 'engine',
+      transcript_kind: 'company_role_result',
+      result_delivery_id: 'deterministic-delivery',
+    },
+    'assistant',
+  ),
+  timestamp: 2_100,
+}
+const truncatedEqualPriorityResult = {
+  ...resultMessage(
+    'truncated-equal-priority',
+    'session:company-child-b',
+    'supporting rationale.',
+    {
+      source: 'engine',
+      transcript_kind: 'company_role_result',
+      result_delivery_id: 'deterministic-delivery',
+    },
+    'assistant',
+  ),
+  timestamp: 2_200,
+}
+for (const groups of [
+  [[fullEqualPriorityResult], [truncatedEqualPriorityResult]],
+  [[truncatedEqualPriorityResult], [fullEqualPriorityResult]],
+]) {
+  const merged = mergeConversationMessages(groups)
+  assert.equal(merged.length, 1)
+  assert.equal(merged[0]?.id, 'full-equal-priority')
+  assert.equal(merged[0]?.content, fullEqualPriorityResult.content)
+  assert.equal(merged[0]?.timestamp, 2_100)
+  assert.equal(
+    stableMessageTimelineKey(merged[0]!),
+    'result:delivery:deterministic-delivery',
+  )
+  const replayed = mergeConversationMessages([
+    merged,
+    [truncatedEqualPriorityResult],
+  ])
+  assert.equal(replayed.length, 1)
+  assert.equal(replayed[0]?.id, 'full-equal-priority')
+  assert.equal(replayed[0]?.content, fullEqualPriorityResult.content)
+}
+
+const equalLengthStableWinner = {
+  ...resultMessage(
+    'z-stable-winner',
+    'session:company-child-a',
+    'BBBB',
+    {
+      source: 'engine',
+      transcript_kind: 'company_role_result',
+      result_delivery_id: 'equal-length-delivery',
+    },
+    'assistant',
+  ),
+  timestamp: 3_200,
+}
+const equalLengthLoser = {
+  ...resultMessage(
+    'a-stable-loser',
+    'session:company-child-b',
+    'AAAA',
+    {
+      source: 'engine',
+      transcript_kind: 'company_role_result',
+      result_delivery_id: 'equal-length-delivery',
+    },
+    'assistant',
+  ),
+  timestamp: 3_100,
+}
+for (const groups of [
+  [[equalLengthStableWinner], [equalLengthLoser]],
+  [[equalLengthLoser], [equalLengthStableWinner]],
+]) {
+  const firstMerge = mergeConversationMessages(groups)
+  assert.equal(firstMerge[0]?.id, 'z-stable-winner')
+  assert.equal(firstMerge[0]?.content, 'BBBB')
+  assert.equal(firstMerge[0]?.timestamp, 3_100)
+  const replayed = mergeConversationMessages([firstMerge, [equalLengthLoser]])
+  assert.equal(replayed[0]?.id, 'z-stable-winner')
+  assert.equal(replayed[0]?.content, 'BBBB')
+}
 assert.equal(companyHeaderView?.status, 'running')
 assert.equal(companyHeaderView?.contextTokens, 0)
 assert.equal(companyHeaderView?.contextWindow, 128000)

@@ -24,6 +24,7 @@ import { companyRuntimeControlPatchForBoardStatus } from './lib/sessionRuntime'
 import { getExecutionTurnId } from './lib/workItemRuntimeIds'
 import { normalizeSessionCompanyProfile, normalizeSessionExecMode } from './lib/sessionIdentity'
 import { extractSessionRecruitmentByRole, sessionChannelId } from './lib/sessionRecruitment'
+import { resolveCanonicalTurnId, terminalAssistantTurnId } from './lib/turnIdentity'
 import { unassignAgent } from './game/map/OfficeStore'
 import type { AgentAnimStatus, EmployeeAssignment, KanbanPhase, KanbanTask, RoleAggregatedStatus, RoleWorkItemSummary, Session, TaskPreferredAgent } from './types/kanban'
 
@@ -919,9 +920,11 @@ export default function App() {
             const taskId = typeof data.task_id === 'string' ? data.task_id : ''
             if (taskId) {
               const isDeltaEvent = evt.type === 'assistant_delta' || evt.type === 'thinking_delta'
+              const bufferedDraftTurnId = pendingDeltaFlushRef.current.get(taskId)?.draftTurnId
               // Store-write ordering guarantee: everything buffered for this
-              // task lands before a non-delta event (turn boundaries call
-              // clearDraft; the draft must be flushed first, not after).
+              // task lands before a non-delta event. A matching terminal
+              // message replaces the draft later; flushing here must not make
+              // a completion boundary remove the visible turn prematurely.
               if (!isDeltaEvent) flushPendingDeltas(taskId)
               const ss = sessionStoreRef.current
               const bs = boardStoreRef.current
@@ -931,13 +934,10 @@ export default function App() {
                 : ''
               const executionMode = typeof data.execution_mode === 'string' ? data.execution_mode : ''
               const isTaskModeRuntime = executionMode === 'task_mode' || projectionId === 'task_mode_execution'
-              const turnId = typeof data.turn_id === 'string' && data.turn_id
-                ? data.turn_id
-                : typeof data.canonical_turn_id === 'string' && data.canonical_turn_id
-                  ? data.canonical_turn_id
-                  : typeof data.execution_turn_id === 'string' && data.execution_turn_id
-                    ? data.execution_turn_id
-                    : undefined
+              // Drafts represent one logical assistant turn. The shared
+              // resolver deliberately prefers conversation identity over the
+              // iteration-scoped runtime turn id.
+              const turnId = resolveCanonicalTurnId(data) || undefined
               const marksCompanyRuntime =
                 !!projectionId && projectionId !== 'task_mode_execution' && !isTaskModeRuntime
               if (marksCompanyRuntime && !isDeltaEvent && existingSession?.isCompanyRuntime !== true) {
@@ -993,7 +993,14 @@ export default function App() {
                 entry.kanbanPatch = { ...entry.kanbanPatch, ...kanbanPatch }
                 scheduleDeltaFlush()
               } else {
-                if (evt.type === 'turn_started' || evt.type === 'turn_completed' || evt.type === 'turn_failed' || evt.type === 'checkpoint_saved') {
+                const activeDraftTurnId = String(
+                  bufferedDraftTurnId ?? existingSession?.draftTurnId ?? '',
+                ).trim()
+                const startsNewCanonicalTurn = evt.type === 'turn_started'
+                  && !!turnId
+                  && !!activeDraftTurnId
+                  && turnId !== activeDraftTurnId
+                if (evt.type === 'turn_failed' || startsNewCanonicalTurn) {
                   ss?.clearDraft(taskId)
                 }
                 ss?.updateSession(taskId, runtimePartial)
@@ -1084,14 +1091,9 @@ export default function App() {
                 payload.client_history_page === true,
               )
               const draftTurnId = String(existingSession?.draftTurnId ?? '').trim()
-              const detailHasFinalForDraft = !!draftTurnId && detailMessages.some((message) => {
-                if (message.sender === 'user') return false
-                const metadata = message.metadata ?? {}
-                const transcriptKind = String(metadata.transcript_kind ?? metadata.kind ?? '').trim()
-                if (transcriptKind !== 'runtime_v2_assistant') return false
-                const messageTurnId = String(metadata.canonical_turn_id ?? metadata.turn_id ?? '').trim()
-                return messageTurnId === draftTurnId
-              })
+              const detailHasFinalForDraft = !!draftTurnId
+                && !!cs
+                && detailMessages.some(message => terminalAssistantTurnId(message) === draftTurnId)
               if (detailHasFinalForDraft) {
                 ss.clearDraft(detailTaskId)
               }
@@ -1672,8 +1674,14 @@ export default function App() {
           console.debug('[onSessionMessage]', mapped.sender, mapped.channelId, mapped.content?.slice(0, 60))
           cs.addMessageFromBackend(mapped)
           const taskId = mapped.channelId.startsWith('session:') ? mapped.channelId.slice('session:'.length) : ''
+          const terminalTurnId = terminalAssistantTurnId(mapped)
+          const activeDraftTurnId = String(
+            sessionStoreRef.current?.sessions.find(session => session.taskId === taskId)?.draftTurnId ?? '',
+          ).trim()
           if (taskId && mapped.sender !== 'user') {
-            sessionStoreRef.current?.clearDraft(taskId)
+            if (terminalTurnId && terminalTurnId === activeDraftTurnId) {
+              sessionStoreRef.current?.clearDraft(taskId)
+            }
             // Force refresh — session messages are critical content that must sync
             scheduleSessionDetailRefresh(taskId, 'full', true)
           }
