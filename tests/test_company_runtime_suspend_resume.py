@@ -647,6 +647,112 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
                 reply_metadata={"ui_force_resume": True},
             )
 
+    async def test_resume_rejects_role_runtime_session_employee_mismatch(self) -> None:
+        store = await self._store()
+        _, task = await self._seed_runtime(store)
+        task.metadata["employee_assignment"] = {"employee_id": "employee-executor"}
+        await store.save_task(task)
+        work_item = await store.get_delegation_work_item("work-item-1")
+        role_session = await store.get_delegation_role_session("role-runtime-1")
+        assert work_item is not None and role_session is not None
+        work_item.metadata["employee_assignment"] = {
+            "employee_id": "employee-executor",
+        }
+        role_session.employee_id = "employee-executor"
+        await store.save_delegation_work_item(work_item)
+        await store.save_delegation_role_session(role_session)
+        engine = self._engine(store)
+        await engine.suspend_company_runtime(
+            origin_task_id=task.id,
+            session_id="sess-parent",
+            reason="user_stop",
+        )
+
+        role_session.employee_id = "replacement-employee"
+        await store.save_delegation_role_session(role_session)
+        engine.company_executor = self._CapturingCompanyExecutor()
+
+        with self.assertRaisesRegex(RuntimeError, "role session employee_id"):
+            await engine._maybe_resume_checkpoint(
+                "continue",
+                "sess-parent",
+                reply_metadata={"ui_force_resume": True},
+            )
+
+    async def test_resume_accepts_work_item_seat_in_multi_seat_role_session(self) -> None:
+        store = await self._store()
+        _, task = await self._seed_runtime(store)
+        work_item = await store.get_delegation_work_item("work-item-1")
+        role_session = await store.get_delegation_role_session("role-runtime-1")
+        assert work_item is not None and role_session is not None
+
+        work_item_seat_id = "seat::team::ceo::cto"
+        home_seat_id = "seat::team::cto::cto"
+        work_item.seat_id = work_item_seat_id
+        work_item.role_runtime_session_id = "role-runtime-1"
+        work_item.claimed_by_seat_id = work_item_seat_id
+        work_item.metadata["employee_assignment"] = {
+            "employee_id": "employee-executor",
+        }
+        role_session.seat_id = home_seat_id
+        role_session.seat_ids = [home_seat_id, work_item_seat_id]
+        role_session.employee_id = "employee-executor"
+        task.metadata["delegation_seat_id"] = work_item_seat_id
+        task.metadata["employee_assignment"] = {
+            "employee_id": "employee-executor",
+        }
+        await store.save_delegation_work_item(work_item)
+        await store.save_delegation_role_session(role_session)
+        await store.save_task(task)
+
+        engine = self._engine(store)
+        await engine.suspend_company_runtime(
+            origin_task_id=task.id,
+            session_id="sess-parent",
+            reason="user_stop",
+        )
+        executor = self._CapturingCompanyExecutor()
+        engine.company_executor = executor
+
+        await engine._maybe_resume_checkpoint(
+            "continue",
+            "sess-parent",
+            reply_metadata={"ui_force_resume": True},
+        )
+
+        self.assertEqual(len(executor.calls), 1)
+        resumed_task = executor.calls[0][1][0]
+        self.assertEqual(
+            resumed_task.metadata["delegation_seat_id"],
+            work_item_seat_id,
+        )
+        self.assertEqual(resumed_task.assigned_to, "executor")
+        self.assertEqual(resumed_task.assigned_external_agent, "codex")
+        self.assertEqual(
+            resumed_task.metadata["delegation_role_session_id"],
+            "role-runtime-1",
+        )
+        self.assertEqual(
+            resumed_task.metadata["employee_assignment"]["employee_id"],
+            "employee-executor",
+        )
+        resumed_work_item = await store.get_delegation_work_item("work-item-1")
+        resumed_role_session = await store.get_delegation_role_session(
+            "role-runtime-1",
+        )
+        assert resumed_work_item is not None and resumed_role_session is not None
+        self.assertEqual(resumed_work_item.seat_id, work_item_seat_id)
+        self.assertEqual(
+            resumed_work_item.role_runtime_session_id,
+            "role-runtime-1",
+        )
+        self.assertEqual(resumed_role_session.seat_id, home_seat_id)
+        self.assertEqual(resumed_role_session.employee_id, "employee-executor")
+        self.assertCountEqual(
+            resumed_role_session.seat_ids,
+            [home_seat_id, work_item_seat_id],
+        )
+
     async def test_force_native_real_work_item_path_consumes_resume_pin(self) -> None:
         store = await self._store()
         _, task = await self._seed_runtime(store)

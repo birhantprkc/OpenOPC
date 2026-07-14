@@ -6201,9 +6201,10 @@ class OPCEngine:
                 f"task {task.id}: role runtime session {expected_role_session_id!r} is missing"
             )
         if role_session is not None:
+            # A role session's scalar seat is its home/primary seat, while the
+            # checkpoint seat is the authoritative WorkItem's placement.
             role_session_values = {
                 "role_id": str(getattr(role_session, "role_id", "") or "").strip(),
-                "seat_id": str(getattr(role_session, "seat_id", "") or "").strip(),
                 "employee_id": str(getattr(role_session, "employee_id", "") or "").strip(),
             }
             for field_name, current in role_session_values.items():
