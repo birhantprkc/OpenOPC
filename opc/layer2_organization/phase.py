@@ -49,7 +49,9 @@ __all__ = [
     "phase_for_task_status",
     "coerce_phase",
     "is_review_execution_work_item_metadata",
+    "is_runtime_auxiliary_work_item",
     "should_hide_work_item_from_company_kanban",
+    "is_stale_claim_releasable",
     "is_resumable_after_claim_release",
     "is_orphaned",
     "is_dispatchable",
@@ -144,6 +146,27 @@ def is_report_execution_work_item_metadata(metadata: Mapping[str, Any] | None) -
         return True
     work_kind = _normalized_text(data.get("work_kind") or work_item_turn_type_from_metadata(data, fallback=""))
     return work_kind == "report" and bool(str(data.get("report_target_work_item_id", "") or "").strip())
+
+
+def is_runtime_auxiliary_work_item(value_or_metadata: Any) -> bool:
+    """True for attention, report, and review runtime helper cards.
+
+    Accepts either a work-item-like object, a serialized work item containing
+    a ``metadata`` mapping, or the metadata mapping itself.  Keeping this
+    identity check below the company runtime gives lifecycle and board code a
+    single dependency-free definition of a non-business child.
+    """
+    if isinstance(value_or_metadata, Mapping):
+        nested = value_or_metadata.get("metadata")
+        metadata = nested if isinstance(nested, Mapping) else value_or_metadata
+    else:
+        metadata = getattr(value_or_metadata, "metadata", None)
+    data = dict(metadata or {}) if isinstance(metadata, Mapping) else {}
+    return (
+        bool(data.get("attention_work_item", False))
+        or is_report_execution_work_item_metadata(data)
+        or is_review_execution_work_item_metadata(data)
+    )
 
 
 def should_hide_work_item_from_company_kanban(metadata: Mapping[str, Any] | None) -> bool:
@@ -316,40 +339,45 @@ def is_runnable(phase: Phase) -> bool:
     return phase in RUNNABLE_PHASES
 
 
-# Phases whose runtime claim, when released as stale (process restart, crashed
-# session), allow the dispatcher to re-pick the card. Without this set, a card
-# that was actively running when the process died becomes a zombie: phase still
-# says RUNNING / WAITING_FOR_*, but no session is alive to make progress.
-_RESUMABLE_AFTER_STALE_CLAIM: frozenset[Phase] = frozenset({
-    Phase.RUNNING,
-    Phase.WAITING_FOR_PEER,
-    Phase.WAITING_FOR_CHILDREN,
-    Phase.PAUSED,
-    Phase.NEEDS_ATTENTION,
-    Phase.AWAITING_MANAGER_REVIEW,
-    Phase.AWAITING_HUMAN,
-})
+# A process restart invalidates every persisted runtime claim, including claims
+# on passive review states.  Releasing a dead claim and allowing the original
+# worker to execute again are intentionally separate decisions: review parents
+# must lose their dead claim but remain passive while their report/review
+# auxiliaries resume.
+_STALE_CLAIM_RELEASABLE_PHASES: frozenset[Phase] = (
+    IN_PROGRESS_PHASES | IN_REVIEW_PHASES
+)
+_RESUMABLE_AFTER_CLAIM_RELEASE_PHASES: frozenset[Phase] = IN_PROGRESS_PHASES
+
+
+def is_stale_claim_releasable(phase: Phase) -> bool:
+    """Whether startup recovery may clear a dead runtime claim.
+
+    This includes passive review/human-wait states so a crashed resident
+    session cannot retain ownership forever.  It does *not* imply that the
+    original work item may be dispatched again.
+    """
+    return phase in _STALE_CLAIM_RELEASABLE_PHASES
 
 
 def is_resumable_after_claim_release(phase: Phase) -> bool:
-    """True iff a stale claim on this phase can be released and the card
-    re-picked up by the dispatcher (rather than left as a zombie).
+    """Whether the original worker may resume after its claim is released.
 
-    Used by the periodic stale-claim sweeper. Every in-flight phase must
-    return True here — the invariant test in
-    test_phase_state_machine_invariants.py enforces this.
+    Active execution phases can be re-picked after a crash. Passive
+    ``AWAITING_*`` parents cannot: their report/review chain (or human) owns
+    forward progress.
     """
-    return phase in _RESUMABLE_AFTER_STALE_CLAIM
+    return phase in _RESUMABLE_AFTER_CLAIM_RELEASE_PHASES
 
 
 def is_orphaned(item: Any) -> bool:
     """A work item is orphaned when its phase says 'in flight' but no
     runtime session currently holds a claim on it.
 
-    Typical scenario: the process that owned the claim died (restart,
-    crash). On startup the stale-claim sweeper clears the claim
-    metadata; this function then lets the dispatcher re-pick the card
-    on the next tick, eliminating zombie work items (Bug C).
+    Typical scenario: the process that owned an execution claim died. On
+    startup the stale-claim sweeper clears the claim metadata; this function
+    then lets the dispatcher re-pick active execution, but never a passive
+    review parent.
     """
     if not is_resumable_after_claim_release(item.phase):
         return False

@@ -117,6 +117,7 @@ from opc.layer2_organization.session_scoping import (
     is_top_level_company_session,
     task_session_scope_id,
 )
+from opc.layer2_organization.turn_mode import reset_manager_dispatch_turn_metadata
 from opc.layer2_organization.seat_executor import EngineSeatExecutor
 from opc.layer2_organization.work_item_runtime import (
     is_work_item_runtime_metadata,
@@ -6945,11 +6946,7 @@ class OPCEngine:
         task.metadata.pop("delegation_pending_work_item_ids", None)
         task.metadata.pop("delegated_children_pending", None)
         task.metadata.pop("delegation_wait_for_work_item_ids", None)
-        task.metadata.pop("manager_board_mutation_performed", None)
-        task.metadata.pop("manager_board_modified_work_item_ids", None)
-        task.metadata.pop("manager_board_deleted_work_item_ids", None)
-        task.metadata.pop("manager_no_delegation_justification", None)
-        task.metadata.pop("no_delegation_justification", None)
+        task.metadata = reset_manager_dispatch_turn_metadata(task.metadata)
         progress = list(task.metadata.get("progress_log", []) or [])
         progress.append(f"Company follow-up routed to final decider ({resume_source}): {reply}")
         task.metadata["progress_log"] = progress[-20:]
@@ -10211,16 +10208,7 @@ class OPCEngine:
             return True
         if str(task_metadata.get("manager_no_delegation_justification", "") or "").strip():
             return True
-        work_item_id = linked_work_item_id_for_task(task)
-        if not work_item_id or not hasattr(self.store, "get_delegation_work_item"):
-            return False
-        work_item = await self.store.get_delegation_work_item(work_item_id)
-        if work_item is None:
-            return False
-        metadata = dict(getattr(work_item, "metadata", {}) or {})
-        if bool(metadata.get("manager_board_mutation_performed", False)):
-            return True
-        if str(metadata.get("manager_no_delegation_justification", "") or "").strip():
+        if str(task_metadata.get("manager_dispatch_guard_unresolved", "") or "").strip():
             return True
         return False
 

@@ -83,6 +83,40 @@ class MetadataOwnershipMatrixTests(unittest.TestCase):
         self.assertNotIn("progress_log", copied)
         self.assertIn("current_turn_mode", EXECUTION_COPY_KEYS)
 
+    def test_review_source_report_link_is_work_item_only_not_execution_copy(self) -> None:
+        key = "review_source_report_work_item_id"
+        item = _work_item(
+            {
+                key: "report::wi-1::v2",
+                "review_target_work_item_id": "wi-1",
+            }
+        )
+
+        self.assertEqual(metadata_owner_for_key(key), MetadataOwner.WORK_ITEM)
+        self.assertTrue(is_work_item_owned_key(key))
+        self.assertNotIn(key, EXECUTION_COPY_KEYS)
+
+        copied = copy_work_item_execution_metadata(item)
+
+        self.assertNotIn(key, copied)
+        self.assertEqual(copied["review_target_work_item_id"], "wi-1")
+
+        task = Task(id="task-1", metadata={key: "report::wi-1::v2"})
+        removed = strip_disallowed_work_item_metadata_from_runtime_task(task)
+        self.assertIn(key, removed)
+        self.assertNotIn(key, task.metadata)
+
+        for journal_key in (
+            "review_resolution",
+            "review_resolution_state",
+            "review_resolution_applied_work_item_id",
+        ):
+            self.assertEqual(
+                metadata_owner_for_key(journal_key),
+                MetadataOwner.WORK_ITEM,
+            )
+            self.assertNotIn(journal_key, EXECUTION_COPY_KEYS)
+
     def test_validate_metadata_ownership_reports_task_only_work_item_field(self) -> None:
         item = _work_item({})
         task = Task(

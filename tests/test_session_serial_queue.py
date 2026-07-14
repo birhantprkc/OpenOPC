@@ -228,6 +228,18 @@ class IsDispatchableQueueFilterTests(unittest.TestCase):
         )
         self.assertFalse(is_dispatchable(item))
 
+    def test_passive_review_parent_without_claim_is_not_dispatchable(self) -> None:
+        for phase in (Phase.AWAITING_MANAGER_REVIEW, Phase.AWAITING_HUMAN):
+            with self.subTest(phase=phase):
+                item = DelegationWorkItem(
+                    work_item_id=f"wi-{phase.value}",
+                    run_id="r", cell_id="c", role_id="cto",
+                    seat_id="seat", manager_role_id="ceo",
+                    manager_seat_id="seat::ceo", title="t",
+                    phase=phase,
+                )
+                self.assertFalse(is_dispatchable(item))
+
 
 # ── enqueue_session_work_on_runnable_hook ────────────────────────────────
 
@@ -467,7 +479,10 @@ class SerialQueueReconcilerTests(_StoreFixture):
     async def test_reconcile_preserves_valid_marker_for_busy_session(self) -> None:
         self.store.role_serial_queue_enabled = True
         sid = await self._seed_session(focused="wi-active", pending=["wi-next"])
-        await self._save_item(wid="wi-active", sid=sid, phase=Phase.RUNNING)
+        active = await self._save_item(wid="wi-active", sid=sid, phase=Phase.RUNNING)
+        active.claimed_by_role_runtime_session_id = sid
+        active.claimed_by_seat_id = "seat"
+        await self.store.save_delegation_work_item(active)
         await self._save_item(wid="wi-next", sid=sid, marker=True)
 
         result = await reconcile_role_serial_queues(self.store, "r")
@@ -478,6 +493,64 @@ class SerialQueueReconcilerTests(_StoreFixture):
         item = await self.store.get_delegation_work_item("wi-next")
         self.assertEqual(item.metadata.get("queued_behind_session"), sid)
         self.assertFalse(is_dispatchable(item))
+
+    async def test_reconcile_promotes_aux_behind_unclaimed_review_focus(self) -> None:
+        self.store.role_serial_queue_enabled = True
+        sid = await self._seed_session(
+            focused="wi-parent",
+            pending=["wi-report"],
+            status="running",
+        )
+        await self._save_item(
+            wid="wi-parent",
+            sid=sid,
+            phase=Phase.AWAITING_MANAGER_REVIEW,
+        )
+        report = await self._save_item(wid="wi-report", sid=sid, marker=True)
+        report.metadata.update({
+            "report_execution_work_item": True,
+            "report_target_work_item_id": "wi-parent",
+        })
+        await self.store.save_delegation_work_item(report)
+
+        result = await reconcile_role_serial_queues(self.store, "r")
+
+        self.assertIn(sid, result["cleared_focus_session_ids"])
+        self.assertIn("wi-report", result["promoted_work_item_ids"])
+        session = await self.store.get_delegation_role_session(sid)
+        self.assertEqual(session.focused_work_item_id, "")
+        self.assertEqual(session.pending_work_item_ids, [])
+        report_after = await self.store.get_delegation_work_item("wi-report")
+        self.assertNotIn("queued_behind_session", report_after.metadata)
+        self.assertTrue(is_dispatchable(report_after))
+
+    async def test_reconcile_preserves_live_claimed_review_focus(self) -> None:
+        self.store.role_serial_queue_enabled = True
+        sid = await self._seed_session(
+            focused="wi-parent",
+            pending=["wi-report"],
+            status="running",
+        )
+        parent = await self._save_item(
+            wid="wi-parent",
+            sid=sid,
+            phase=Phase.AWAITING_MANAGER_REVIEW,
+        )
+        parent.claimed_by_role_runtime_session_id = sid
+        parent.claimed_by_seat_id = "seat"
+        await self.store.save_delegation_work_item(parent)
+        await self._save_item(wid="wi-report", sid=sid, marker=True)
+
+        result = await reconcile_role_serial_queues(self.store, "r")
+
+        self.assertEqual(result["cleared_focus_session_ids"], [])
+        self.assertEqual(result["promoted_work_item_ids"], [])
+        session = await self.store.get_delegation_role_session(sid)
+        self.assertEqual(session.focused_work_item_id, "wi-parent")
+        self.assertEqual(session.pending_work_item_ids, ["wi-report"])
+        report = await self.store.get_delegation_work_item("wi-report")
+        self.assertEqual(report.metadata.get("queued_behind_session"), sid)
+        self.assertFalse(is_dispatchable(report))
 
     async def test_reconcile_prunes_dead_entries_and_promotes_one_head(self) -> None:
         self.store.role_serial_queue_enabled = True
@@ -557,6 +630,106 @@ class SerialQueueReconcilerTests(_StoreFixture):
 
         repaired = await self.store.get_task(task.id)
         self.assertEqual(repaired.status, TaskStatus.DONE)
+
+
+class StartupClaimSweepTests(_StoreFixture):
+    async def test_restart_clears_dead_running_focus_so_auxiliary_can_resume(self) -> None:
+        sid = "role-runtime::r::cto"
+        report_id = "report::wi-parent::v1"
+        await self.store.save_delegation_role_session(
+            DelegationRoleSession(
+                role_session_id=sid,
+                run_id="r",
+                role_id="cto",
+                focused_work_item_id=report_id,
+                status="running",
+            )
+        )
+        await self.store.save_delegation_work_item(
+            DelegationWorkItem(
+                work_item_id=report_id,
+                run_id="r",
+                cell_id="c",
+                role_id="cto",
+                seat_id="seat",
+                role_runtime_session_id=sid,
+                manager_role_id="ceo",
+                manager_seat_id="seat::ceo",
+                title="report",
+                kind="report",
+                phase=Phase.RUNNING,
+                claimed_by_role_runtime_session_id=sid,
+                claimed_by_seat_id="seat",
+                metadata={
+                    "report_execution_work_item": True,
+                    "report_target_work_item_id": "wi-parent",
+                    "claimed_by_role_session_id": sid,
+                    "claimed_task_id": "task-report",
+                },
+            )
+        )
+
+        db_path = self.store.db_path
+        await self.store.close()
+        self.store = OPCStore(db_path=db_path)
+        await self.store.initialize()
+        self.store.role_serial_queue_enabled = True
+
+        report = await self.store.get_delegation_work_item(report_id)
+        session_before = await self.store.get_delegation_role_session(sid)
+        self.assertEqual(report.claimed_by_role_runtime_session_id, "")
+        self.assertTrue(is_dispatchable(report))
+        self.assertEqual(session_before.focused_work_item_id, report_id)
+        self.assertEqual(session_before.status, "running")
+
+        result = await reconcile_role_serial_queues(self.store, "r")
+
+        session_after = await self.store.get_delegation_role_session(sid)
+        self.assertIn(sid, result["cleared_focus_session_ids"])
+        self.assertEqual(session_after.focused_work_item_id, "")
+        self.assertEqual(session_after.status, "idle")
+        self.assertTrue(is_dispatchable(await self.store.get_delegation_work_item(report_id)))
+
+    async def test_restart_releases_review_claim_without_dispatching_parent(self) -> None:
+        parent = DelegationWorkItem(
+            work_item_id="wi-parent",
+            run_id="r", cell_id="c", role_id="cto", seat_id="seat",
+            manager_role_id="ceo", manager_seat_id="seat::ceo", title="parent",
+            phase=Phase.AWAITING_MANAGER_REVIEW,
+            claimed_by_role_runtime_session_id="dead-role-session",
+            claimed_by_seat_id="seat",
+            metadata={
+                "claimed_by_role_session_id": "dead-role-session",
+                "claimed_task_id": "task-parent",
+            },
+        )
+        report = DelegationWorkItem(
+            work_item_id="wi-report",
+            run_id="r", cell_id="c", role_id="cto", seat_id="seat",
+            manager_role_id="ceo", manager_seat_id="seat::ceo", title="report",
+            phase=Phase.READY,
+            metadata={
+                "report_execution_work_item": True,
+                "report_target_work_item_id": "wi-parent",
+            },
+        )
+        await self.store.save_delegation_work_item(parent)
+        await self.store.save_delegation_work_item(report)
+
+        db_path = self.store.db_path
+        await self.store.close()
+        self.store = OPCStore(db_path=db_path)
+        await self.store.initialize()
+
+        parent_after = await self.store.get_delegation_work_item("wi-parent")
+        report_after = await self.store.get_delegation_work_item("wi-report")
+        self.assertEqual(parent_after.claimed_by_role_runtime_session_id, "")
+        self.assertEqual(parent_after.claimed_by_seat_id, "")
+        self.assertEqual(parent_after.metadata.get("claimed_by_role_session_id"), "")
+        self.assertEqual(parent_after.metadata.get("claimed_task_id"), "")
+        self.assertTrue(parent_after.metadata.get("claim_swept_at"))
+        self.assertFalse(is_dispatchable(parent_after))
+        self.assertTrue(is_dispatchable(report_after))
 
 
 # ── Config loader picks up the feature flag ──────────────────────────────

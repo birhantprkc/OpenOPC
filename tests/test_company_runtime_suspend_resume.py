@@ -1067,12 +1067,21 @@ class CompanyRuntimeSuspendResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await engine._company_followup_target_progressed("task-ceo"))
 
         task.metadata.pop("manager_no_delegation_justification", None)
+        task.metadata["manager_dispatch_guard_unresolved"] = (
+            "Soft dispatch constraint exhausted; accept the top-seat output."
+        )
+        await store.save_task(task)
+        self.assertTrue(await engine._company_followup_target_progressed("task-ceo"))
+
+        task.metadata.pop("manager_dispatch_guard_unresolved", None)
         await store.save_task(task)
         await store.update_delegation_work_item(
             "wi-ceo",
             metadata_updates={"manager_board_mutation_performed": True},
         )
-        self.assertTrue(await engine._company_followup_target_progressed("task-ceo"))
+        # Dispatch outcome markers are attempt-scoped Task state. A stale
+        # WorkItem copy must not make a later follow-up look progressed.
+        self.assertFalse(await engine._company_followup_target_progressed("task-ceo"))
 
     async def test_final_decider_followup_keeps_dispatch_turn_mode_with_existing_children(self) -> None:
         runtime = CompanyRuntime(org_engine=None, communication=None, store=None)

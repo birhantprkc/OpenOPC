@@ -30,6 +30,29 @@ from typing import Any, Mapping
 from opc.core.models import Phase
 
 
+MANAGER_DISPATCH_TURN_METADATA_KEYS: tuple[str, ...] = (
+    "manager_board_mutation_performed",
+    "manager_board_modified_work_item_ids",
+    "manager_board_deleted_work_item_ids",
+    "manager_no_delegation_justification",
+    "no_delegation_justification",
+    "manager_dispatch_guard_unresolved",
+)
+
+
+def reset_manager_dispatch_turn_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return mutable metadata with prior manager-turn outcomes removed.
+
+    These keys describe what happened in one agent turn.  They must not be
+    carried into a retry, rework turn, or user follow-up; durable board state
+    (dependencies and child mutation revisions) is intentionally untouched.
+    """
+    result = dict(metadata or {})
+    for key in MANAGER_DISPATCH_TURN_METADATA_KEYS:
+        result.pop(key, None)
+    return result
+
+
 class TurnMode(str, Enum):
     EXECUTE = "execute"
     DELEGATE = "delegate"

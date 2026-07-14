@@ -2230,6 +2230,11 @@ def create_collaboration_tools(
             task.metadata = dict(task.metadata)
             task.metadata["delegation_wait_for_work_item_ids"] = parent_dependency_ids
             task.metadata["manager_board_parent_work_item_id"] = parent_work_item_id
+            # Reusing an existing scope-key match is not a current-turn board
+            # mutation.  Only newly persisted business children make this
+            # attempt a delegated-board completion.
+            if resolved_pending_items:
+                task.metadata["manager_board_mutation_performed"] = True
             if attention_work_item_id:
                 task.metadata["attention_business_parent_work_item_id"] = parent_work_item_id
                 task.metadata["attention_work_item_id"] = attention_work_item_id

@@ -214,23 +214,24 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
 
         executor = self._executor()
         executor._active_tasks = [manager_task]
+        follow_up_result = TaskResult(
+            status=TaskStatus.DONE,
+            content="Create a PPT deck.",
+            artifacts={
+                "follow_up_actions": [
+                    {
+                        "action": "delegate_followup",
+                        "target_role_id": "report_producer",
+                        "title": "Generate PPT deck",
+                        "summary": "Create a PPT with image2 visuals.",
+                        "depends_on_work_item_ids": ["dep-a", "dep-b"],
+                    }
+                ]
+            },
+        )
         created = await executor._materialize_follow_up_work_items(
             manager_task,
-            TaskResult(
-                status=TaskStatus.DONE,
-                content="Create a PPT deck.",
-                artifacts={
-                    "follow_up_actions": [
-                        {
-                            "action": "delegate_followup",
-                            "target_role_id": "report_producer",
-                            "title": "Generate PPT deck",
-                            "summary": "Create a PPT with image2 visuals.",
-                            "depends_on_work_item_ids": ["dep-a", "dep-b"],
-                        }
-                    ]
-                },
-            ),
+            follow_up_result,
         )
 
         self.assertEqual(len(created), 1)
@@ -238,6 +239,20 @@ class RefreshDependentsForRunTests(unittest.IsolatedAsyncioTestCase):
         parent_after = await self.store.get_delegation_work_item("parent")
         self.assertEqual(follow.phase, Phase.READY)
         self.assertEqual(parent_after.phase, Phase.WAITING_FOR_CHILDREN)
+
+        # Re-emitting the same dedupe key reuses board state; it is not a
+        # current-turn creation signal for the dispatch guard.
+        reused = await executor._materialize_follow_up_work_items(
+            manager_task,
+            follow_up_result,
+        )
+        self.assertEqual(reused, [])
+        follow_ups = [
+            item
+            for item in await self.store.list_delegation_work_items("run-materialize")
+            if (item.metadata or {}).get("follow_up_dedupe_key")
+        ]
+        self.assertEqual(len(follow_ups), 1)
 
     async def test_parent_wakes_when_last_child_approved(self) -> None:
         """The canonical app12 fix: parent in WAITING_FOR_CHILDREN with a

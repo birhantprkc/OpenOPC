@@ -380,7 +380,11 @@ class ReviewWorkItemLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 }
                 await store.save_delegation_work_item(child_work_item)
 
-                await executor._close_review_work_item_for_work_item("wi-child", outcome=Phase.FAILED.value)
+                await executor._persist_terminal_review_card(
+                    review_work_item_id,
+                    phase=Phase.CANCELLED,
+                    outcome=Phase.FAILED.value,
+                )
                 refreshed_review = await store.get_delegation_work_item(review_work_item_id)
                 assert refreshed_review is not None
                 self.assertEqual(refreshed_review.phase, Phase.CANCELLED)

@@ -30,7 +30,10 @@ from opc.layer2_organization.phase import (
     TERMINAL_PHASES,
     TODO_PHASES,
     coerce_phase,
+    is_resumable_after_claim_release,
     is_runnable,
+    is_runtime_auxiliary_work_item,
+    is_stale_claim_releasable,
     is_terminal,
     kanban_column,
     validate_transition,
@@ -253,20 +256,49 @@ def test_review_work_item_id_per_attempt_is_unique() -> None:
 # ── H: in-flight phase recoverability after stale claim release ───────────
 
 
-def test_inflight_phase_recoverable_after_claim_release() -> None:
-    """Every in-flight phase (RUNNING / WAITING_FOR_*) must be re-claimable
-    once the previous claim is released (e.g. after process restart).
+def test_inflight_claims_are_releasable_but_only_execution_is_resumable() -> None:
+    """Claim cleanup and worker re-execution are separate invariants.
 
-    Without this invariant, any restart leaves in-flight cards as zombies
-    that the dispatcher refuses to pick up. The recovery path is provided
-    by `is_resumable_after_claim_release` defined in `phase.py`.
+    All in-flight claims belong to the dead process and must be released on
+    restart. Active execution may then resume; passive review/human parents
+    must wait for their auxiliary or external actor instead of running twice.
     """
-    from opc.layer2_organization.phase import is_resumable_after_claim_release
-
     inflight = IN_PROGRESS_PHASES | IN_REVIEW_PHASES
-    not_recoverable = [p.value for p in inflight if not is_resumable_after_claim_release(p)]
-    assert not not_recoverable, (
-        f"in-flight phases that cannot recover after a stale claim is "
-        f"released: {not_recoverable}. After process restart these cards "
-        f"would become permanent zombies."
+    not_releasable = [p.value for p in inflight if not is_stale_claim_releasable(p)]
+    assert not not_releasable, (
+        f"in-flight phases whose dead claims cannot be released: {not_releasable}"
     )
+    not_resumable = [
+        p.value for p in IN_PROGRESS_PHASES
+        if not is_resumable_after_claim_release(p)
+    ]
+    assert not not_resumable, (
+        f"active execution phases that cannot resume: {not_resumable}"
+    )
+    incorrectly_resumable = [
+        p.value for p in IN_REVIEW_PHASES
+        if is_resumable_after_claim_release(p)
+    ]
+    assert not incorrectly_resumable, (
+        f"passive review phases incorrectly resume worker execution: "
+        f"{incorrectly_resumable}"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"attention_work_item": True},
+        {"report_execution_work_item": True},
+        {"review_execution_work_item": True},
+        {"work_kind": "report", "report_target_work_item_id": "parent"},
+        {"work_kind": "review", "review_target_work_item_id": "parent"},
+        {"metadata": {"attention_work_item": True}},
+    ],
+)
+def test_runtime_auxiliary_identity_is_canonical(value: dict[str, object]) -> None:
+    assert is_runtime_auxiliary_work_item(value)
+
+
+def test_business_work_item_is_not_runtime_auxiliary() -> None:
+    assert not is_runtime_auxiliary_work_item({"work_kind": "execute"})

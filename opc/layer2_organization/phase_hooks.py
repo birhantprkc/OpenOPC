@@ -31,6 +31,7 @@ from opc.core.models import Phase, TaskStatus
 from opc.layer2_organization.phase import (
     DONE_PHASES,
     RUNNABLE_PHASES,
+    is_stale_claim_releasable,
     register_phase_transition_hook,
     task_status_for_phase,
 )
@@ -365,6 +366,17 @@ def _active_focus_id(session: Any, work_item_by_id: dict[str, Any]) -> str:
         return ""
     if getattr(focused_item, "phase", None) in DONE_PHASES:
         return ""
+    phase = getattr(focused_item, "phase", None)
+    if is_stale_claim_releasable(phase):
+        claim = str(
+            getattr(focused_item, "claimed_by_role_runtime_session_id", "") or ""
+        ).strip()
+        if not claim:
+            # On a live transition the focused item retains its claim. After
+            # restart the startup sweep removes that dead-process claim; the
+            # persisted session focus must stop blocking the orphaned item (or
+            # a passive parent's report/review helper) from being dispatched.
+            return ""
     return focused
 
 

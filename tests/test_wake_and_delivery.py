@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -599,45 +598,6 @@ class DeliveryCardPhaseSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(item.kind == "report" for item in items))
         self.assertFalse(any(item.kind == "review" for item in items))
 
-    async def test_repair_stuck_aggregate_review_item_unblocks_dependents(self) -> None:
-        executor = self._executor()
-        stuck = DelegationWorkItem(
-            work_item_id="aggregate-stuck",
-            run_id="r",
-            cell_id="c",
-            role_id="cto",
-            seat_id="seat-cto",
-            manager_role_id="ceo",
-            manager_seat_id="seat-ceo",
-            title="Stuck aggregate",
-            kind="execute",
-            phase=Phase.AWAITING_MANAGER_REVIEW,
-            metadata={"work_kind": "synthesize", "work_item_turn_type": "aggregate"},
-        )
-        dependent = DelegationWorkItem(
-            work_item_id="final-qa",
-            run_id="r",
-            cell_id="c",
-            role_id="coo",
-            seat_id="seat-coo",
-            manager_role_id="ceo",
-            manager_seat_id="seat-ceo",
-            title="Final QA",
-            kind="review",
-            phase=Phase.WAITING_DEPENDENCIES,
-            metadata={"dependency_work_item_ids": ["aggregate-stuck"]},
-        )
-        await self.store.save_delegation_work_item(stuck)
-        await self.store.save_delegation_work_item(dependent)
-
-        work_items = await self.store.list_delegation_work_items("r")
-        await executor._repair_stuck_aggregate_review_items(work_items)
-
-        repaired = await self.store.get_delegation_work_item("aggregate-stuck")
-        unblocked = await self.store.get_delegation_work_item("final-qa")
-        self.assertEqual(repaired.phase, Phase.APPROVED)
-        self.assertEqual(unblocked.phase, Phase.READY)
-
     async def test_stale_report_for_delivery_parent_closes_without_review_card(self) -> None:
         executor = self._executor()
         parent = DelegationWorkItem(
@@ -697,7 +657,10 @@ class DeliveryCardPhaseSyncTests(unittest.IsolatedAsyncioTestCase):
 
         closed = await self.store.get_delegation_work_item(report.work_item_id)
         self.assertEqual(closed.phase, Phase.APPROVED)
-        self.assertEqual(closed.metadata["report_card_outcome"], "non_reviewable_parent")
+        self.assertEqual(
+            closed.metadata["report_card_outcome"],
+            "parent_not_awaiting_review",
+        )
         items = await self.store.list_delegation_work_items("r")
         self.assertFalse(any(str(item.work_item_id).startswith("review::deliver-parent") for item in items))
 

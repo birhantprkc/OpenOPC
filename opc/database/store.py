@@ -76,7 +76,7 @@ from opc.layer2_organization.phase import (
     InvalidPhaseTransition,
     TODO_PHASES,
     coerce_phase,
-    is_resumable_after_claim_release,
+    is_stale_claim_releasable,
     is_terminal,
     kanban_column,
     on_phase_transition,
@@ -4600,9 +4600,9 @@ class OPCStore:
         We only touch in-flight phases (RUNNING / WAITING_FOR_* /
         PAUSED / NEEDS_ATTENTION / AWAITING_*) so we never disturb
         terminal cards. The phase itself is left alone; the sweep only
-        clears the claim. The dispatcher's ``is_dispatchable`` check
-        recognises a non-terminal card with no claim as eligible for
-        re-pick on the next tick.
+        clears the claim. Active execution can subsequently be re-picked;
+        passive AWAITING_* parents remain non-dispatchable while their
+        report/review chain (or human) advances them.
         """
         if self._db is None:
             return 0
@@ -4619,7 +4619,7 @@ class OPCStore:
                 phase = coerce_phase(phase_str)
             except (TypeError, ValueError):
                 continue
-            if not is_resumable_after_claim_release(phase):
+            if not is_stale_claim_releasable(phase):
                 continue
             metadata = _json_loads(metadata_json, {})
             metadata["claimed_by_role_session_id"] = ""
@@ -5102,13 +5102,26 @@ class OPCStore:
 
         return total
 
-    async def save_delegation_work_item(self, item: DelegationWorkItem) -> None:
+    async def save_delegation_work_item(
+        self,
+        item: DelegationWorkItem,
+    ) -> None:
+        await self._write_delegation_work_item(item, if_absent=False)
+
+    async def _write_delegation_work_item(
+        self,
+        item: DelegationWorkItem,
+        *,
+        if_absent: bool,
+    ) -> bool:
         # Single-source-of-truth gate: every write — whether it goes through
         # update_delegation_work_item or directly mutates `item.phase` and
         # then calls save — passes through validate_transition. Skipping the
         # validation requires a separate code path; there is no way to write
         # an invalid phase by accident.
         existing = await self.get_delegation_work_item(item.work_item_id)
+        if if_absent and existing is not None:
+            return False
         previous_phase = existing.phase if existing is not None else None
         validate_transition(previous_phase, item.phase)
         item.metadata = dict(item.metadata or {})
@@ -5127,16 +5140,10 @@ class OPCStore:
         # may want to know "what changed".
         target_phase = item.phase
         db = self._require_db()
-        await db.execute(
-            """INSERT INTO delegation_work_items
-            (work_item_id, run_id, cell_id, team_instance_id, team_id, role_id, seat_id, seat_state_id,
-             role_runtime_session_id, parent_work_item_id, source_role_id, source_seat_id, title, summary,
-             kind, projection_id, phase, batch_id, batch_index,
-             deliverable_summary, blocked_reason, handoff_status, continuation_source, manager_role_id,
-             manager_seat_id, claimed_by_role_runtime_session_id, claimed_by_seat_id, metadata,
-             created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(work_item_id) DO UPDATE SET
+        conflict_action = (
+            "DO NOTHING"
+            if if_absent
+            else """DO UPDATE SET
                 run_id=excluded.run_id,
                 cell_id=excluded.cell_id,
                 team_instance_id=excluded.team_instance_id,
@@ -5165,7 +5172,18 @@ class OPCStore:
                 claimed_by_seat_id=excluded.claimed_by_seat_id,
                 metadata=excluded.metadata,
                 created_at=excluded.created_at,
-                updated_at=excluded.updated_at""",
+                updated_at=excluded.updated_at"""
+        )
+        cursor = await db.execute(
+            f"""INSERT INTO delegation_work_items
+            (work_item_id, run_id, cell_id, team_instance_id, team_id, role_id, seat_id, seat_state_id,
+             role_runtime_session_id, parent_work_item_id, source_role_id, source_seat_id, title, summary,
+             kind, projection_id, phase, batch_id, batch_index,
+             deliverable_summary, blocked_reason, handoff_status, continuation_source, manager_role_id,
+             manager_seat_id, claimed_by_role_runtime_session_id, claimed_by_seat_id, metadata,
+             created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(work_item_id) {conflict_action}""",
             (
                 item.work_item_id,
                 item.run_id,
@@ -5200,6 +5218,8 @@ class OPCStore:
             ),
         )
         await db.commit()
+        if if_absent and not (getattr(cursor, "rowcount", 0) or 0):
+            return False
         # D2 hook fire — propagate phase change to dependent layers
         # (task.status, role_session.status, dispatcher wake, etc.). All
         # writes to delegation_work_items pass through here, so this is
@@ -5208,6 +5228,20 @@ class OPCStore:
             await on_phase_transition(previous_phase, target_phase, item, store=self)
         except Exception:  # never let hook failures break the write
             logger.opt(exception=True).debug("on_phase_transition raised at top level")
+        return True
+
+    async def insert_delegation_work_item_if_absent(
+        self,
+        item: DelegationWorkItem,
+    ) -> bool:
+        """Atomically create a WorkItem without overwriting a concurrent claim.
+
+        Auxiliary report/review IDs are deterministic.  A read-before-write
+        check is insufficient because another dispatcher can create and claim
+        the same card between those operations; the conflict decision must be
+        made by SQLite in the insert statement itself.
+        """
+        return await self._write_delegation_work_item(item, if_absent=True)
 
     async def list_delegation_work_items(
         self,
@@ -5474,6 +5508,106 @@ class OPCStore:
         item.updated_at = datetime.now()
         await self.save_delegation_work_item(item)
         return item
+
+    async def apply_delegation_review_resolution(
+        self,
+        work_item_id: str,
+        *,
+        source_report_work_item_id: str,
+        target_phase: Phase | str,
+        blocked_reason: str,
+        metadata_updates: dict[str, Any],
+    ) -> DelegationWorkItem | None:
+        """Atomically apply a manager verdict to its exact report generation.
+
+        The phase predicate and latest-applied-report predicate live in the
+        same SQLite UPDATE as the child phase + applied-stamp write. This
+        prevents a late manager turn from crossing an AWAITING_HUMAN
+        transition or approving an older report after a newer report landed.
+        ``updated_at`` provides optimistic metadata concurrency; a few retries
+        preserve unrelated same-phase updates without weakening either guard.
+        """
+        target = coerce_phase(target_phase)
+        validate_transition(Phase.AWAITING_MANAGER_REVIEW, target)
+        expected_source = str(source_report_work_item_id or "").strip()
+        db = self._require_db()
+
+        for _attempt in range(3):
+            item = await self.get_delegation_work_item(work_item_id)
+            if item is None or item.phase != Phase.AWAITING_MANAGER_REVIEW:
+                return None
+            metadata = dict(item.metadata or {})
+            metadata.update(dict(metadata_updates or {}))
+            if (
+                self._metadata_has_work_item_projection_identity(metadata)
+                or str(item.projection_id or "").strip()
+                or str(item.kind or "").strip()
+            ):
+                metadata, _ = migrate_work_item_projection_metadata(
+                    metadata,
+                    projection_id_fallback=str(
+                        item.projection_id or item.work_item_id or ""
+                    ).strip(),
+                    turn_type_fallback=str(item.kind or "").strip(),
+                )
+            previous_updated_at = item.updated_at.isoformat()
+            updated_at = datetime.now()
+            cursor = await db.execute(
+                """UPDATE delegation_work_items
+                   SET phase = ?, blocked_reason = ?, metadata = ?, updated_at = ?
+                   WHERE work_item_id = ?
+                     AND phase = ?
+                     AND updated_at = ?
+                     AND COALESCE((
+                         SELECT report.work_item_id
+                         FROM delegation_work_items AS report
+                         WHERE report.parent_work_item_id = ?
+                           AND report.kind = 'report'
+                           AND json_extract(
+                               report.metadata,
+                               '$.report_target_work_item_id'
+                           ) = ?
+                           AND json_extract(
+                               report.metadata,
+                               '$.report_card_outcome'
+                           ) = 'applied'
+                         ORDER BY report.batch_index DESC,
+                                  report.created_at DESC,
+                                  report.work_item_id DESC
+                         LIMIT 1
+                     ), '') = ?""",
+                (
+                    target.value,
+                    str(blocked_reason or ""),
+                    _json_dumps(metadata),
+                    updated_at.isoformat(),
+                    work_item_id,
+                    Phase.AWAITING_MANAGER_REVIEW.value,
+                    previous_updated_at,
+                    work_item_id,
+                    work_item_id,
+                    expected_source,
+                ),
+            )
+            await db.commit()
+            if not (getattr(cursor, "rowcount", 0) or 0):
+                continue
+            persisted = await self.get_delegation_work_item(work_item_id)
+            if persisted is None:
+                return None
+            try:
+                await on_phase_transition(
+                    Phase.AWAITING_MANAGER_REVIEW,
+                    target,
+                    persisted,
+                    store=self,
+                )
+            except Exception:
+                logger.opt(exception=True).debug(
+                    "on_phase_transition raised after review-resolution CAS"
+                )
+            return persisted
+        return None
 
     async def reopen_approved_delegation_work_item_for_rework(
         self,

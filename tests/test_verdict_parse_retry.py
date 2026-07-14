@@ -29,6 +29,7 @@ from opc.layer2_organization.communication import CommunicationManager
 from opc.layer2_organization.company_mode import (
     CompanyWorkItemExecutor,
     MAX_VERDICT_PARSE_RETRIES,
+    report_work_item_id_for_attempt,
     review_work_item_id_for_attempt,
 )
 from opc.layer2_organization.org_engine import OrgEngine
@@ -234,6 +235,130 @@ class VerdictParseRetryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(
                     "could not be parsed",
                     str(new_review.metadata.get("review_retry_hint", "")),
+                )
+            finally:
+                await store.close()
+
+    async def test_retry_card_save_failure_stays_in_review_and_reconciles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            store = OPCStore(root / "tasks.db")
+            await store.initialize()
+            try:
+                executor = _build_executor(store, _make_org_engine(root))
+                child, review_id_v1 = _build_review_setup(store)
+                report_id = report_work_item_id_for_attempt("wi-child", 1)
+                child.metadata = {
+                    **dict(child.metadata or {}),
+                    "report_attempt_count": 1,
+                }
+                report = DelegationWorkItem(
+                    work_item_id=report_id,
+                    run_id="run-1",
+                    cell_id="team::cto",
+                    team_id="team::cto",
+                    role_id="engineer",
+                    seat_id="seat::team::cto::engineer",
+                    manager_role_id="cto",
+                    manager_seat_id="seat::team::cto::cto",
+                    parent_work_item_id="wi-child",
+                    title="Report #1: Build feature",
+                    summary="Durable worker report.",
+                    kind="report",
+                    projection_id=report_id,
+                    phase=Phase.APPROVED,
+                    batch_index=1,
+                    metadata={
+                        "runtime_model": "multi_team_org",
+                        "work_kind": "report",
+                        "report_execution_work_item": True,
+                        "report_attempt": 1,
+                        "report_target_work_item_id": "wi-child",
+                        "report_card_outcome": "applied",
+                        "completion_report": "Durable worker report.",
+                        "review_evidence": {
+                            "completion_summary": "Durable worker report."
+                        },
+                    },
+                )
+                review = _make_review_card(review_card_id=review_id_v1)
+                review.metadata = {
+                    **dict(review.metadata or {}),
+                    "review_source_report_work_item_id": report_id,
+                }
+                await store.save_delegation_work_item(child)
+                await store.save_delegation_work_item(report)
+                await store.save_delegation_work_item(review)
+
+                original_insert = store.insert_delegation_work_item_if_absent
+                review_id_v2 = review_work_item_id_for_attempt("wi-child", 2)
+                injected = False
+
+                async def fail_first_retry_card_insert(
+                    item: DelegationWorkItem,
+                ) -> bool:
+                    nonlocal injected
+                    if not injected and item.work_item_id == review_id_v2:
+                        injected = True
+                        raise RuntimeError("injected review retry save failure")
+                    return await original_insert(item)
+
+                store.insert_delegation_work_item_if_absent = AsyncMock(
+                    side_effect=fail_first_retry_card_insert
+                )
+                review_task = _make_review_task(
+                    review_card_id=review_id_v1,
+                    structured_verdict={"unparseable": True},
+                )
+                try:
+                    await executor._finalize_review_work_item(review_task)
+                finally:
+                    store.insert_delegation_work_item_if_absent = original_insert
+
+                self.assertTrue(injected)
+                child_after_failure = await store.get_delegation_work_item(
+                    "wi-child"
+                )
+                failed_review = await store.get_delegation_work_item(review_id_v1)
+                self.assertEqual(
+                    child_after_failure.phase,
+                    Phase.AWAITING_MANAGER_REVIEW,
+                )
+                self.assertFalse(
+                    child_after_failure.metadata.get(
+                        "review_verdict_parse_failed_auto_done", False
+                    )
+                )
+                self.assertEqual(failed_review.phase, Phase.CANCELLED)
+                self.assertEqual(
+                    failed_review.metadata.get("review_work_item_outcome"),
+                    "verdict_parse_failed",
+                )
+                self.assertIsNone(
+                    await store.get_delegation_work_item(review_id_v2)
+                )
+
+                run_items = await store.list_delegation_work_items("run-1")
+                await executor._reconcile_missing_review_chain(run_items)
+                await executor._reconcile_missing_review_chain(
+                    await store.list_delegation_work_items("run-1")
+                )
+
+                retry = await store.get_delegation_work_item(review_id_v2)
+                self.assertIsNotNone(retry)
+                self.assertEqual(retry.phase, Phase.READY)
+                self.assertEqual(
+                    retry.metadata.get("review_source_report_work_item_id"),
+                    report_id,
+                )
+                self.assertEqual(
+                    retry.metadata.get("review_retry_reason"),
+                    "verdict_parse_failed",
+                )
+                self.assertIsNone(
+                    await store.get_delegation_work_item(
+                        report_work_item_id_for_attempt("wi-child", 2)
+                    )
                 )
             finally:
                 await store.close()
