@@ -7469,12 +7469,6 @@ class OPCEngine:
         )
         for task in tasks:
             task_metadata = dict(getattr(task, "metadata", {}) or {})
-            if (
-                str(task_metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended"
-                or str(task_metadata.get("company_runtime_stop_state", "") or "").strip() in {"suspending", "suspended"}
-            ):
-                interrupted_tasks.append(task)
-                continue
             work_item_id = linked_work_item_id_for_task(task)
             work_item = (
                 await get_work_item(work_item_id)
@@ -7482,6 +7476,38 @@ class OPCEngine:
                 else None
             )
             work_item_phase = getattr(work_item, "phase", None)
+            task_held = (
+                str(task_metadata.get("dispatch_hold", "") or "").strip() == "company_runtime_suspended"
+                or str(task_metadata.get("company_runtime_stop_state", "") or "").strip() in {"suspending", "suspended"}
+            )
+            terminal_card = (
+                work_item_phase in DONE_PHASES
+                if work_item is not None
+                else task.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+            )
+            if terminal_card:
+                # Terminal cards are done — a leftover suspend hold on them is
+                # residue (stale-snapshot save, suspend racing a FAILED write),
+                # not an interruption. Classifying it as interrupted here
+                # rebuilt a pending company_runtime_interrupted checkpoint on
+                # EVERY boot for a run that had already converged. Scrub the
+                # residue instead so startup is idempotent.
+                if task_held:
+                    task.metadata = dict(task_metadata)
+                    for key in _COMPANY_RUNTIME_CONTROL_METADATA_KEYS:
+                        task.metadata.pop(key, None)
+                    try:
+                        await self.store.save_task(task)
+                        updated += 1
+                    except Exception:
+                        logger.opt(exception=True).debug(
+                            "startup reconcile: terminal-card hold scrub failed for {}",
+                            task.id,
+                        )
+                continue
+            if task_held:
+                interrupted_tasks.append(task)
+                continue
             # A linked WorkItem is the company workflow state.  Task.status is
             # only its UI/execution projection and may lag on either side of a
             # crash.  Fall back to Task status only for legacy envelopes that
@@ -7928,6 +7954,17 @@ class OPCEngine:
         plan: CompanyWorkItemRuntimePlan,
         tasks: list[Task],
     ) -> Task | None:
+        # FAILED/CANCELLED cards are terminal in the phase machine — there is
+        # no legal reopen edge, so routing a follow-up onto one can only crash
+        # the resume turn (`InvalidPhaseTransition: failed -> ready`) after
+        # having already clobbered the Task projection to PENDING. DONE stays
+        # eligible: the approved→rework reopen has a dedicated legal store op
+        # (`reopen_approved_delegation_work_item_for_rework`).
+        tasks = [
+            task
+            for task in tasks
+            if task.status not in {TaskStatus.FAILED, TaskStatus.CANCELLED}
+        ]
         final_delivery_candidates = [
             task for task in tasks
             if self._is_open_final_delivery_review_task(task)
@@ -8008,6 +8045,18 @@ class OPCEngine:
         metadata_updates: dict[str, Any] | None = None,
     ) -> None:
         assert self.store
+        # Terminal guard (belt to the selection-level filter): FAILED and
+        # CANCELLED have no legal reopen edge. Mutating the Task projection
+        # first and letting the store reject the phase write afterwards is
+        # exactly the ordering that left task=PENDING vs work_item=FAILED
+        # divergence — refuse up front instead.
+        if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            logger.warning(
+                "_prepare_company_followup_target: refusing terminal target task {} (status={})",
+                task.id,
+                task.status.value,
+            )
+            return
         reply = str(user_reply or "").strip()
         task.context_snapshot = dict(task.context_snapshot or {})
         task.context_snapshot["user_supplied_input"] = reply
@@ -8195,6 +8244,7 @@ class OPCEngine:
         resume_source: str = "primary_session_followup",
         context_updates: dict[str, Any] | None = None,
         metadata_updates: dict[str, Any] | None = None,
+        degrade_to_plain_resume_on_missing_target: bool = False,
     ) -> str | None:
         assert self.company_executor
         reply = str(user_reply or "").strip()
@@ -8202,6 +8252,20 @@ class OPCEngine:
             return None
         target_task = self._company_followup_target_task(plan, tasks)
         if target_task is None:
+            # No live final-decider card remains (e.g. it failed terminally
+            # during resume preparation). For the suspend-checkpoint caller,
+            # degrade to a plain runtime resume so the run converges and the
+            # checkpoint drains, instead of parking the checkpoint pending
+            # forever and dead-ending every follow-up.
+            if degrade_to_plain_resume_on_missing_target:
+                result = await self.company_executor.execute(plan, tasks)
+                note = (
+                    "The final-decider work item for this run is no longer active "
+                    "(failed or cancelled), so the follow-up could not be routed to it. "
+                    "Resumed the remaining runtime instead; re-issue the request as a "
+                    "new task if further work is needed."
+                )
+                return f"{note}\n\n{str(result or '').strip()}".strip()
             return None
         projection_label = projection_id_for_task(target_task) or str(target_task.title or target_task.id).strip()
         projection_title = str(target_task.title or projection_label).strip() or projection_label
@@ -11769,7 +11833,16 @@ class OPCEngine:
         payload, parent_session_id, plan, tasks = loaded
         target_task = self._company_followup_target_task(plan, tasks)
         if target_task is None:
-            return "Could not route the suspended company runtime because no CEO/final-decider work item was available."
+            # Every routable final-decider card is terminal — a follow-up can
+            # no longer be routed, but the run itself must still drain instead
+            # of bouncing this checkpoint back to pending on every message.
+            plain = await self._resume_company_suspend_checkpoint(checkpoint, user_reply)
+            return (
+                "The final-decider work item for this run is no longer active "
+                "(failed or cancelled), so the message could not be routed to it. "
+                "Resumed the remaining runtime instead; re-issue the request as a "
+                f"new task if further work is needed.\n\n{plain}"
+            ).strip()
 
         handoff = await self._handoff_company_suspend_checkpoint(
             checkpoint,
@@ -11790,6 +11863,7 @@ class OPCEngine:
                     tasks=tasks,
                     user_reply=user_reply,
                     session_id=parent_session_id,
+                    degrade_to_plain_resume_on_missing_target=True,
                 )
                 if followup_result is None:
                     await self._restore_company_suspend_checkpoint_pending(
